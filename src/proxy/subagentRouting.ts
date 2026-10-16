@@ -76,6 +76,66 @@ function stripMarker(text: string, token: string): string {
   const marker = `[antigravity-subagent-route:${token}]`;
   return text.split(`\n\n${marker}`).join('').split(marker).join('');
 }
+
+/**
+ * Compaction can quote child snapshots as JSON inside an ordinary user message.
+ * Their initialPrompt is history, not the current child's routing instruction.
+ * Only edit values in complete valid JSON objects; preserve all surrounding prose
+ * and leave malformed JSON or markers in other fields subject to normal guards.
+ */
+function stripHistoricalPromptMarkers(text: string): string {
+  let result = '';
+  let copied = 0;
+  for (let start = 0; start < text.length; start++) {
+    if (text[start] !== '{') continue;
+    let depth = 1;
+    let quoted = false;
+    let end = start + 1;
+    for (; end < text.length && depth; end++) {
+      const char = text[end];
+      if (quoted && char === '\\') end++;
+      else if (char === '"') quoted = !quoted;
+      else if (!quoted && char === '{') depth++;
+      else if (!quoted && char === '}') depth--;
+    }
+    if (depth) break;
+    const json = text.slice(start, end);
+    try {
+      JSON.parse(json);
+    } catch {
+      start = end - 1;
+      continue;
+    }
+    const strings = /"(?:\\.|[^"\\])*"/g;
+    const replacements: { start: number; end: number; value: string }[] = [];
+    let match: RegExpExecArray;
+    while ((match = strings.exec(json))) {
+      if (JSON.parse(match[0]) !== 'initialPrompt') continue;
+      const rest = json.slice(strings.lastIndex);
+      const colon = /^\s*:\s*(?=")/.exec(rest);
+      if (!colon) continue;
+      strings.lastIndex += colon[0].length;
+      const value = strings.exec(json)!;
+      const decoded = JSON.parse(value[0]) as string;
+      let cleaned = decoded;
+      for (const token of tokens(decoded)) cleaned = stripMarker(cleaned, token);
+      if (cleaned !== decoded)
+        replacements.push({ start: value.index, end: strings.lastIndex, value: JSON.stringify(cleaned) });
+    }
+    if (replacements.length) {
+      result += text.slice(copied, start);
+      let offset = 0;
+      for (const replacement of replacements) {
+        result += json.slice(offset, replacement.start) + replacement.value;
+        offset = replacement.end;
+      }
+      result += json.slice(offset);
+      copied = end;
+    }
+    start = end - 1;
+  }
+  return result + text.slice(copied);
+}
 function subagents(call: JsonObject): JsonObject[] | undefined {
   const args = object(call.args);
   if (!args || !Array.isArray(args.Subagents)) return undefined;
@@ -233,7 +293,9 @@ export class SubagentRoutingBridge {
       if (content.role !== 'user') continue;
       for (const part of content.parts || []) {
         if (typeof part.text !== 'string' || part.functionCall || part.functionResponse) continue;
-        const issued = tokens(part.text);
+        const text = stripHistoricalPromptMarkers(part.text);
+        part.text = text;
+        const issued = tokens(text);
         for (const token of issued) {
           this.requireMarker(token);
           if (index !== firstUser)

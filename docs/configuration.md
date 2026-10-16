@@ -292,7 +292,11 @@ to 4,096 entries per routing cache. Start new subagents after restarting the
 proxy or when a route has expired; a child using an unavailable marker reports
 an error. Expired markers in parent tool history are removed so the parent can
 continue and spawn fresh children; its original custom selection can only be
-restored while the corresponding routing state remains available. This feature
+restored while the corresponding routing state remains available. Compaction
+snapshots can also quote child prompts as JSON inside a user message. Route
+markers in string `initialPrompt` fields of valid JSON objects are treated as
+history and removed before active route detection, including after restart.
+Markers outside those snapshot fields retain the normal routing checks. This feature
 depends on Antigravity supplying the child prompt or a stable conversation
 identity, and does not add native subagent tools to clients that do not expose
 them. Automated routing coverage uses local HTTP fixtures. Actual Windows IDE
@@ -388,6 +392,14 @@ model manager. It groups the provider's quota buckets and shows supplied reset
 times. Unknown quota stays unknown; refreshing a card does not
 generate a completion or purchase additional quota. Each account is queried
 through the saved model that owns it, including when multiple pools are present.
+When Google returns both grouped and top-level buckets, both sets are displayed;
+distinct model families and quota windows are retained.
+
+A shared email appears in one account row with every assigned model pool below
+it. Email matching ignores case and surrounding whitespace; accounts without a
+known email use their saved account ID. Each pool keeps its own account ID,
+credentials, project, quota query and controls, so grouping does not transfer
+quota or preferences between models.
 
 **Use preferred** saves `googlePool.preferredAccountId` for that pool. The chosen
 account is preferred only while enabled, authenticated and eligible for the

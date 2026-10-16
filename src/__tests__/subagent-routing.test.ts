@@ -114,6 +114,132 @@ describe('subagent routing at the common Gemini boundary', () => {
     expect(JSON.stringify(prepared.body)).not.toContain('antigravity-subagent-route');
   });
 
+  it.each(['live', 'restarted', 'expired'] as const)(
+    'cleans two quoted child snapshots after compaction with %s routing state',
+    (state) => {
+      let now = 0;
+      const bridge = new SubagentRoutingBridge({ now: () => now, ttlMs: 100 });
+      const emitted = spawn(bridge, ['custom-a', 'custom-b']);
+      const snapshots = [0, 1].map((index) => JSON.stringify({ spec: { initialPrompt: prompt(emitted, index) } }));
+      const body = child(`Earlier work:\n${snapshots.join('\n')}\nContinue the parent task.`, 'parent');
+      const before = structuredClone(body);
+      if (state === 'restarted') bridge.clear();
+      if (state === 'expired') now = 101;
+      const prepared = bridge.prepareRequest(body, resolve);
+      expect(prepared.modelName).toBeUndefined();
+      expect(prepared.body.contents[0].parts[0].text).toBe(
+        'Earlier work:\n{"spec":{"initialPrompt":"Task 0"}}\n{"spec":{"initialPrompt":"Task 1"}}\nContinue the parent task.',
+      );
+      expect(body).toEqual(before);
+    },
+  );
+
+  it('does not bind an unrelated conversation to a single quoted historical child', () => {
+    const bridge = new SubagentRoutingBridge();
+    const emitted = spawn(bridge);
+    const prepared = bridge.prepareRequest(
+      child(`Previous child: '${JSON.stringify({ initialPrompt: prompt(emitted) })}'`, 'unrelated'),
+      resolve,
+    );
+    expect(prepared.modelName).toBeUndefined();
+    expect(prepared.body.contents[0].parts[0].text).toBe('Previous child: \'{"initialPrompt":"Task 0"}\'');
+    expect(bridge.prepareRequest(child('Continue.', 'unrelated'), resolve).modelName).toBeUndefined();
+    expect(bridge.prepareRequest(child(prompt(emitted), 'actual-child'), resolve).modelName).toBe('custom-a');
+  });
+
+  it('routes an active child marker alongside historical sibling snapshots', () => {
+    const bridge = new SubagentRoutingBridge();
+    const emitted = spawn(bridge, ['custom-a', 'custom-b']);
+    const snapshot = JSON.stringify({ spec: { initialPrompt: prompt(emitted, 1) } });
+    const body = child(`${prompt(emitted)}\nPrior work: ${snapshot}`, 'actual-child');
+    const prepared = bridge.prepareRequest(body, resolve);
+    expect(prepared.modelName).toBe('custom-a');
+    expect(prepared.body.contents[0].parts[0].text).toBe('Task 0\nPrior work: {"spec":{"initialPrompt":"Task 1"}}');
+    expect(bridge.prepareRequest(child('Continue.', 'actual-child'), resolve).modelName).toBe('custom-a');
+    expect(bridge.prepareRequest(child(prompt(emitted, 1), 'sibling'), resolve).modelName).toBe('custom-b');
+  });
+
+  it('accepts historical snapshots in later user turns without changing an existing child binding', () => {
+    const bridge = new SubagentRoutingBridge();
+    const emitted = spawn(bridge, ['custom-a', 'custom-b']);
+    bridge.prepareRequest(child(prompt(emitted), 'bound-child'), resolve);
+    const body = child('Compacted child context', 'bound-child');
+    body.contents.push({
+      role: 'user',
+      parts: [{ text: `Review ${JSON.stringify({ initialPrompt: prompt(emitted, 1) })}` }],
+    });
+    expect(bridge.prepareRequest(body, resolve).modelName).toBe('custom-a');
+    body.conversationId = 'ordinary-parent';
+    expect(bridge.prepareRequest(body, resolve).modelName).toBeUndefined();
+  });
+
+  it('handles escaped JSON keys, quotes, backslashes and marker delimiters without altering surrounding text', () => {
+    const bridge = new SubagentRoutingBridge();
+    const emitted = spawn(bridge);
+    const task = 'Quoted "task" and path C:\\work\\project with {braces}';
+    const json = JSON.stringify({ spec: { initialPrompt: prompt(emitted).replace('Task 0', task), keep: 'unchanged' } })
+      .replace('initialPrompt', 'initial\\u0050rompt')
+      .replace('[antigravity', '\\u005bantigravity');
+    const prepared = bridge.prepareRequest(child(`Before\n${json}\nAfter`, 'parent'), resolve);
+    expect(prepared.modelName).toBeUndefined();
+    const text = prepared.body.contents[0].parts[0].text;
+    expect(text).toBe(`Before\n{"spec":{"initial\\u0050rompt":${JSON.stringify(task)},"keep":"unchanged"}}\nAfter`);
+  });
+
+  it('preserves whitespace and duplicate unrelated JSON fields when cleaning a snapshot', () => {
+    const bridge = new SubagentRoutingBridge();
+    const emitted = spawn(bridge);
+    const text = `{ "keep": 1, "keep": 2, "initialPrompt" : ${JSON.stringify(prompt(emitted))} }`;
+    expect(bridge.prepareRequest(child(text, 'parent'), resolve).body.contents[0].parts[0].text).toBe(
+      '{ "keep": 1, "keep": 2, "initialPrompt" : "Task 0" }',
+    );
+  });
+
+  it.each([
+    (text: string) => JSON.stringify({ Prompt: text }),
+    (text: string) => JSON.stringify({ initialPromptCopy: text }),
+    (text: string) => JSON.stringify({ initialPrompt: { text } }),
+    (text: string) => JSON.stringify({ prose: `"initialPrompt": ${JSON.stringify(text)}` }),
+    (text: string) => `{"initialPrompt": ${JSON.stringify(text)},}`,
+    (text: string) => `{"initialPrompt": ${JSON.stringify(text).replace('Task 0', 'Task \\q')}}`,
+    (text: string) => `{'initialPrompt': '${text}'}`,
+    (text: string) => `{"initialPrompt": ${JSON.stringify(text)}`,
+  ])('keeps non-snapshot or invalid JSON markers subject to routing guards: %s', (serialize) => {
+    const bridge = new SubagentRoutingBridge();
+    const emitted = spawn(bridge);
+    const body = child(serialize(prompt(emitted)), 'parent');
+    const before = structuredClone(body);
+    expect(() => bridge.prepareRequest(body, resolve)).toThrow(/parent conversation/);
+    expect(body).toEqual(before);
+    bridge.clear();
+    expect(() => bridge.prepareRequest(body, resolve)).toThrow(/expired or is unknown/);
+  });
+
+  it('keeps active unknown, conflicting, parent and assigned-route guards around valid snapshots', () => {
+    const bridge = new SubagentRoutingBridge();
+    const emitted = spawn(bridge, ['custom-a', 'custom-b', 'custom-c']);
+    const snapshot = JSON.stringify({ initialPrompt: prompt(emitted, 2) });
+    expect(() =>
+      bridge.prepareRequest(
+        child(`${snapshot}\n[antigravity-subagent-route:11111111-1111-4111-8111-111111111111]`),
+        resolve,
+      ),
+    ).toThrow(/expired or is unknown/);
+    expect(() =>
+      bridge.prepareRequest(child(`${snapshot}\n${prompt(emitted)}\n${prompt(emitted, 1)}`), resolve),
+    ).toThrow(/Multiple/);
+    expect(() => bridge.prepareRequest(child(`${snapshot}\n${prompt(emitted)}`, 'parent'), resolve)).toThrow(
+      /parent conversation/,
+    );
+    bridge.prepareRequest(child(prompt(emitted), 'child-a'), resolve);
+    expect(() => bridge.prepareRequest(child(`${snapshot}\n${prompt(emitted)}`, 'other-child'), resolve)).toThrow(
+      /already assigned/,
+    );
+    const later = child('Initial ordinary prompt');
+    later.contents.push({ role: 'user', parts: [{ text: `${snapshot}\n${prompt(emitted, 1)}` }] });
+    expect(() => bridge.prepareRequest(later, resolve)).toThrow(/initial child prompt/);
+  });
+
   it('does not inspect marker-looking strings inside function results for child routing', () => {
     const bridge = new SubagentRoutingBridge();
     const emitted = spawn(bridge);

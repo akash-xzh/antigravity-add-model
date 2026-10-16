@@ -569,6 +569,68 @@ describe('subagent bridge through native-shaped HTTP requests', () => {
     expect(upstream.requests).toHaveLength(0);
   });
 
+  it.each([false, true])(
+    'continues a compacted native parent with quoted child snapshots before and after restart, stream=%s',
+    async (stream) => {
+      const nativeRequests: Record<string, unknown>[] = [];
+      const native = await serve(async (req, res) => {
+        nativeRequests.push(await readBody(req));
+        const payload = nativePayload(
+          'cloud-code',
+          nativeRequests.length === 1
+            ? [
+                { Model: 'models/child-a', Prompt: 'Historical task A' },
+                { Model: 'models/child-b', Prompt: 'Historical task B' },
+              ]
+            : undefined,
+        );
+        res.setHeader('Content-Type', stream ? 'text/event-stream' : 'application/json');
+        res.end(stream ? `data: ${JSON.stringify(payload)}\n\ndata: [DONE]\n\n` : JSON.stringify(payload));
+      });
+      const upstream = await providerFixture(() => undefined);
+      const proxy = await fixture(
+        [model(upstream.url, 'openai', 'child-a'), model(upstream.url, 'anthropic', 'child-b')],
+        native,
+      );
+      const [spawn] = await toolCalls(await nativeRequest(proxy, 'cloud-code', stream, 'native-parent'), stream);
+      const childResponse = await request(
+        proxy,
+        'gemini-native-pro',
+        spawn.args.Subagents[0].Prompt,
+        stream,
+        'actual-child-a',
+      );
+      expect(childResponse.status).toBe(200);
+      expect(await childResponse.text()).toContain('CHILD OK');
+      const summary = `Earlier child work:\n${spawn.args.Subagents.map(({ Prompt }) =>
+        JSON.stringify({ spec: { initialPrompt: Prompt } }),
+      ).join('\n')}\nContinue the parent task.`;
+      for (const restarted of [false, true]) {
+        if (restarted) subagentRouting.subagentRouting.clear();
+        const response = await nativeRequest(proxy, 'cloud-code', stream, 'native-parent', summary);
+        expect(response.status).toBe(200);
+        expect(await response.text()).toContain('NATIVE OK');
+        const wire = JSON.stringify(nativeRequests.at(-1));
+        expect(wire).toContain('Historical task A');
+        expect(wire).toContain('Historical task B');
+        expect(wire).not.toContain('antigravity-subagent-route:');
+        expect(nativeRequests.at(-1).model).toBe('gemini-native-pro');
+      }
+      expect(nativeRequests).toHaveLength(3);
+      expect(upstream.requests.map((input) => input.model)).toEqual(['child-a']);
+      const staleChild = await request(
+        proxy,
+        'gemini-native-pro',
+        spawn.args.Subagents[1].Prompt,
+        stream,
+        'stale-child-b',
+      );
+      expect(staleChild.status).toBe(409);
+      expect(nativeRequests).toHaveLength(3);
+      expect(upstream.requests).toHaveLength(1);
+    },
+  );
+
   it.each(['openai', 'anthropic'] as const)(
     'restores ID-less Google parent history when switching to %s',
     async (provider) => {

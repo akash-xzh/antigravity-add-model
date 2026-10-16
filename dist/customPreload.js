@@ -167,6 +167,7 @@ window.addEventListener('DOMContentLoaded', () => {
       .agy-choice{display:flex;gap:10px;align-items:center;padding:7px 0;overflow-wrap:anywhere}.agy-choice span{min-width:0}
       #agy-modal-overlay details{border:1px solid #303036;border-radius:8px;margin:12px 0;padding:12px}#agy-modal-overlay summary{cursor:pointer;margin-bottom:10px;font-weight:500}
       .agy-fleet{margin:18px 0;border:1px solid #303036;border-radius:8px;padding:14px}.agy-fleet-table-wrap{overflow:auto}.agy-fleet-table{width:100%;border-collapse:collapse;text-align:left}.agy-fleet-table th,.agy-fleet-table td{padding:10px 8px;border-bottom:1px solid #303036;vertical-align:top}.agy-fleet-table th{font-size:11px;color:#a1a1aa}.agy-quota-bucket{min-width:180px;margin-bottom:8px}.agy-quota-bucket progress{display:block;width:100%;height:7px;accent-color:#86efac}.agy-fleet-label{font-weight:600}.agy-pool-badge{display:inline-block;padding:2px 6px;border-radius:5px;background:#27272c;color:#a1a1aa;font-size:11px}.agy-pool-preferred{color:#86efac}.agy-model-search-box{padding:6px 8px}.agy-model-search-input{box-sizing:border-box;width:100%;font:inherit;color:inherit;background:transparent;border:1px solid #52525b;border-radius:5px;padding:6px}.agy-model-no-results{padding:8px;color:#a1a1aa;font-size:12px}
+      .agy-fleet-pool+.agy-fleet-pool{border-top:1px solid #303036;margin-top:12px;padding-top:12px}.agy-fleet-quotas{display:flex;flex-wrap:wrap;gap:12px;margin-top:8px}.agy-fleet-pool .agy-actions{margin-bottom:0}.agy-fleet-label{overflow-wrap:anywhere}
       @media(max-width:600px){.agy-grid{grid-template-columns:1fr}#agy-modal-card{padding:16px}.agy-row .agy-actions{width:100%}}
     `;
         document.head.append(style);
@@ -187,11 +188,13 @@ window.addEventListener('DOMContentLoaded', () => {
         const heading = element('h2', '', title);
         heading.id = 'agy-modal-title';
         const close = () => {
+            if (!overlay.isConnected)
+                return;
             cancelModalOperation?.();
             cancelModalOperation = undefined;
             overlay.remove();
             if (previousFocus?.isConnected)
-                previousFocus.focus();
+                previousFocus.focus({ preventScroll: true });
         };
         header.append(heading, button('Close', close));
         const body = element('div');
@@ -541,46 +544,84 @@ window.addEventListener('DOMContentLoaded', () => {
             name = `${base}-${index++}`;
         return name;
     }
+    function captureScrollPosition(node) {
+        const positions = new Map();
+        for (let parent = node; parent; parent = parent.parentElement)
+            positions.set(parent, { top: parent.scrollTop, left: parent.scrollLeft });
+        const scrollingElement = document.scrollingElement;
+        if (scrollingElement && !positions.has(scrollingElement))
+            positions.set(scrollingElement, { top: scrollingElement.scrollTop, left: scrollingElement.scrollLeft });
+        return () => {
+            for (const [element, position] of positions) {
+                if (!element.isConnected)
+                    continue;
+                element.scrollTop = position.top;
+                element.scrollLeft = position.left;
+            }
+        };
+    }
     function openDeleteModelModal(model) {
         const { body, status, close } = openModal('Delete model');
         body.append(element('p', '', `Delete “${model.displayName || model.name}”?`), element('p', 'agy-muted', 'This removes the saved model configuration from this app.'));
         const actions = element('div', 'agy-actions');
         actions.append(button('Cancel', close), button('Delete model', async () => {
+            const visibleRows = Array.from(document.querySelectorAll('#agy-custom-models-content [data-model-name]'));
+            const deletedIndex = visibleRows.findIndex((row) => row.dataset.modelName === model.name);
+            const adjacentNames = [...visibleRows.slice(deletedIndex + 1), ...visibleRows.slice(0, deletedIndex).reverse()]
+                .map((row) => row.dataset.modelName);
             setStatus(status, 'Deleting model…');
             requireSuccess(await storageAPI.deleteCustomModel(model.name));
             // The user may have closed this dialog while storage was updating.
             const dialogStillOpen = body.isConnected;
             if (dialogStillOpen)
                 close();
+            const focusAfterClose = document.activeElement;
             await modelsChanged();
-            if (dialogStillOpen && !document.getElementById('agy-modal-overlay'))
-                document.getElementById('agy-add-model')?.focus();
+            if (dialogStillOpen && !document.getElementById('agy-modal-overlay') &&
+                (document.activeElement === document.body || document.activeElement === focusAfterClose)) {
+                const remainingRows = Array.from(document.querySelectorAll('#agy-custom-models-content [data-model-name]'));
+                const adjacentRow = adjacentNames.map((name) => remainingRows.find((row) => row.dataset.modelName === name)).find(Boolean);
+                const nextFocus = Array.from(adjacentRow?.querySelectorAll('button') || [])
+                    .find((button) => button.textContent === 'Delete') || document.getElementById('agy-add-model');
+                nextFocus?.focus({ preventScroll: true });
+            }
         }, status, true));
         body.append(actions);
     }
     const quotaCache = new Map();
     let fleetRefreshing = false;
     let fleetTimer;
-    function fleetAccounts(models) {
-        const rows = new Map();
+    function fleetMembers(models) {
+        const members = [];
         for (const model of models) {
             if (model.provider !== 'google-cloudcode' || !Array.isArray(model.googleAccounts))
                 continue;
             for (const account of model.googleAccounts) {
                 if (!account?.id)
                     continue;
-                const key = `${model.name}\0${account.id}`;
-                const row = rows.get(key);
-                if (row)
-                    row.owners.push(model);
-                else
-                    rows.set(key, { account, owners: [model] });
+                members.push({ account, owner: model });
             }
+        }
+        return members;
+    }
+    function fleetAccounts(models) {
+        const rows = new Map();
+        for (const member of fleetMembers(models)) {
+            const { owner, account } = member;
+            const email = (quotaCache.get(quotaKey(owner, account))?.quota?.email || account.email)?.trim();
+            // An ID is only a fallback identity. Distinct known emails must never merge,
+            // and grouping never replaces the original owner/account used by actions.
+            const key = email ? `email:${email.toLowerCase()}` : `id:${account.id}`;
+            const row = rows.get(key);
+            if (row)
+                row.members.push(member);
+            else
+                rows.set(key, { identity: email || account.label || account.id, members: [member] });
         }
         return [...rows.values()];
     }
     function quotaKey(model, account) {
-        return JSON.stringify([model.name, account.id, account.project, account.authMode, account.cloudCodeEndpoint]);
+        return JSON.stringify([model.name, model.apiUrl, model.externalModelName, account.id, account.project, account.authMode, account.cloudCodeEndpoint]);
     }
     async function connectFleetAccount(modelName, replaceAccountId) {
         const { body, status, close } = openModal(replaceAccountId ? 'Reconnect Google account' : 'Add Google account');
@@ -621,14 +662,13 @@ window.addEventListener('DOMContentLoaded', () => {
         const container = document.getElementById('agy-google-account-pool-section');
         if (!container?.isConnected || container.hidden)
             return;
-        const rows = fleetAccounts(modelList);
+        const members = fleetMembers(modelList);
         fleetRefreshing = true;
         try {
             // A small sequential queue avoids a login or quota request burst on large fleets.
-            for (const { account, owners } of rows) {
+            for (const { account, owner } of members) {
                 if (!container.isConnected)
                     break;
-                const owner = owners[0];
                 const key = quotaKey(owner, account);
                 if (!force && Date.now() - (quotaCache.get(key)?.at || 0) < 120000)
                     continue;
@@ -652,18 +692,21 @@ window.addEventListener('DOMContentLoaded', () => {
         const container = document.getElementById('agy-google-account-pool-section');
         if (!container)
             return;
+        const restoreScroll = captureScrollPosition(container);
         const rows = fleetAccounts(modelList);
         const hasGoogleModels = modelList.some((model) => model.provider === 'google-cloudcode');
         container.hidden = !hasGoogleModels;
-        container.replaceChildren();
-        if (!hasGoogleModels)
+        if (!hasGoogleModels) {
+            container.replaceChildren();
+            restoreScroll();
             return;
-        const keys = new Set(rows.map(({ account, owners }) => quotaKey(owners[0], account)));
+        }
+        const keys = new Set(fleetMembers(modelList).map(({ account, owner }) => quotaKey(owner, account)));
         for (const key of quotaCache.keys())
             if (!keys.has(key))
                 quotaCache.delete(key);
         const header = element('div', 'agy-toolbar');
-        header.append(element('h3', '', `Google account fleet · ${rows.length} account entries`));
+        header.append(element('h3', '', `Google account fleet · ${rows.length} account${rows.length === 1 ? '' : 's'}`));
         const actions = element('div', 'agy-actions');
         const targetPool = element('select');
         targetPool.id = 'agy-fleet-target-pool';
@@ -678,67 +721,79 @@ window.addEventListener('DOMContentLoaded', () => {
         add.id = 'agy-pool-add-account-btn';
         actions.append(add, button('Refresh quotas', () => refreshFleetQuotas(true)));
         header.append(actions);
-        container.append(header, element('p', 'agy-muted', 'Preferred accounts are used when eligible; automatic selection handles unavailable accounts. Quotas are reported by Google for the displayed model/project. Unknown limits are not shown as available credit.'));
         const wrap = element('div', 'agy-fleet-table-wrap');
         const table = element('table', 'agy-fleet-table');
         const head = element('thead');
         const heading = element('tr');
-        for (const title of ['Account / models', 'Reported quotas', 'Selection', 'Actions'])
+        for (const title of ['Account', 'Assigned model pools'])
             heading.append(element('th', '', title));
         head.append(heading);
         table.append(head);
         const tbody = element('tbody');
-        for (const { account, owners } of rows) {
-            const owner = owners[0];
-            const cached = quotaCache.get(quotaKey(owner, account));
+        for (const { identity: accountIdentity, members } of rows) {
             const row = element('tr');
-            row.dataset.accountId = account.id;
+            row.dataset.accountIdentity = accountIdentity;
             const identity = element('td');
-            identity.append(element('div', 'agy-fleet-label', account.email || cached?.quota?.email || account.label || account.id), element('div', 'agy-muted', owners.map((model) => model.displayName || model.name).join(', ')));
-            const quota = element('td');
-            const buckets = cached?.quota?.buckets || [];
-            if (cached?.quota?.planTier)
-                quota.append(element('div', 'agy-pool-badge', cached.quota.planTier));
-            if (cached?.error)
-                quota.append(element('div', 'agy-status agy-error', cached.error));
-            else if (!cached)
-                quota.append(element('span', 'agy-muted', 'Loading quota…'));
-            else if (!buckets.length)
-                quota.append(element('span', 'agy-muted', 'Quota unavailable — Google returned no buckets.'));
-            for (const bucket of buckets) {
-                const block = element('div', 'agy-quota-bucket');
-                const fraction = bucket.remainingFraction;
-                const known = typeof fraction === 'number' && Number.isFinite(fraction);
-                block.append(element('div', 'agy-muted', [bucket.groupName, bucket.displayName || bucket.id].filter(Boolean).join(' · ')));
-                block.append(element('div', '', known ? `${Math.round(Math.max(0, Math.min(1, fraction)) * 100)}% remaining` : 'Remaining quota unknown'));
-                if (known) {
-                    const bar = element('progress');
-                    bar.max = 1;
-                    bar.value = Math.max(0, Math.min(1, fraction));
-                    bar.setAttribute('aria-label', `${bucket.displayName || bucket.id} remaining quota`);
-                    block.append(bar);
+            identity.append(element('div', 'agy-fleet-label', accountIdentity), element('div', 'agy-muted', `${members.length} model pool${members.length === 1 ? '' : 's'}`));
+            const pools = element('td');
+            for (const { account, owner } of members) {
+                const cached = quotaCache.get(quotaKey(owner, account));
+                const pool = element('section', 'agy-fleet-pool');
+                pool.setAttribute('role', 'group');
+                pool.setAttribute('aria-label', `${owner.displayName || owner.name} account ${account.id}`);
+                pool.dataset.modelName = owner.name;
+                pool.dataset.accountId = account.id;
+                const poolHeading = element('div', 'agy-group-heading');
+                const poolIdentity = element('div');
+                poolIdentity.append(element('h3', '', owner.displayName || owner.name), element('div', 'agy-muted', [owner.name, `Account: ${account.id}`, account.project ? `Project: ${account.project}` : ''].filter(Boolean).join(' · ')));
+                const preferred = owner.googlePool?.preferredAccountId === account.id;
+                const enabled = owner.enabled !== false && account.enabled !== false;
+                poolHeading.append(poolIdentity, element('span', `agy-pool-badge${preferred ? ' agy-pool-preferred' : ''}`, !enabled ? 'Disabled' : preferred ? 'Preferred' : 'Automatic'));
+                pool.append(poolHeading);
+                const quota = element('div', 'agy-fleet-quotas');
+                const buckets = cached?.quota?.buckets || [];
+                if (cached?.quota?.planTier)
+                    quota.append(element('div', 'agy-pool-badge', cached.quota.planTier));
+                if (cached?.error)
+                    quota.append(element('div', 'agy-status agy-error', cached.error));
+                else if (!cached)
+                    quota.append(element('span', 'agy-muted', 'Loading quota…'));
+                else if (!buckets.length)
+                    quota.append(element('span', 'agy-muted', 'Quota unavailable — Google returned no buckets.'));
+                for (const bucket of buckets) {
+                    const block = element('div', 'agy-quota-bucket');
+                    const fraction = bucket.remainingFraction;
+                    const known = typeof fraction === 'number' && Number.isFinite(fraction);
+                    block.append(element('div', 'agy-muted', [bucket.groupName, bucket.displayName || bucket.id].filter(Boolean).join(' · ')));
+                    block.append(element('div', '', known ? `${Math.round(Math.max(0, Math.min(1, fraction)) * 100)}% remaining` : 'Remaining quota unknown'));
+                    if (known) {
+                        const bar = element('progress');
+                        bar.max = 1;
+                        bar.value = Math.max(0, Math.min(1, fraction));
+                        bar.setAttribute('aria-label', `${bucket.displayName || bucket.id} remaining quota`);
+                        block.append(bar);
+                    }
+                    if (bucket.resetTime && Number.isFinite(Date.parse(bucket.resetTime)))
+                        block.append(element('div', 'agy-muted', `Resets ${new Date(bucket.resetTime).toLocaleString()}`));
+                    quota.append(block);
                 }
-                if (bucket.resetTime && Number.isFinite(Date.parse(bucket.resetTime)))
-                    block.append(element('div', 'agy-muted', `Resets ${new Date(bucket.resetTime).toLocaleString()}`));
-                quota.append(block);
+                const rowActions = element('div', 'agy-actions');
+                const choose = button('Use preferred', async () => {
+                    requireSuccess(await electron_1.ipcRenderer.invoke('storage:google-select-account', { modelName: owner.name, accountId: account.id }));
+                    await modelsChanged();
+                });
+                choose.disabled = !enabled;
+                rowActions.append(choose, account.authMode === 'antigravity' ? button('Reconnect', () => connectFleetAccount(owner.name, account.id)) : button('Edit account', () => openModelModal(owner)), button('Remove', () => removeFleetAccount(account, owner.name)));
+                pool.append(quota, rowActions);
+                pools.append(pool);
             }
-            const selection = element('td');
-            const preferred = owners.filter((model) => model.googlePool?.preferredAccountId === account.id);
-            const enabled = owners.some((model) => model.enabled !== false && model.googleAccounts.some((entry) => entry.id === account.id && entry.enabled !== false));
-            selection.append(element('span', `agy-pool-badge${preferred.length ? ' agy-pool-preferred' : ''}`, !enabled ? 'Disabled' : preferred.length ? `Preferred in ${preferred.length} pool(s)` : 'Automatic'));
-            const rowActions = element('td');
-            const choose = button('Use preferred', async () => {
-                requireSuccess(await electron_1.ipcRenderer.invoke('storage:google-select-account', { modelName: owner.name, accountId: account.id }));
-                await modelsChanged();
-            });
-            choose.disabled = !enabled;
-            rowActions.append(choose, account.authMode === 'antigravity' ? button('Reconnect', () => connectFleetAccount(owner.name, account.id)) : button('Edit account', () => openModelModal(owner)), button('Remove', () => removeFleetAccount(account, owner.name)));
-            row.append(identity, quota, selection, rowActions);
+            row.append(identity, pools);
             tbody.append(row);
         }
         table.append(tbody);
         wrap.append(table);
-        container.append(wrap);
+        container.replaceChildren(header, element('p', 'agy-muted', 'Accounts are grouped by email when available. Each model pool keeps its own credentials, project and reported quotas. Preferred accounts are used when eligible; unknown limits are not available credit.'), wrap);
+        restoreScroll();
     }
     async function renderCustomModelsList() {
         const target = document.getElementById('agy-custom-models-content');
@@ -749,10 +804,11 @@ window.addEventListener('DOMContentLoaded', () => {
             const models = await storageAPI.getCustomModels();
             if (version !== renderVersion || !target.isConnected)
                 return;
+            const restoreScroll = captureScrollPosition(target);
             modelList = models;
             renderGoogleFleet();
             void refreshFleetQuotas();
-            target.replaceChildren();
+            const content = document.createDocumentFragment();
             const groups = new Map();
             for (const model of models) {
                 if (searchTerm &&
@@ -764,7 +820,7 @@ window.addEventListener('DOMContentLoaded', () => {
                 groups.set(key, [...(groups.get(key) || []), model]);
             }
             if (!groups.size)
-                target.append(element('p', 'agy-muted', models.length
+                content.append(element('p', 'agy-muted', models.length
                     ? 'No models match this search.'
                     : 'Add a provider model, discover a local server, or import a configuration to get started.'));
             for (const models of groups.values()) {
@@ -786,6 +842,7 @@ window.addEventListener('DOMContentLoaded', () => {
                 group.append(header, groupStatus);
                 for (const model of models) {
                     const row = element('div', 'agy-row');
+                    row.dataset.modelName = model.name;
                     row.dataset.enabled = String(model.enabled !== false);
                     const info = element('div', 'agy-row-info');
                     info.append(element('strong', '', model.displayName || model.name), element('div', 'agy-muted', model.externalModelName));
@@ -818,8 +875,10 @@ window.addEventListener('DOMContentLoaded', () => {
                     row.append(info, actions);
                     group.append(row);
                 }
-                target.append(group);
+                content.append(group);
             }
+            target.replaceChildren(content);
+            restoreScroll();
         }
         catch (error) {
             setStatus(target, error instanceof Error ? error.message : 'Could not load custom models.', true);

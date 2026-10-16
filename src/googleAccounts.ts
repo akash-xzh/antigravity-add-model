@@ -149,18 +149,19 @@ function quotaIsFresh(quota?: GoogleQuotaSnapshot, now = Date.now()): boolean {
     !quota.buckets.some((bucket) => bucket.resetTime && Date.parse(bucket.resetTime) <= now)
   );
 }
+function quotaFamily(name: string): 'third-party' | 'gemini' | undefined {
+  return /claude|gpt|anthropic|openai|third[- ]?party/i.test(name)
+    ? 'third-party'
+    : /gemini|google/i.test(name)
+      ? 'gemini'
+      : undefined;
+}
 function quotaBuckets(quota: GoogleQuotaSnapshot, upstreamModel?: string): GoogleQuotaBucket[] {
-  const family = (name: string) =>
-    /claude|gpt|anthropic|openai|third[- ]?party/i.test(name)
-      ? 'third-party'
-      : /gemini|google/i.test(name)
-        ? 'gemini'
-        : undefined;
-  const wanted = upstreamModel ? family(upstreamModel) : undefined;
+  const wanted = upstreamModel ? quotaFamily(upstreamModel) : undefined;
   if (!wanted) return quota.buckets;
   const classified = quota.buckets.map((bucket) => ({
     bucket,
-    family: family(`${bucket.groupName || ''} ${bucket.id} ${bucket.displayName || ''}`),
+    family: quotaFamily(`${bucket.groupName || ''} ${bucket.id} ${bucket.displayName || ''}`),
   }));
   // Missing family information is unknown eligibility, not proof that the account lacks access.
   return classified.some((entry) => entry.family)
@@ -378,11 +379,30 @@ export async function fetchGoogleQuota(
     throw new GoogleAccountError(describeGoogleAccessError(status, 'quota').message, status);
   const buckets: GoogleQuotaBucket[] = [];
   const groups: GoogleQuotaGroup[] = [];
-  const rawGroups = Array.isArray(data.groups)
-    ? data.groups
-    : Array.isArray(data.buckets)
-      ? [{ buckets: data.buckets }]
-      : [];
+  const rawGroups = [
+    ...(Array.isArray(data.groups) ? data.groups : []),
+    ...(Array.isArray(data.buckets) ? [{ buckets: data.buckets }] : []),
+  ];
+  const groupedBuckets = new Map<string, GoogleQuotaBucket[]>();
+  const topLevelGroup = Array.isArray(data.buckets) ? rawGroups[rawGroups.length - 1] : undefined;
+  const sameBucket = (left: GoogleQuotaBucket, right: GoogleQuotaBucket): boolean => {
+    const normalize = (value?: string) => value?.trim().toLowerCase() || '';
+    const leftFamily = quotaFamily(`${left.groupName || ''} ${left.id} ${left.displayName || ''}`);
+    const rightFamily = quotaFamily(`${right.groupName || ''} ${right.id} ${right.displayName || ''}`);
+    if (leftFamily !== rightFamily) return false;
+    for (const field of ['groupName', 'displayName', 'resetTime'] as const) {
+      if (left[field] && right[field] && normalize(left[field]) !== normalize(right[field])) return false;
+    }
+    // Flat buckets can carry the model label that the grouped response puts on its parent.
+    // Sharing a family and a generic ID such as "weekly" does not prove these are the same model.
+    if (left.groupName && right.displayName && normalize(left.groupName) !== normalize(right.displayName)) return false;
+    // A generic flat ID (for example "weekly") cannot establish which named group it belongs to.
+    return (
+      !!leftFamily ||
+      normalize(left.groupName) === normalize(right.groupName) ||
+      (!!left.displayName && normalize(left.displayName) === normalize(right.displayName))
+    );
+  };
   for (const group of rawGroups) {
     if (!group || typeof group !== 'object') continue;
     const groupName =
@@ -424,8 +444,24 @@ export async function fetchGoogleQuota(
         remainingFraction: bFraction,
         resetTime: bReset,
       };
+      const explicitId = typeof bucket.bucketId === 'string' ? bucket.bucketId : bucket.id;
+      const key = typeof explicitId === 'string' ? explicitId.trim().toLowerCase() : '';
+      if (group === topLevelGroup && key) {
+        const matches = (groupedBuckets.get(key) || []).filter((existing) => sameBucket(existing, item));
+        if (matches.length === 1) {
+          const existing = matches[0];
+          const measured = [existing.remainingFraction, item.remainingFraction].filter(
+            (value): value is number => value !== undefined,
+          );
+          existing.remainingFraction = measured.length ? Math.min(...measured) : undefined;
+          existing.displayName ||= item.displayName;
+          existing.resetTime ||= item.resetTime;
+          continue;
+        }
+      }
       groupBuckets.push(item);
       buckets.push(item);
+      if (group !== topLevelGroup && key) groupedBuckets.set(key, [...(groupedBuckets.get(key) || []), item]);
     }
     if (groupBuckets.length > 0 || groupName) {
       groups.push({

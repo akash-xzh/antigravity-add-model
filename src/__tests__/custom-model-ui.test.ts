@@ -275,6 +275,69 @@ describe('custom model settings in the preserved vendor preload', () => {
     expect(f.document.getElementById('agy-modal-overlay')).toBeNull();
   });
 
+  it('preserves document and nested scroll when deleting and focuses the adjacent surviving row without scrolling', async () => {
+    const f = await fixture('<div id="nested" style="overflow:auto"><section id="settings"><h2>Models &amp; Usage</h2></section></div>',
+      [model, { ...model, name: 'models/next', displayName: 'Next' }]);
+    const nested = f.document.getElementById('nested')!;
+    const documentScroll = f.document.documentElement;
+    nested.scrollTop = 640;
+    nested.scrollLeft = 40;
+    documentScroll.scrollTop = 120;
+    const content = f.document.getElementById('agy-custom-models-content')!;
+    const replace = content.replaceChildren.bind(content);
+    const replacements: number[] = [];
+    vi.spyOn(content, 'replaceChildren').mockImplementation((...nodes) => {
+      replace(...nodes);
+      replacements.push(content.childElementCount);
+      // Simulate a browser clamping the scroll while its content is replaced.
+      nested.scrollTop = 0;
+      nested.scrollLeft = 0;
+      documentScroll.scrollTop = 0;
+    });
+    const focus = vi.spyOn(f.dom.window.HTMLElement.prototype, 'focus');
+    const firstRow = content.querySelector<HTMLElement>('[data-model-name="models/primary"]')!;
+    await f.click('Delete', firstRow);
+    await f.click('Delete model', f.document.querySelector('[role="dialog"]')!);
+    expect(replacements).toEqual([1]);
+    expect(nested.scrollTop).toBe(640);
+    expect(nested.scrollLeft).toBe(40);
+    expect(documentScroll.scrollTop).toBe(120);
+    const active = f.document.activeElement as HTMLElement;
+    expect(active.closest<HTMLElement>('[data-model-name]')?.dataset.modelName).toBe('models/next');
+    expect(active.textContent).toBe('Delete');
+    expect(focus.mock.calls.at(-1)).toEqual([{ preventScroll: true }]);
+  });
+
+  it('restores cancel and final deletion focus without scrolling the page', async () => {
+    const f = await fixture();
+    const removeButton = [...f.document.querySelectorAll<HTMLButtonElement>('button')].find((node) => node.textContent === 'Delete')!;
+    removeButton.focus();
+    const restoreFocus = vi.spyOn(removeButton, 'focus');
+    await f.click('Delete');
+    await f.click('Cancel', f.document.querySelector('[role="dialog"]')!);
+    expect(restoreFocus).toHaveBeenCalledWith({ preventScroll: true });
+    const add = f.document.getElementById('agy-add-model')!;
+    const addFocus = vi.spyOn(add, 'focus');
+    await f.click('Delete');
+    await f.click('Delete model', f.document.querySelector('[role="dialog"]')!);
+    expect(addFocus).toHaveBeenCalledWith({ preventScroll: true });
+  });
+
+  it('does not steal focus if the user moves to the native prompt while the model list refreshes', async () => {
+    const f = await fixture('<section id="settings"><h2>Models &amp; Usage</h2></section><textarea id="native-prompt"></textarea>');
+    const read = f.handlers['storage:get-custom-models'];
+    let finish!: () => void;
+    f.handlers['storage:get-custom-models'] = () => new Promise((resolve) => { finish = () => resolve(read()); });
+    await f.click('Delete');
+    await f.click('Delete model', f.document.querySelector('[role="dialog"]')!);
+    const prompt = f.document.getElementById('native-prompt')!;
+    prompt.focus();
+    finish();
+    await settle();
+    expect(f.getModels()).toHaveLength(0);
+    expect(f.document.activeElement).toBe(prompt);
+  });
+
   it('does not close a new dialog when a previously confirmed deletion finishes', async () => {
     const f = await fixture();
     const remove = f.handlers['storage:delete-custom-model'];
@@ -1125,6 +1188,64 @@ describe('custom model settings in the preserved vendor preload', () => {
 
 describe('Google fleet and native picker search', () => {
   const pool = (name: string, id: string) => ({ ...model, name, provider:'google-cloudcode', googleAccounts:[{id,email:`${id}@example.com`,authMode:'antigravity'}] });
+  it('groups a shared email once while preserving every model account, quota and action scope', async () => {
+    const first = { ...pool('models/one', 'first-id'), displayName: 'First pool', googleAccounts: [
+      { id: 'first-id', email: ' Shared@Example.com ', authMode: 'antigravity', project: 'project-one', cloudCodeEndpoint: 'https://one.example' },
+    ] };
+    const second = { ...pool('models/two', 'second-id'), displayName: 'Second pool', googlePool: { preferredAccountId: 'second-id' }, googleAccounts: [
+      { id: 'second-id', email: 'shared@example.com', authMode: 'antigravity', project: 'project-two', cloudCodeEndpoint: 'https://two.example' },
+    ] };
+    const f = await fixture(undefined, [first, second]);
+    f.handlers['storage:google-test-account'] = ({ modelName }) => ({ success: true, quota: {
+      buckets: [{ id: modelName === first.name ? 'gemini' : 'claude', remainingFraction: modelName === first.name ? 0.2 : 0.8 }],
+    } });
+    await f.click('Refresh quotas');
+    const fleet = f.document.getElementById('agy-google-account-pool-section')!;
+    expect(fleet.querySelectorAll('tbody > tr')).toHaveLength(1);
+    expect(fleet.textContent).toContain('Google account fleet · 1 account');
+    expect(fleet.textContent).toContain('2 model pools');
+    const member = (name: string) => [...fleet.querySelectorAll<HTMLElement>('.agy-fleet-pool')].find((node) => node.dataset.modelName === name)!;
+    expect(member(first.name).textContent).toContain('project-one');
+    expect(member(second.name).textContent).toContain('project-two');
+    expect(member(first.name).querySelector('progress')?.value).toBe(0.2);
+    expect(member(second.name).querySelector('progress')?.value).toBe(0.8);
+    expect(member(first.name).querySelector('.agy-pool-badge')?.textContent).toBe('Automatic');
+    expect(member(second.name).querySelector('.agy-pool-badge')?.textContent).toBe('Preferred');
+    expect(f.invoke).toHaveBeenCalledWith('storage:google-test-account', { modelName: first.name, accountId: 'first-id' });
+    expect(f.invoke).toHaveBeenCalledWith('storage:google-test-account', { modelName: second.name, accountId: 'second-id' });
+    await f.click('Use preferred', member(second.name));
+    expect(f.invoke).toHaveBeenCalledWith('storage:google-select-account', { modelName: second.name, accountId: 'second-id' });
+    await f.click('Reconnect', member(second.name));
+    await vi.waitFor(() => expect(f.invoke).toHaveBeenCalledWith('storage:google-link-account', {
+      modelName: second.name, accountId: 'pending-account', replaceAccountId: 'second-id',
+    }));
+    await f.click('Remove', member(first.name));
+    expect(f.document.querySelector('[role="dialog"]')?.textContent).toContain('from models/one');
+    await f.click('Remove account', f.document.querySelector('[role="dialog"]')!);
+    expect(f.invoke).toHaveBeenCalledWith('storage:google-remove-account', { modelName: first.name, accountId: 'first-id' });
+    expect(f.invoke).not.toHaveBeenCalledWith('storage:google-remove-account', { modelName: second.name, accountId: 'first-id' });
+  });
+
+  it('keeps distinct known emails separate even when their account IDs match', async () => {
+    const f = await fixture(undefined, ['one', 'two'].map((name) => ({ ...pool(`models/${name}`, 'same-id'),
+      googleAccounts: [{ id: 'same-id', email: `${name}@example.com`, authMode: 'antigravity' }],
+    })));
+    expect(f.document.querySelectorAll('.agy-fleet-table tbody > tr')).toHaveLength(2);
+  });
+
+  it('uses account IDs for unknown identities and groups verified emails after quota refresh', async () => {
+    const f = await fixture(undefined, ['one', 'two', 'three'].map((name) => ({ ...pool(`models/${name}`, 'unused'),
+      googleAccounts: [{ id: name === 'three' ? 'third-id' : 'shared-id', label: 'Account', authMode: 'antigravity' }],
+    })));
+    expect(f.document.querySelectorAll('.agy-fleet-table tbody > tr')).toHaveLength(2);
+    f.handlers['storage:google-test-account'] = () => ({ success: true, quota: { email: 'verified@example.com', buckets: [] } });
+    await f.click('Refresh quotas');
+    expect(f.document.querySelectorAll('.agy-fleet-table tbody > tr')).toHaveLength(1);
+    expect(f.document.querySelectorAll('.agy-fleet-pool')).toHaveLength(3);
+    expect(f.document.querySelector('.agy-fleet-label')?.textContent).toBe('verified@example.com');
+    expect(f.document.querySelectorAll('.agy-fleet-pool progress')).toHaveLength(0);
+  });
+
   it('clears a deleted preference when editing an account pool', async () => {
     const configured = { ...pool('models/edit-pool', 'primary'), googlePool: { preferredAccountId: 'primary' }, googleAccounts: [
       { id: 'primary', accessToken: '********', authMode: 'antigravity' },

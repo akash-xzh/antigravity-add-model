@@ -559,6 +559,140 @@ describe('Google account selection and quota', () => {
     });
   });
 
+  it('combines grouped Claude quota with top-level Gemini quota without excluding Gemini', async () => {
+    const endpoint = await serve((_req, res) =>
+      res.end(
+        JSON.stringify({
+          groups: [{ name: 'Claude and GPT models', buckets: [{ bucketId: 'weekly', remainingFraction: 0 }] }],
+          buckets: [{ bucketId: 'gemini-weekly', remainingFraction: 0.8 }],
+        }),
+      ),
+    );
+    const entry = account('mixed-shape');
+    const snapshot = await fetchGoogleQuota(entry, endpoint);
+    expect(snapshot.buckets).toEqual([
+      expect.objectContaining({ id: 'weekly', groupName: 'Claude and GPT models', remainingFraction: 0 }),
+      expect.objectContaining({ id: 'gemini-weekly', remainingFraction: 0.8 }),
+    ]);
+    expect(snapshot.groups?.map((group) => group.name)).toEqual(['Claude and GPT models', 'Models']);
+    const lease = await acquireGoogleAccount('gemini-2.5-pro', [entry], { strategy: 'quota' });
+    lease.release();
+    await expect(acquireGoogleAccount('claude-sonnet', [entry])).rejects.toThrow(/quota/);
+  });
+
+  it.each([
+    ['empty groups', { groups: [], buckets: [{ id: 'gemini', remainingFraction: 0.8 }] }],
+    ['groups only', { groups: [{ name: 'Gemini', buckets: [{ id: 'gemini', remainingFraction: 0.8 }] }] }],
+    ['buckets only', { buckets: [{ id: 'gemini', remainingFraction: 0.8 }] }],
+  ])('preserves reported quota with %s', async (_label, payload) => {
+    const endpoint = await serve((_req, res) => res.end(JSON.stringify(payload)));
+    const snapshot = await fetchGoogleQuota(account('single-source'), endpoint);
+    expect(snapshot.buckets).toHaveLength(1);
+    expect(snapshot.buckets[0]).toMatchObject({ id: 'gemini', remainingFraction: 0.8 });
+  });
+
+  it.each([
+    [0.8, 0.4, 0.4],
+    [undefined, 0, 0],
+    [0.8, undefined, 0.8],
+    [undefined, undefined, undefined],
+  ])('deduplicates repeated buckets conservatively (%s / %s)', async (grouped, flat, expected) => {
+    const resetTime = new Date(Date.now() + 3_600_000).toISOString();
+    const endpoint = await serve((_req, res) =>
+      res.end(
+        JSON.stringify({
+          groups: [
+            { name: 'Gemini Models', buckets: [{ bucketId: 'gemini-weekly', remainingFraction: grouped, resetTime }] },
+          ],
+          buckets: [{ bucketId: 'gemini-weekly', remainingFraction: flat, resetTime }],
+        }),
+      ),
+    );
+    const entry = account('duplicate');
+    const snapshot = await fetchGoogleQuota(entry, endpoint);
+    expect(snapshot.buckets).toHaveLength(1);
+    expect(snapshot.groups).toHaveLength(1);
+    expect(snapshot.groups![0].buckets).toEqual(snapshot.buckets);
+    expect(snapshot.buckets[0]).toMatchObject({ groupName: 'Gemini Models', remainingFraction: expected, resetTime });
+    expect(snapshot.remainingFraction).toBe(expected);
+    if (expected === 0) await expect(acquireGoogleAccount('gemini-2.5-pro', [entry])).rejects.toThrow(/quota/);
+    else (await acquireGoogleAccount('gemini-2.5-pro', [entry])).release();
+  });
+
+  it('keeps distinct families that reuse a generic bucket ID', async () => {
+    const endpoint = await serve((_req, res) =>
+      res.end(
+        JSON.stringify({
+          groups: [{ name: 'Claude and GPT models', buckets: [{ bucketId: 'weekly', remainingFraction: 0 }] }],
+          buckets: [{ bucketId: 'weekly', displayName: 'Gemini', remainingFraction: 0.8 }],
+        }),
+      ),
+    );
+    const entry = account('generic-id');
+    const snapshot = await fetchGoogleQuota(entry, endpoint);
+    expect(snapshot.buckets).toHaveLength(2);
+    expect(snapshot.buckets.map((bucket) => bucket.remainingFraction)).toEqual([0, 0.8]);
+    (await acquireGoogleAccount('gemini-2.5-pro', [entry])).release();
+    await expect(acquireGoogleAccount('claude-sonnet', [entry])).rejects.toThrow(/quota/);
+  });
+
+  it('does not assign an unknown flat bucket to a named family or fabricate its quota', async () => {
+    const endpoint = await serve((_req, res) =>
+      res.end(
+        JSON.stringify({
+          groups: [{ name: 'Claude and GPT models', buckets: [{ bucketId: 'weekly', remainingFraction: 0 }] }],
+          buckets: [{ bucketId: 'weekly' }],
+        }),
+      ),
+    );
+    const entry = account('unknown-flat');
+    const snapshot = await fetchGoogleQuota(entry, endpoint);
+    expect(snapshot.buckets).toHaveLength(2);
+    expect(snapshot.buckets[1]).toEqual({ id: 'weekly', remainingFraction: undefined, resetTime: undefined });
+    (await acquireGoogleAccount('gemini-2.5-pro', [entry])).release();
+  });
+
+  it('keeps different model labels in the same family when they reuse a generic bucket ID', async () => {
+    const endpoint = await serve((_req, res) =>
+      res.end(
+        JSON.stringify({
+          groups: [{ name: 'Gemini Flash', buckets: [{ bucketId: 'weekly', remainingFraction: 0 }] }],
+          buckets: [{ bucketId: 'weekly', displayName: 'Gemini Pro', remainingFraction: 0.8 }],
+        }),
+      ),
+    );
+    const entry = account('different-gemini-models');
+    const snapshot = await fetchGoogleQuota(entry, endpoint);
+    expect(snapshot.buckets).toHaveLength(2);
+    expect(snapshot.buckets[0]).toMatchObject({ groupName: 'Gemini Flash', remainingFraction: 0 });
+    expect(snapshot.buckets[1]).toMatchObject({ displayName: 'Gemini Pro', remainingFraction: 0.8 });
+    (await acquireGoogleAccount('gemini-pro', [entry])).release();
+  });
+
+  it('keeps conflicting reset windows and ambiguous grouped matches separate', async () => {
+    const resetTime = new Date(Date.now() + 3_600_000).toISOString();
+    const laterReset = new Date(Date.now() + 7_200_000).toISOString();
+    const endpoint = await serve((_req, res) =>
+      res.end(
+        JSON.stringify({
+          groups: [
+            { name: 'Gemini Flash', buckets: [{ bucketId: 'gemini-weekly', remainingFraction: 0.8, resetTime }] },
+            { name: 'Gemini Pro', buckets: [{ bucketId: 'gemini-weekly', remainingFraction: 0.6, resetTime }] },
+            { name: 'Claude', buckets: [{ bucketId: 'claude-weekly', remainingFraction: 0.3, resetTime }] },
+          ],
+          buckets: [
+            { bucketId: 'gemini-weekly', remainingFraction: 0.9, resetTime },
+            { bucketId: 'claude-weekly', remainingFraction: 0.9, resetTime: laterReset },
+          ],
+        }),
+      ),
+    );
+    const snapshot = await fetchGoogleQuota(account('ambiguous'), endpoint);
+    expect(snapshot.buckets).toHaveLength(5);
+    expect(snapshot.groups).toHaveLength(4);
+    expect(snapshot.buckets.map((bucket) => bucket.remainingFraction)).toEqual([0.8, 0.6, 0.3, 0.9, 0.9]);
+  });
+
   it('parses separate Gemini and Claude/GPT quota groups and routes requests according to model family', async () => {
     const endpoint = await serve((req, res) => {
       expect(req.url).toBe('/v1internal:retrieveUserQuotaSummary');

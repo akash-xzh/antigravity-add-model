@@ -2,6 +2,12 @@
 
 Release history preserved from the project README. Historical entries describe the behavior of their release; see [compatibility and recovery](docs/compatibility.md) for current installation guidance.
 
+### Unreleased — Compaction resume and account panel fixes
+
+- Address [issue #26](https://github.com/vahapogut/antigravity-add-model/issues/26): remove historical subagent route markers from JSON `initialPrompt` snapshots before scanning active routes. Compacted parent conversations can resume after a proxy restart without binding to a quoted child route; actual expired, ambiguous or parent-replacing routes still fail explicitly.
+- Address [issue #25](https://github.com/vahapogut/antigravity-add-model/issues/25): read grouped and top-level Google quota buckets together, retaining distinct quota families and unknown values. Display a shared Google email once with all assigned model pools, keeping each pool's credentials, project, quotas and actions separate.
+- Preserve model-list scroll position after deletion and return keyboard focus to an adjacent model without scrolling. Build replacement content before swapping it into the page, and respect focus changes while a refresh is pending.
+
 ### Unreleased — Account quota controls and model search
 
 - Add grouped Google quota cards with supplied reset times to desktop settings and the IDE web manager, plus per-pool preferred-account, reconnect and removal actions. Preserve new OAuth tokens during reconnect and retain the owning model when querying accounts across multiple pools.
