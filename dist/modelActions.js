@@ -39,6 +39,8 @@ const path = __importStar(require("node:path"));
 const modelIdentity_1 = require("./modelIdentity");
 const modelUtils_1 = require("./proxy/modelUtils");
 const chatContext_1 = require("./chatContext");
+const promptSections_1 = require("./proxy/promptSections");
+const modelHealth_1 = require("./proxy/modelHealth");
 function createModelActions(manager) {
     return {
         'storage:get-custom-models': () => {
@@ -58,7 +60,7 @@ function createModelActions(manager) {
                         'Native model identity metadata is unavailable. Retry after resolving the local metadata error.';
             }
             const byName = new Map(identities.map((identity) => [identity.name, identity]));
-            const recent = (0, diagnostics_1.getRecentModelNames)();
+            const recent = [...new Set([...(0, modelHealth_1.getRecentModels)(), ...(0, diagnostics_1.getRecentModelNames)()])];
             const rank = (name) => {
                 const index = recent.indexOf(name);
                 return index < 0 ? recent.length : index;
@@ -69,6 +71,7 @@ function createModelActions(manager) {
                 const capabilities = (0, modelUtils_1.nativeCatalogCapabilities)(model);
                 return {
                     ...model,
+                    isRecent: (0, modelHealth_1.isRecentModel)(model.name) || recent.slice(0, 3).includes(model.name),
                     nativeCatalogId: identity?.catalogId,
                     nativeModelId: identity?.placeholderId,
                     nativePickerAvailable: !!identity?.placeholderId,
@@ -112,6 +115,40 @@ function createModelActions(manager) {
         'storage:get-diagnostics': diagnostics_1.getDiagnostics,
         'storage:clear-diagnostics': diagnostics_1.clearDiagnostics,
         'storage:get-chat-context-usage': (payload) => (0, chatContext_1.getContextInformation)(payload, path.dirname(manager.store.filename), manager.store.list()),
+        'storage:get-prompt-sections': () => ({
+            success: true,
+            tags: promptSections_1.STATIC_TAGS,
+            defaults: promptSections_1.DEFAULT_PROMPT_SECTIONS,
+            config: (0, promptSections_1.loadPromptSectionsConfig)(),
+        }),
+        'storage:save-prompt-sections': (config) => {
+            (0, promptSections_1.savePromptSectionsConfig)(config);
+            return { success: true };
+        },
+        'storage:reset-prompt-sections': () => {
+            (0, promptSections_1.savePromptSectionsConfig)({ overrides: {}, enabled: {} });
+            return {
+                success: true,
+                tags: promptSections_1.STATIC_TAGS,
+                defaults: promptSections_1.DEFAULT_PROMPT_SECTIONS,
+                config: { overrides: {}, enabled: {} },
+            };
+        },
+        'storage:get-model-health': () => {
+            return Object.fromEntries((0, modelHealth_1.getCachedHealthMap)());
+        },
+        'storage:check-model-health': async (name) => {
+            const models = manager.store.list();
+            if (typeof name === 'string' && name.trim()) {
+                const target = models.find((m) => m.name === name.trim());
+                if (target) {
+                    const res = await (0, modelHealth_1.pingCustomModel)(target);
+                    return { [target.name]: res };
+                }
+            }
+            const healthMap = await (0, modelHealth_1.checkAllModelsHealth)(models, true);
+            return Object.fromEntries(healthMap);
+        },
     };
 }
 //# sourceMappingURL=modelActions.js.map

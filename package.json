@@ -40,6 +40,7 @@
     "ide:mcp": "node scripts/ide-mcp.mjs",
     "proxy:start": "node scripts/desktop-service.mjs start",
     "proxy:stop": "node scripts/desktop-service.mjs stop",
+    "proxy:restart": "node scripts/desktop-service.mjs restart",
     "proxy:status": "node scripts/desktop-service.mjs status",
     "model:mcp": "node scripts/model-delegation-mcp.mjs",
     "workers-ai:setup": "node scripts/workers-ai.mjs",

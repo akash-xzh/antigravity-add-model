@@ -133,7 +133,7 @@ export function getDiagnostics() {
 export function getRecentModelNames(): string[] {
   return [
     ...new Set(requests.filter((r) => r.outcome === 'succeeded' && r.kind === 'request').map((r) => r.model)),
-  ].slice(0, 5);
+  ].slice(0, 3);
 }
 
 export function clearDiagnostics() {

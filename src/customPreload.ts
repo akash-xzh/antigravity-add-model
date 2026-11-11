@@ -102,6 +102,30 @@ const storageAPI = {
   getPresets: (): Promise<ProviderPreset[]> => ipcRenderer.invoke('storage:get-provider-presets'),
   discoverModels: (params: Partial<CustomModelEntry>): Promise<DiscoveryResult> =>
     ipcRenderer.invoke('storage:discover-models', params),
+  getModelHealth: (): Promise<
+    Record<
+      string,
+      {
+        status: 'healthy' | 'slow' | 'unhealthy' | 'cooldown';
+        error?: string;
+        latencyMs?: number;
+        checkedAt: number;
+      }
+    >
+  > => ipcRenderer.invoke('storage:get-model-health'),
+  checkModelHealth: (
+    name?: string,
+  ): Promise<
+    Record<
+      string,
+      {
+        status: 'healthy' | 'slow' | 'unhealthy' | 'cooldown';
+        error?: string;
+        latencyMs?: number;
+        checkedAt: number;
+      }
+    >
+  > => ipcRenderer.invoke('storage:check-model-health', name),
 };
 
 window.addEventListener('DOMContentLoaded', () => {
@@ -1213,7 +1237,16 @@ window.addEventListener('DOMContentLoaded', () => {
     if (!target) return;
     const version = ++renderVersion;
     try {
-      const models = await storageAPI.getCustomModels();
+      const [models, healthMap] = await Promise.all([
+        storageAPI.getCustomModels(),
+        storageAPI.getModelHealth().catch(
+          () =>
+            ({} as Record<
+              string,
+              { status: 'healthy' | 'unhealthy'; error?: string; latencyMs?: number; checkedAt: number }
+            >),
+        ),
+      ]);
       if (version !== renderVersion || !target.isConnected) return;
       const restoreScroll = captureScrollPosition(target);
       modelList = models;
@@ -1242,8 +1275,14 @@ window.addEventListener('DOMContentLoaded', () => {
               : 'Add a provider model, discover a local server, or import a configuration to get started.',
           ),
         );
-      for (const models of groups.values()) {
-        const first = models[0];
+      const sortedGroups = Array.from(groups.values()).sort((groupA, groupB) => {
+        const recentA = groupA.some((m) => m.isRecent) ? 1 : 0;
+        const recentB = groupB.some((m) => m.isRecent) ? 1 : 0;
+        return recentB - recentA;
+      });
+      for (const groupModels of sortedGroups) {
+        const modelsInGroup = [...groupModels].sort((a, b) => (b.isRecent ? 1 : 0) - (a.isRecent ? 1 : 0));
+        const first = modelsInGroup[0];
         const group = element('section', 'agy-group');
         const header = element('div', 'agy-group-heading');
         const heading = element('div');
@@ -1251,19 +1290,19 @@ window.addEventListener('DOMContentLoaded', () => {
           element(
             'h3',
             '',
-            `${first.provider} · ${models.filter((model) => model.enabled !== false).length}/${models.length} enabled`,
+            `${first.provider} · ${modelsInGroup.filter((model) => model.enabled !== false).length}/${modelsInGroup.length} enabled`,
           ),
           element('div', 'agy-muted', first.apiUrl),
         );
         const groupStatus = statusNode();
         const actions = element('div', 'agy-actions');
         actions.append(button('Discover models', () => openModelModal(first, 'discover'), groupStatus));
-        const allEnabled = models.every((model) => model.enabled !== false);
+        const allEnabled = modelsInGroup.every((model) => model.enabled !== false);
         actions.append(
           button(
             allEnabled ? 'Disable group' : 'Enable group',
             async () => {
-              for (const model of models)
+              for (const model of modelsInGroup)
                 requireSuccess(await storageAPI.saveCustomModel({ ...model, enabled: !allEnabled }));
               await modelsChanged();
             },
@@ -1272,14 +1311,45 @@ window.addEventListener('DOMContentLoaded', () => {
         );
         header.append(heading, actions);
         group.append(header, groupStatus);
-        for (const model of models) {
+        for (const model of modelsInGroup) {
+          const rawName = model.displayName || model.name;
+          const cleanName = rawName.replace(/^⭐\s*/u, '').replace(/^[🟢🔴⚪🟡⭐\s•·|-]+(?:\[[^\]]+\]\s*)?[•·|-]?\s*/u, '').trim();
+          const health = healthMap ? healthMap[model.name] : undefined;
+          const isRecent = Boolean(model.isRecent);
+          const starPrefix = isRecent ? '⭐ ' : '';
+          const statusDot = health?.status === 'slow'
+            ? '🟡'
+            : health?.status === 'cooldown'
+              ? '🟡'
+              : !health || health.status === 'healthy'
+                ? '🟢'
+                : '🔴';
+          const latencyText = health?.latencyMs !== undefined ? ` · ${health.latencyMs}ms` : '';
+          const statusNotice = health?.status === 'slow'
+            ? ' · Slow'
+            : health?.status === 'cooldown'
+              ? ' · Cooldown (429)'
+              : health?.error
+                ? ` · [${health.error}]`
+                : '';
+
           const row = element('div', 'agy-row');
           row.dataset.modelName = model.name;
           row.dataset.enabled = String(model.enabled !== false);
           const info = element('div', 'agy-row-info');
+          const titleEl = element('strong', '', `${starPrefix}${statusDot} ${cleanName}`);
+          titleEl.title = health
+            ? health.status === 'healthy'
+              ? `Healthy${latencyText} · Checked ${new Date(health.checkedAt).toLocaleTimeString()}`
+            : health.status === 'slow'
+              ? `Slow response (${health.latencyMs}ms) · Checked ${new Date(health.checkedAt).toLocaleTimeString()}`
+            : health.status === 'cooldown'
+              ? `Cooldown / Rate Limit (429) · Checked ${new Date(health.checkedAt).toLocaleTimeString()}`
+              : `Unhealthy: ${health.error || 'Failed'} · Checked ${new Date(health.checkedAt).toLocaleTimeString()}`
+            : 'Status unknown';
           info.append(
-            element('strong', '', model.displayName || model.name),
-            element('div', 'agy-muted', model.externalModelName),
+            titleEl,
+            element('div', 'agy-muted', `${model.externalModelName || ''}${latencyText}${statusNotice}${isRecent ? ' · Recent' : ''}`),
           );
           if (model.nativePickerAvailable === false) info.append(element('div', 'agy-muted',
             typeof model.nativePickerError === 'string' ? model.nativePickerError :
@@ -1293,6 +1363,25 @@ window.addEventListener('DOMContentLoaded', () => {
               async () => {
                 requireSuccess(await storageAPI.saveCustomModel({ ...model, enabled: model.enabled === false }));
                 await modelsChanged();
+              },
+              rowStatus,
+            ),
+            button(
+              'Check',
+              async () => {
+                setStatus(rowStatus, 'Checking…');
+                try {
+                  const checkRes = await storageAPI.checkModelHealth(model.name);
+                  const mHealth = checkRes[model.name];
+                  if (mHealth?.status === 'healthy') {
+                    setStatus(rowStatus, `🟢 Healthy (${mHealth.latencyMs || 0}ms)`);
+                  } else {
+                    setStatus(rowStatus, `🔴 Unhealthy (${mHealth?.error || 'Failed'})`, true);
+                  }
+                  void renderCustomModelsList();
+                } catch (e: unknown) {
+                  setStatus(rowStatus, (e as Error)?.message || 'Check failed', true);
+                }
               },
               rowStatus,
             ),
@@ -1449,15 +1538,18 @@ window.addEventListener('DOMContentLoaded', () => {
         'agy-model-id',
         mode === 'discover' ? '' : existing?.externalModelName || '',
       );
+      const cleanExistingDisplayName = (existing?.displayName || '')
+        .replace(/^[🟢🔴⚪🟡⭐\s•·|-]+(?:\[[^\]]+\]\s*)?[•·|-]?\s*/u, '')
+        .trim();
       const displayName = field(
         grid,
         'Display name',
         'agy-display-name',
         mode === 'duplicate'
-          ? `${existing?.displayName || existing?.externalModelName || ''} copy`
+          ? `${cleanExistingDisplayName || existing?.externalModelName || ''} copy`
           : mode === 'discover'
             ? ''
-            : existing?.displayName || '',
+            : cleanExistingDisplayName,
       );
       body.append(grid);
       const name = field(
@@ -1779,7 +1871,10 @@ window.addEventListener('DOMContentLoaded', () => {
           apiUrl: apiUrl.value.trim(),
           apiKey: keylessOpencode() ? 'none' : apiKey.value.trim() || 'none',
           externalModelName: id.trim(),
-          displayName: title || id.trim(),
+          displayName:
+            (title || id.trim())
+              .replace(/^[🟢🔴⚪🟡⭐\s•·|-]+(?:\[[^\]]+\]\s*)?[•·|-]?\s*/u, '')
+              .trim() || id.trim(),
           description: description.value.trim(),
           enabled: enabled.value === 'true',
           apiFormat: apiFormat.value,
@@ -2226,6 +2321,135 @@ window.addEventListener('DOMContentLoaded', () => {
     await refresh();
   }
 
+  async function openPromptSections(): Promise<void> {
+    const { body, status, close } = openModal('System prompt sections');
+    try {
+      const data = (await ipcRenderer.invoke('storage:get-prompt-sections')) as {
+        success: boolean;
+        tags: string[];
+        defaults: Record<string, string>;
+        config: { overrides: Record<string, string>; enabled: Record<string, boolean> };
+      };
+      if (!body.isConnected) return;
+      requireSuccess(data);
+
+      body.append(
+        element(
+          'p',
+          'agy-muted',
+          'Customize static sections of Antigravity’s system prompt (<identity>, <guidelines>, etc.). Dynamic sections like active workspaces, tools, and skills are preserved automatically.',
+        ),
+      );
+
+      const sectionLabels: Record<string, string> = {
+        identity: 'Identity (<identity>)',
+        guidelines: 'Behavior & Security Guidelines (<guidelines>)',
+        communication_style: 'Communication Style (<communication_style>)',
+        artifacts: 'Artifacts Instruction (<artifacts>)',
+        messaging: 'Messaging & Reactive Wakeup (<messaging>)',
+        conversation_transcript: 'Transcript Format (<conversation_transcript>)',
+      };
+
+      const textareas = new Map<string, HTMLTextAreaElement>();
+      const checkboxes = new Map<string, HTMLInputElement>();
+
+      for (const tag of data.tags) {
+        const details = element('details');
+        const summary = element('summary');
+        const isEnabled = data.config.enabled?.[tag] !== false;
+        const currentCustom = data.config.overrides?.[tag] ?? '';
+        const defaultText = data.defaults?.[tag] ?? '';
+
+        const titleSpan = element('span', '', sectionLabels[tag] || tag);
+        summary.append(titleSpan);
+        details.append(summary);
+
+        const enableLabel = element('label', 'agy-fleet-fallback');
+        const enableCheck = element('input');
+        enableCheck.type = 'checkbox';
+        enableCheck.checked = isEnabled;
+        checkboxes.set(tag, enableCheck);
+
+        enableLabel.append(enableCheck, element('span', '', 'Include this section'));
+        details.append(enableLabel);
+
+        const area = textAreaField(
+          details,
+          'Content (leave empty to use default)',
+          `agy-prompt-section-${tag}`,
+          currentCustom,
+          defaultText,
+        );
+        area.rows = 8;
+        textareas.set(tag, area);
+
+        const sectionToolbar = element('div', 'agy-actions');
+        sectionToolbar.append(
+          button('Use default as template', () => {
+            area.value = defaultText;
+          }),
+          button('Clear override', () => {
+            area.value = '';
+          }),
+        );
+        details.append(sectionToolbar);
+
+        body.append(details);
+      }
+
+      const actions = element('div', 'agy-actions');
+      actions.append(
+        button(
+          'Save prompt settings',
+          async () => {
+            const overrides: Record<string, string> = {};
+            const enabled: Record<string, boolean> = {};
+
+            for (const tag of data.tags) {
+              const val = textareas.get(tag)?.value ?? '';
+              if (val.trim()) {
+                overrides[tag] = val.trim();
+              }
+              const en = checkboxes.get(tag)?.checked ?? true;
+              if (!en) {
+                enabled[tag] = false;
+              }
+            }
+
+            requireSuccess(
+              await ipcRenderer.invoke('storage:save-prompt-sections', {
+                overrides,
+                enabled,
+              }),
+            );
+            setStatus(status, 'System prompt sections saved successfully.');
+          },
+          status,
+          true,
+        ),
+        button(
+          'Reset all to default',
+          async () => {
+            requireSuccess(await ipcRenderer.invoke('storage:reset-prompt-sections'));
+            for (const tag of data.tags) {
+              const area = textareas.get(tag);
+              if (area) area.value = '';
+              const chk = checkboxes.get(tag);
+              if (chk) chk.checked = true;
+            }
+            setStatus(status, 'All sections reset to defaults.');
+          },
+          status,
+        ),
+        button('Close', close),
+      );
+
+      body.append(actions);
+    } catch (error) {
+      if (body.isConnected) setStatus(status, error instanceof Error ? error.message : String(error), true);
+    }
+  }
+
   async function openGateway(): Promise<void> {
     const { body, status } = openModal('Remote gateway');
     try {
@@ -2353,8 +2577,19 @@ window.addEventListener('DOMContentLoaded', () => {
     const actions = element('div', 'agy-actions');
     actions.append(
       button('Discover local', discoverLocal),
+      button('Check health', async () => {
+        setStatus(status, 'Checking health of all models…');
+        try {
+          await storageAPI.checkModelHealth();
+          setStatus(status, 'Health check complete.');
+          void renderCustomModelsList();
+        } catch (e: unknown) {
+          setStatus(status, (e as Error)?.message || 'Health check failed', true);
+        }
+      }),
       button('Import', () => openImportExport('import')),
       button('Export', () => openImportExport('export')),
+      button('System Prompt', openPromptSections),
       button('Remote gateway', openGateway),
       button('Diagnostics', openDiagnostics),
     );
@@ -2666,4 +2901,13 @@ window.addEventListener('DOMContentLoaded', () => {
 
   // Start the observer
   setupInjectionObserver();
+
+  window.addEventListener('focus', () => {
+    void renderCustomModelsList();
+  });
+  setInterval(() => {
+    if (document.visibilityState === 'visible') {
+      void renderCustomModelsList();
+    }
+  }, 4000);
 });

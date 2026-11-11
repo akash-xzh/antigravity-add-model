@@ -114,7 +114,7 @@ function getDiagnostics() {
 function getRecentModelNames() {
     return [
         ...new Set(requests.filter((r) => r.outcome === 'succeeded' && r.kind === 'request').map((r) => r.model)),
-    ].slice(0, 5);
+    ].slice(0, 3);
 }
 function clearDiagnostics() {
     epoch += 1;

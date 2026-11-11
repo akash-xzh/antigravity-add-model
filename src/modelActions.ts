@@ -5,6 +5,21 @@ import * as path from 'node:path';
 import { allocateModelIdentities } from './modelIdentity';
 import { nativeCatalogCapabilities, nativeModelExperiments, type CustomModelConfig } from './proxy/modelUtils';
 import { getContextInformation } from './chatContext';
+import {
+  DEFAULT_PROMPT_SECTIONS,
+  loadPromptSectionsConfig,
+  PromptSectionsConfig,
+  savePromptSectionsConfig,
+  STATIC_TAGS,
+} from './proxy/promptSections';
+import {
+  getCachedHealthMap,
+  pingCustomModel,
+  checkAllModelsHealth,
+  getRecentModels,
+  isRecentModel,
+} from './proxy/modelHealth';
+import type { CustomModel } from './proxy';
 
 export function createModelActions(
   manager: ReturnType<typeof createModelManager>,
@@ -26,7 +41,7 @@ export function createModelActions(
           'Native model identity metadata is unavailable. Retry after resolving the local metadata error.';
       }
       const byName = new Map(identities.map((identity) => [identity.name, identity]));
-      const recent = getRecentModelNames();
+      const recent = [...new Set([...getRecentModels(), ...getRecentModelNames()])];
       const rank = (name: string) => {
         const index = recent.indexOf(name);
         return index < 0 ? recent.length : index;
@@ -37,6 +52,7 @@ export function createModelActions(
           const capabilities = nativeCatalogCapabilities(model as CustomModelConfig);
           return {
             ...model,
+            isRecent: isRecentModel(model.name) || recent.slice(0, 3).includes(model.name),
             nativeCatalogId: identity?.catalogId,
             nativeModelId: identity?.placeholderId,
             nativePickerAvailable: !!identity?.placeholderId,
@@ -81,5 +97,39 @@ export function createModelActions(
     'storage:clear-diagnostics': clearDiagnostics,
     'storage:get-chat-context-usage': (payload?: unknown) =>
       getContextInformation(payload, path.dirname(manager.store.filename), manager.store.list()),
+    'storage:get-prompt-sections': () => ({
+      success: true,
+      tags: STATIC_TAGS,
+      defaults: DEFAULT_PROMPT_SECTIONS,
+      config: loadPromptSectionsConfig(),
+    }),
+    'storage:save-prompt-sections': (config: PromptSectionsConfig) => {
+      savePromptSectionsConfig(config);
+      return { success: true };
+    },
+    'storage:reset-prompt-sections': () => {
+      savePromptSectionsConfig({ overrides: {}, enabled: {} });
+      return {
+        success: true,
+        tags: STATIC_TAGS,
+        defaults: DEFAULT_PROMPT_SECTIONS,
+        config: { overrides: {}, enabled: {} },
+      };
+    },
+    'storage:get-model-health': () => {
+      return Object.fromEntries(getCachedHealthMap());
+    },
+    'storage:check-model-health': async (name?: unknown) => {
+      const models = manager.store.list();
+      if (typeof name === 'string' && name.trim()) {
+        const target = models.find((m) => m.name === name.trim());
+        if (target) {
+          const res = await pingCustomModel(target as unknown as CustomModel);
+          return { [target.name]: res };
+        }
+      }
+      const healthMap = await checkAllModelsHealth(models as unknown as CustomModel[], true);
+      return Object.fromEntries(healthMap);
+    },
   };
 }

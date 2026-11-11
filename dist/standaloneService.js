@@ -59,12 +59,13 @@ const HTML = `<!doctype html><html lang="en"><meta charset="utf-8"><meta name="v
 const STYLE = `:root{color-scheme:dark;font-family:system-ui,sans-serif;background:#111318;color:#e7e9ed}body{margin:0}main{max-width:1100px;margin:3rem auto;padding:0 1.5rem}button,input,select,textarea{font:inherit}button{cursor:pointer}h1{font-size:1.8rem}p{color:#b7bfcc}a{color:#91bcff}`;
 const BRIDGE = `const key='antigravity-addon-token';
 const fragment=new URLSearchParams(location.hash.slice(1));
-if(fragment.has('token')){sessionStorage.setItem(key,fragment.get('token'));history.replaceState(null,'',location.pathname);}
+if(fragment.has('token')){sessionStorage.setItem(key,fragment.get('token'));localStorage.setItem(key,fragment.get('token'));history.replaceState(null,'',location.pathname);}
+const token=()=>sessionStorage.getItem(key)||localStorage.getItem(key)||'';
 const bridge={invoke:async(channel,...args)=>{
- const response=await fetch('/_addon/rpc',{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+(sessionStorage.getItem(key)||'')},body:JSON.stringify({channel,args})});
+ const response=await fetch('/_addon/rpc',{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+token()},body:JSON.stringify({channel,args})});
  const value=await response.json();if(!response.ok)throw new Error(value.error||'Management request failed');return value;
 }};
-if(!sessionStorage.getItem(key))document.getElementById('connection-status').textContent='Open the management URL printed by npm run proxy:start -- --open to connect.';
+if(!token())document.getElementById('connection-status').textContent='Open the management URL printed by npm run proxy:start -- --open to connect.';
 `;
 async function startStandaloneService(options) {
     if (!/^[a-f0-9]{64}$/.test(options.token) || !/^[a-f0-9-]{36}$/.test(options.instance))

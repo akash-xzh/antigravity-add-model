@@ -96,6 +96,108 @@ const subagentModels_1 = require("./proxy/subagentModels");
 const loopbackSecurity_1 = require("./proxy/loopbackSecurity");
 const nativeSubagentResponse_1 = require("./proxy/nativeSubagentResponse");
 const googlePoolFailover_1 = require("./proxy/googlePoolFailover");
+function getGlobalPrompt() {
+    try {
+        return require('./proxy/globalPrompt');
+    }
+    catch {
+        return null;
+    }
+}
+function injectGlobalSystemPrompt(raw) {
+    try {
+        const mod = getGlobalPrompt();
+        return mod?.injectGlobalSystemPrompt ? mod.injectGlobalSystemPrompt(raw) : raw;
+    }
+    catch {
+        return raw;
+    }
+}
+function getModelHealth() {
+    try {
+        return require('./proxy/modelHealth');
+    }
+    catch {
+        return null;
+    }
+}
+function setModelHealthDataDirectory(dir) {
+    try {
+        getModelHealth()?.setDataDirectory?.(dir);
+    }
+    catch { }
+}
+function loadHealthCache(dir) {
+    try {
+        getModelHealth()?.loadHealthCache?.(dir);
+    }
+    catch { }
+}
+function checkAllModelsHealth(models) {
+    try {
+        const p = getModelHealth()?.checkAllModelsHealth?.(models);
+        return p ? Promise.resolve(p) : Promise.resolve();
+    }
+    catch {
+        return Promise.resolve();
+    }
+}
+function getCachedHealthMap() {
+    try {
+        return getModelHealth()?.getCachedHealthMap?.();
+    }
+    catch {
+        return undefined;
+    }
+}
+function getRecentModels() {
+    try {
+        return getModelHealth()?.getRecentModels?.() || [];
+    }
+    catch {
+        return [];
+    }
+}
+function isRecentModel(name) {
+    try {
+        return Boolean(getModelHealth()?.isRecentModel?.(name));
+    }
+    catch {
+        return false;
+    }
+}
+function sortCustomModels(models) {
+    try {
+        const mod = getModelHealth();
+        return mod?.sortCustomModels ? mod.sortCustomModels(models) : models;
+    }
+    catch {
+        return models;
+    }
+}
+function recordRecentModel(name) {
+    try {
+        getModelHealth()?.recordRecentModel?.(name);
+    }
+    catch { }
+}
+function formatHealthDisplayName(baseName, health, isRecent) {
+    try {
+        const mod = getModelHealth();
+        return mod?.formatHealthDisplayName ? mod.formatHealthDisplayName(baseName, health, isRecent) : baseName;
+    }
+    catch {
+        return baseName;
+    }
+}
+function getCachedHealth(name) {
+    try {
+        return getModelHealth()?.getCachedHealth?.(name);
+    }
+    catch {
+        return undefined;
+    }
+}
 let languageServerPortResolver;
 let languageServerRoutingEnabled = false;
 /** Registered by the desktop with its own live language-server port getter. */
@@ -158,9 +260,9 @@ function matchCustomModel(models, ...selectors) {
     });
 }
 function customCloudCodeCatalog(upstream = {}) {
-    const models = loadCustomModels();
+    const models = sortCustomModels(loadCustomModels());
     const identities = modelIdentities(models, upstream);
-    const labels = (0, modelCatalog_1.catalogDisplayNames)(models, upstream);
+    const labels = (0, modelCatalog_1.catalogDisplayNames)(models, upstream, getCachedHealthMap(), getRecentModels());
     return (0, modelCatalog_1.mergeCloudCodeCatalog)(upstream, models
         .filter((model) => identities.get(model.name)?.placeholderId)
         .map((model) => {
@@ -470,6 +572,9 @@ function forwardCloudCodeCatalog(req, res, body, targetUrl) {
 }
 function proxyToGoogle(req, res, reqBody, nativeSubagent) {
     const generation = req.url.includes('generateContent') || req.url.includes('streamGenerateContent');
+    // A global prompt applies to native models as well; generation bodies are Gemini JSON.
+    if (generation)
+        reqBody = injectGlobalSystemPrompt(reqBody);
     const cloudCode = req.url.includes('v1internal') || req.url.includes('daily-cloudcode');
     if (!cloudCodeRouting || !cloudCode || !generation) {
         forwardToGoogle(req, res, reqBody, nativeSubagent);
@@ -762,6 +867,7 @@ function downloadFileContent(url, authHeader) {
 function handleCustomModelRequest(res, model, body, isStream, cloudEnvelope = true) {
     if (res.destroyed || res.writableEnded || rejectDuringShutdown(res))
         return;
+    recordRecentModel(model.name);
     void (0, customRequest_1.runCustomModelRequest)(res, model, body, isStream, loadCustomModels(), cloudEnvelope);
 }
 function readVarint(buf, offset) {
@@ -937,7 +1043,7 @@ function handleGetAvailableModelsProxy(res, reqBody, lsUrl) {
         lsRes.on('data', (chunk) => chunks.push(chunk));
         lsRes.on('end', () => {
             const responseBuf = Buffer.concat(chunks);
-            const customModels = loadCustomModels();
+            const customModels = sortCustomModels(loadCustomModels());
             const identities = modelIdentities(customModels);
             let modifiedBuf = responseBuf;
             if (customModels.length > 0 && responseBuf.length > 6) {
@@ -953,15 +1059,17 @@ function handleGetAvailableModelsProxy(res, reqBody, lsUrl) {
                             if (sampleEntry && Array.isArray(sampleEntry.value)) {
                                 const fieldMapping = extractFieldMapping(sampleEntry.value);
                                 const newParts = [msgBody];
+                                const labels = (0, modelCatalog_1.catalogDisplayNames)(customModels, {}, getCachedHealthMap(), getRecentModels());
                                 for (const m of customModels) {
                                     const placeholderId = identities.get(m.name)?.placeholderId;
                                     if (!placeholderId)
                                         continue;
-                                    const entry = encodeModelEntryForGetModels('models/' + placeholderId, m.displayName, fieldMapping);
+                                    const displayName = labels.get(m.name) || formatHealthDisplayName(m.displayName, getCachedHealth(m.name), isRecentModel(m.name));
+                                    const entry = encodeModelEntryForGetModels('models/' + placeholderId, displayName, fieldMapping);
                                     const tagBuf = encodeVarint(modelTag);
                                     const lenBuf = encodeVarint(entry.length);
                                     newParts.push(tagBuf, lenBuf, entry);
-                                    electron_log_1.default.info(`[Proxy] Injected into GetAvailableModels: ${m.displayName} => ${placeholderId}`);
+                                    electron_log_1.default.info(`[Proxy] Injected into GetAvailableModels: ${displayName} => ${placeholderId}`);
                                 }
                                 const newMsgBody = Buffer.concat(newParts);
                                 const newHeader = Buffer.alloc(5);
@@ -1344,6 +1452,13 @@ async function startProxy(options = {}) {
         throw new Error('Proxy shutdown grace must be an integer between 0 and 60000 milliseconds');
     }
     serviceDataDirectory = options.dataDirectory ? path.resolve(options.dataDirectory) : undefined;
+    setModelHealthDataDirectory(serviceDataDirectory);
+    loadHealthCache(serviceDataDirectory);
+    // Non-blocking background health check of configured models (smart paced, deduplicated)
+    try {
+        checkAllModelsHealth(loadCustomModels());
+    }
+    catch { }
     languageServerRoutingEnabled = options.allowLanguageServerRouting !== false;
     shutdownGraceMs = options.shutdownGraceMs ?? DEFAULT_SHUTDOWN_GRACE_MS;
     cloudCodeRouting = options.ideCloudCodeRouting ? new cloudCodeRouting_1.CloudCodeRouting() : undefined;

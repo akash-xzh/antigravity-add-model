@@ -27,6 +27,8 @@ import {
 import { activeStreamContexts, modelReasoningContent, modelToolCallIds, stateTimestamps } from './shared';
 import { collectToolSchemas } from './translators/utils';
 import { collectArtifactContext } from './artifactMetadata';
+import { captureSystemPrompt, withGlobalSystemPrompt } from './globalPrompt';
+import { recordModelSuccess, recordModelFailure } from './modelHealth';
 import { omitUnsupportedToolImages } from './translators/images';
 import { detectModelCapabilities } from './modelUtils';
 import { subagentRouting, SubagentRoutingError } from './subagentRouting';
@@ -348,8 +350,10 @@ export async function runCustomModelRequest(
             // Recover only this conversation/provider's matching turn before budgeting.
             const history = format === 'openai' ? reasoningReplayCache.restore(originalBody, model) : originalBody;
             // Each attempt uses its own model's prompt, so a fallback never inherits the
-            // primary's. Added before trimming so the context budget counts it.
-            const prompted = appendModelSystemPrompt(history, model.systemPrompt);
+            // primary's. The operator's global prompt sits between the IDE instruction
+            // and the model's own text, and is added before trimming so it is counted.
+            captureSystemPrompt(history);
+            const prompted = appendModelSystemPrompt(withGlobalSystemPrompt(history), model.systemPrompt);
             // A text-only provider fails the whole request when it receives an image,
             // so strip tool-result media the model cannot use before trimming and
             // translating. Google's native format already carried nested tool media,
@@ -663,6 +667,7 @@ export async function runCustomModelRequest(
               ...replayCalls,
             ]);
           circuits.succeed(circuitKey);
+          recordModelSuccess(model.name, headerLatencyMs);
           completed = true;
           accountLease?.release({ status, latencyMs: headerLatencyMs });
           counts.succeeded += 1;
@@ -684,6 +689,7 @@ export async function runCustomModelRequest(
           }
           if (res.headersSent || upstreamOutput) {
             circuits.fail(circuitKey, model.circuitBreaker);
+            recordModelFailure(model.name, failure.message);
             break modelLoop;
           }
           if (
@@ -713,8 +719,10 @@ export async function runCustomModelRequest(
           clearRequestState(stateKey);
         }
       }
-      if (modelFailed) circuits.fail(circuitKey, model.circuitBreaker);
-      else circuits.cancel(circuitKey);
+      if (modelFailed) {
+        circuits.fail(circuitKey, model.circuitBreaker);
+        recordModelFailure(model.name, failure.message);
+      } else circuits.cancel(circuitKey);
       if (!failure.mayFallback) break;
     }
     if (!signal.aborted && !res.writableEnded && !res.destroyed) {

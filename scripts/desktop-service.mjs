@@ -21,7 +21,7 @@ export function parseServiceOptions(args) {
     dataDirectory: path.join(os.homedir(), '.gemini', 'antigravity'),
     open: false,
   };
-  if (!['start', 'stop', 'status', 'run'].includes(options.command)) throw new Error('Use start, stop, status or run');
+  if (!['start', 'stop', 'status', 'run', 'restart'].includes(options.command)) throw new Error('Use start, stop, status, run or restart');
   for (let i = 1; i < args.length; i++) {
     if (args[i] === '--open') options.open = true;
     else if (['--port', '--data-dir'].includes(args[i]) && args[i + 1]) {
@@ -174,6 +174,12 @@ function acquireLock(options, name = 'start.lock') {
 }
 
 export async function serviceCommand(options) {
+  if (options.command === 'restart') {
+    try {
+      await serviceCommand({ ...options, command: 'stop' });
+    } catch {}
+    return await serviceCommand({ ...options, command: 'start' });
+  }
   const initial = readState(options);
   if (options.command === 'status') return (await health(initial)) ? description(initial) : { status: 'stopped' };
   if (options.command === 'stop') {
@@ -208,7 +214,9 @@ export async function serviceCommand(options) {
         version: 1,
         pid: process.pid,
         port: options.port,
-        token: randomBytes(32).toString('hex'),
+        token: /^[a-f0-9]{64}$/.test(process.env.ANTIGRAVITY_PROXY_TOKEN || '')
+          ? process.env.ANTIGRAVITY_PROXY_TOKEN
+          : randomBytes(32).toString('hex'),
         instance: randomUUID(),
       };
       const cleanup = () => {

@@ -7,6 +7,7 @@ exports.matchesModelSlug = matchesModelSlug;
 exports.catalogDisplayNames = catalogDisplayNames;
 exports.mergeCloudCodeCatalog = mergeCloudCodeCatalog;
 const node_crypto_1 = require("node:crypto");
+const modelHealth_1 = require("./modelHealth");
 const slugPart = (value) => value
     .replace(/^models\//, '')
     .replace(/[^a-zA-Z0-9]+/g, '-')
@@ -31,7 +32,7 @@ function matchesModelSlug(model, value, models) {
     return id === localModelSlug(model) || id === catalogModelSlug(model, models);
 }
 /** The native IDE resolves sorted options by label, so display labels must also be unique. */
-function catalogDisplayNames(models, upstream = {}) {
+function catalogDisplayNames(models, upstream = {}, healthMap, recentModels) {
     const used = new Set();
     if (upstream && typeof upstream === 'object') {
         for (const key of ['models', 'availableModels', 'available_models']) {
@@ -59,7 +60,17 @@ function catalogDisplayNames(models, upstream = {}) {
         while (used.has(label))
             label = `${base} (${model.name.replace(/^models\//, '')} #${suffix++})`;
         used.add(label);
-        labels.set(model.name, label);
+        const isRecent = recentModels
+            ? Array.isArray(recentModels)
+                ? recentModels.includes(model.name)
+                : recentModels.has(model.name)
+            : false;
+        const finalLabel = healthMap
+            ? (0, modelHealth_1.formatHealthDisplayName)(label, healthMap.get(model.name), isRecent)
+            : isRecent
+                ? `⭐ ${label}`
+                : label;
+        labels.set(model.name, finalLabel);
     }
     return labels;
 }

@@ -1,3 +1,4 @@
+import { type ModelHealthResult } from './modelHealth';
 export interface CatalogIdentity {
     name: string;
     externalModelName?: string;
@@ -9,7 +10,7 @@ export declare function localModelSlug(model: CatalogIdentity): string;
 export declare function catalogModelSlug(model: CatalogIdentity, models: CatalogIdentity[]): string;
 export declare function matchesModelSlug(model: CatalogIdentity, value: string, models: CatalogIdentity[]): boolean;
 /** The native IDE resolves sorted options by label, so display labels must also be unique. */
-export declare function catalogDisplayNames(models: CatalogIdentity[], upstream?: unknown): Map<string, string>;
+export declare function catalogDisplayNames(models: CatalogIdentity[], upstream?: unknown, healthMap?: Map<string, ModelHealthResult>, recentModels?: string[] | Set<string>): Map<string, string>;
 export interface CatalogEntry {
     slug: string;
     mapEntry: Record<string, unknown>;

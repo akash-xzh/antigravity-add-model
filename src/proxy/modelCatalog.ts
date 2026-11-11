@@ -1,5 +1,7 @@
 import { createHash } from 'node:crypto';
 
+import { formatHealthDisplayName, type ModelHealthResult } from './modelHealth';
+
 export interface CatalogIdentity {
   name: string;
   externalModelName?: string;
@@ -31,7 +33,12 @@ export function matchesModelSlug(model: CatalogIdentity, value: string, models: 
 }
 
 /** The native IDE resolves sorted options by label, so display labels must also be unique. */
-export function catalogDisplayNames(models: CatalogIdentity[], upstream: unknown = {}): Map<string, string> {
+export function catalogDisplayNames(
+  models: CatalogIdentity[],
+  upstream: unknown = {},
+  healthMap?: Map<string, ModelHealthResult>,
+  recentModels?: string[] | Set<string>,
+): Map<string, string> {
   const used = new Set<string>();
   if (upstream && typeof upstream === 'object') {
     for (const key of ['models', 'availableModels', 'available_models']) {
@@ -55,7 +62,17 @@ export function catalogDisplayNames(models: CatalogIdentity[], upstream: unknown
     let suffix = 2;
     while (used.has(label)) label = `${base} (${model.name.replace(/^models\//, '')} #${suffix++})`;
     used.add(label);
-    labels.set(model.name, label);
+    const isRecent = recentModels
+      ? Array.isArray(recentModels)
+        ? recentModels.includes(model.name)
+        : recentModels.has(model.name)
+      : false;
+    const finalLabel = healthMap
+      ? formatHealthDisplayName(label, healthMap.get(model.name), isRecent)
+      : isRecent
+        ? `⭐ ${label}`
+        : label;
+    labels.set(model.name, finalLabel);
   }
   return labels;
 }

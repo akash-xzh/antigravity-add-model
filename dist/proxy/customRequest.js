@@ -52,6 +52,8 @@ const requestOptions_1 = require("./requestOptions");
 const shared_1 = require("./shared");
 const utils_1 = require("./translators/utils");
 const artifactMetadata_1 = require("./artifactMetadata");
+const globalPrompt_1 = require("./globalPrompt");
+const modelHealth_1 = require("./modelHealth");
 const images_1 = require("./translators/images");
 const modelUtils_1 = require("./modelUtils");
 const subagentRouting_1 = require("./subagentRouting");
@@ -360,8 +362,10 @@ async function runCustomModelRequest(res, primary, originalBody, isStream, allMo
                         // Recover only this conversation/provider's matching turn before budgeting.
                         const history = format === 'openai' ? reasoningReplay_1.reasoningReplayCache.restore(originalBody, model) : originalBody;
                         // Each attempt uses its own model's prompt, so a fallback never inherits the
-                        // primary's. Added before trimming so the context budget counts it.
-                        const prompted = (0, requestOptions_1.appendModelSystemPrompt)(history, model.systemPrompt);
+                        // primary's. The operator's global prompt sits between the IDE instruction
+                        // and the model's own text, and is added before trimming so it is counted.
+                        (0, globalPrompt_1.captureSystemPrompt)(history);
+                        const prompted = (0, requestOptions_1.appendModelSystemPrompt)((0, globalPrompt_1.withGlobalSystemPrompt)(history), model.systemPrompt);
                         // A text-only provider fails the whole request when it receives an image,
                         // so strip tool-result media the model cannot use before trimming and
                         // translating. Google's native format already carried nested tool media,
@@ -629,6 +633,7 @@ async function runCustomModelRequest(res, primary, originalBody, isStream, allMo
                             ...replayCalls,
                         ]);
                     circuits.succeed(circuitKey);
+                    (0, modelHealth_1.recordModelSuccess)(model.name, headerLatencyMs);
                     completed = true;
                     accountLease?.release({ status, latencyMs: headerLatencyMs });
                     counts.succeeded += 1;
@@ -651,6 +656,7 @@ async function runCustomModelRequest(res, primary, originalBody, isStream, allMo
                     }
                     if (res.headersSent || upstreamOutput) {
                         circuits.fail(circuitKey, model.circuitBreaker);
+                        (0, modelHealth_1.recordModelFailure)(model.name, failure.message);
                         break modelLoop;
                     }
                     if (accountLease &&
@@ -682,8 +688,10 @@ async function runCustomModelRequest(res, primary, originalBody, isStream, allMo
                     clearRequestState(stateKey);
                 }
             }
-            if (modelFailed)
+            if (modelFailed) {
                 circuits.fail(circuitKey, model.circuitBreaker);
+                (0, modelHealth_1.recordModelFailure)(model.name, failure.message);
+            }
             else
                 circuits.cancel(circuitKey);
             if (!failure.mayFallback)
