@@ -197,13 +197,17 @@ window.addEventListener('DOMContentLoaded', () => {
       #agy-custom-models-section .agy-menu-list .agy-btn:hover{background:#2b2b31}
       #agy-custom-models-section .agy-menu-list .agy-danger{color:#fca5a5}
       .agy-row[data-enabled="false"] .agy-row-info,.agy-row[data-enabled="false"] .agy-row-actions>.agy-btn{opacity:.6}
-      .agy-effort-chip{display:inline-block;padding:0 5px;border-radius:4px;background:#27272c;color:#a1a1aa;font-size:10px;line-height:15px;white-space:nowrap}
-      .agy-effort-tabs{display:inline-flex;align-items:center;gap:3px;flex-shrink:0;flex-wrap:wrap}
-      .agy-effort-tab{appearance:none;padding:1px 6px;border-radius:4px;border:1px solid #32323a;background:#26262c;color:#a1a1aa;font-size:10px;font-weight:600;line-height:15px;white-space:nowrap;cursor:pointer;transition:background .12s,border-color .12s,color .12s,opacity .12s}
-      .agy-effort-tab:hover{background:#2f2f37;border-color:#52525b;color:#f4f4f5}
-      .agy-effort-tab[aria-pressed="true"]{background:rgba(59,130,246,.18);border-color:#60a5fa;color:#f4f4f5}
-      .agy-effort-tab[data-enabled="false"]{opacity:.45;text-decoration:line-through}
-      .agy-effort-tab[data-enabled="false"][aria-pressed="true"]{opacity:.75}
+      .agy-effort-chip{display:inline-block;padding:1px 6px;border-radius:5px;background:#16161a;border:1px solid #2b2b33;color:#a1a1aa;font-size:10.5px;font-weight:500;line-height:16px;white-space:nowrap}
+      .agy-effort-tabs{display:inline-flex;align-items:center;gap:2px;padding:2px;border-radius:6px;background:#16161a;border:1px solid #2b2b33;flex-shrink:0}
+      .agy-effort-tab{appearance:none;padding:2px 7px;border-radius:4px;border:none;background:transparent;color:#8e8e98;font-size:10.5px;font-weight:500;line-height:14px;white-space:nowrap;cursor:pointer;transition:background .12s,color .12s,opacity .12s}
+      .agy-effort-tab:hover{color:#e4e4e7;background:rgba(255,255,255,.05)}
+      .agy-effort-tab[aria-pressed="true"]{background:#2e2e36;color:#fafafa;font-weight:600;box-shadow:0 1px 2px rgba(0,0,0,.4)}
+      .agy-effort-tab[data-enabled="false"]{opacity:.38;text-decoration:line-through}
+      .agy-effort-tab[data-enabled="false"][aria-pressed="true"]{opacity:.72}
+      .agy-row-slug{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:10.5px;color:#8e8e98}
+      .agy-row-badge-ok{color:#34d399}
+      .agy-row-badge-warn{color:#fbbf24}
+      .agy-row-badge-err{color:#f87171}
       .agy-sticky-bar{position:sticky;top:0;z-index:6;display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:0 0 8px;padding:8px 0;background:#18181b;border-bottom:1px solid #303036}
       .agy-sticky-bar .agy-field{margin:0;flex:1 1 220px}
       .agy-chip{appearance:none;font:inherit;font-size:11px;color:#a1a1aa;background:#202024;border:1px solid #303036;border-radius:9999px;padding:3px 9px;cursor:pointer;white-space:nowrap}
@@ -1241,13 +1245,11 @@ window.addEventListener('DOMContentLoaded', () => {
                 content.append(element('p', 'agy-muted', models.length
                     ? 'No models match this search.'
                     : 'Add a provider model, discover a local server, or import a configuration to get started.'));
-            const sortedGroups = Array.from(groups.values()).sort((groupA, groupB) => {
-                const recentA = groupA.some((m) => m.isRecent) ? 1 : 0;
-                const recentB = groupB.some((m) => m.isRecent) ? 1 : 0;
-                return recentB - recentA;
-            });
+            // Keep provider groups and models in stable order so testing/using a model
+            // in the middle of the modal never teleports its provider group to the top.
+            const sortedGroups = Array.from(groups.values());
             for (const groupModels of sortedGroups) {
-                const modelsInGroup = [...groupModels].sort((a, b) => (b.isRecent ? 1 : 0) - (a.isRecent ? 1 : 0));
+                const modelsInGroup = groupModels;
                 const first = modelsInGroup[0];
                 const groupDisplayName = (first.providerName || '').trim() || first.provider;
                 const group = element('section', 'agy-group');
@@ -1306,13 +1308,32 @@ window.addEventListener('DOMContentLoaded', () => {
                     continue;
                 }
                 const modelsList = element('div', 'agy-models');
+                const formatEffortLabel = (eff) => {
+                    const lower = eff.toLowerCase();
+                    if (lower === 'xhigh')
+                        return 'XHigh';
+                    if (lower === 'medium')
+                        return 'Med';
+                    if (lower === 'minimal')
+                        return 'Min';
+                    return lower.charAt(0).toUpperCase() + lower.slice(1);
+                };
+                const stripGroupSuffix = (name) => {
+                    const trimmedGroup = groupDisplayName.trim();
+                    if (!trimmedGroup)
+                        return name;
+                    const escaped = trimmedGroup.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+                    const stripped = name.replace(new RegExp(`\\s*\\(${escaped}\\)\\s*$`, 'i'), '').trim();
+                    return stripped || name;
+                };
                 const slots = [];
                 const effortSlots = new Map();
                 for (const model of modelsInGroup) {
                     const rawName = model.displayName || model.name;
                     const cleanName = rawName.replace(/^⭐\s*/u, '').replace(/^[🟢🔴⚪🟡⭐\s•·|-]+(?:\[[^\]]+\]\s*)?[•·|-]?\s*/u, '').trim();
                     const effort = /\((minimal|low|medium|high|xhigh|extra)\)\s*$/i.exec(cleanName)?.[1];
-                    const shortName = effort ? cleanName.slice(0, cleanName.length - effort.length - 2).trim() : cleanName;
+                    const withoutEffort = effort ? cleanName.slice(0, cleanName.length - effort.length - 2).trim() : cleanName;
+                    const shortName = stripGroupSuffix(withoutEffort);
                     const parsed = { model, cleanName, shortName, effort };
                     if (effort) {
                         const slotKey = `${shortName.toLowerCase()}\0${(model.externalModelName || '').toLowerCase()}\0${(model.apiUrl || '').toLowerCase()}`;
@@ -1364,13 +1385,26 @@ window.addEventListener('DOMContentLoaded', () => {
                                     : !health || health.status === 'healthy'
                                         ? '🟢 '
                                         : '🔴 ';
-                        const latencyText = health?.latencyMs !== undefined ? ` · ${health.latencyMs}ms` : '';
-                        const statusNotice = health?.status === 'slow'
-                            ? ' · Slow'
+                        const latencyText = health?.latencyMs !== undefined
+                            ? health.latencyMs >= 1000
+                                ? `${(health.latencyMs / 1000).toFixed(1)}s`
+                                : `${health.latencyMs}ms`
+                            : '';
+                        const statusLabel = health?.status === 'slow'
+                            ? 'Slow'
                             : health?.status === 'cooldown'
-                                ? ' · Cooldown (429)'
+                                ? 'Cooldown (429)'
                                 : health?.error
-                                    ? ` · [${health.error}]`
+                                    ? health.error
+                                    : health?.status === 'healthy'
+                                        ? 'OK'
+                                        : '';
+                        const statusClass = health?.status === 'healthy'
+                            ? 'agy-row-badge-ok'
+                            : health?.status === 'slow' || health?.status === 'cooldown'
+                                ? 'agy-row-badge-warn'
+                                : health?.error
+                                    ? 'agy-row-badge-err'
                                     : '';
                         const enabledVariantsCount = slot.variants.filter((v) => v.model.enabled !== false).length;
                         const allDisabled = enabledVariantsCount === 0;
@@ -1380,9 +1414,9 @@ window.addEventListener('DOMContentLoaded', () => {
                         const titleEl = element('strong', '', `${starPrefix}${statusDot}${shortName}`);
                         titleEl.title = health
                             ? health.status === 'healthy'
-                                ? `Healthy${latencyText} · Checked ${new Date(health.checkedAt).toLocaleTimeString()}`
+                                ? `Healthy${latencyText ? ` · ${latencyText}` : ''} · Checked ${new Date(health.checkedAt).toLocaleTimeString()}`
                                 : health.status === 'slow'
-                                    ? `Slow response (${health.latencyMs}ms) · Checked ${new Date(health.checkedAt).toLocaleTimeString()}`
+                                    ? `Slow response (${latencyText}) · Checked ${new Date(health.checkedAt).toLocaleTimeString()}`
                                     : health.status === 'cooldown'
                                         ? `Cooldown / Rate Limit (429) · Checked ${new Date(health.checkedAt).toLocaleTimeString()}`
                                         : `Unhealthy: ${health.error || 'Failed'} · Checked ${new Date(health.checkedAt).toLocaleTimeString()}`
@@ -1394,7 +1428,7 @@ window.addEventListener('DOMContentLoaded', () => {
                             tabs.setAttribute('role', 'group');
                             tabs.setAttribute('aria-label', `Reasoning effort variants for ${shortName}`);
                             for (const variant of slot.variants) {
-                                const effLabel = (variant.effort || '').toUpperCase();
+                                const effLabel = formatEffortLabel(variant.effort || '');
                                 const tab = document.createElement('button');
                                 tab.type = 'button';
                                 tab.className = 'agy-effort-tab';
@@ -1414,10 +1448,28 @@ window.addEventListener('DOMContentLoaded', () => {
                             title.append(tabs);
                         }
                         else if (effort) {
-                            title.append(element('span', 'agy-effort-chip', effort.toUpperCase()));
+                            title.append(element('span', 'agy-effort-chip', formatEffortLabel(effort)));
                         }
-                        const groupCountText = isGrouped ? ` · ${enabledVariantsCount}/${slot.variants.length} enabled` : '';
-                        info.append(title, element('div', 'agy-muted agy-row-meta', `${model.externalModelName || ''}${latencyText}${statusNotice}${isRecent ? ' · Recent' : ''}${groupCountText}`));
+                        const meta = element('div', 'agy-muted agy-row-meta');
+                        if (model.externalModelName)
+                            meta.append(element('span', 'agy-row-slug', model.externalModelName));
+                        if (latencyText || statusLabel) {
+                            if (meta.childNodes.length)
+                                meta.append(document.createTextNode(' · '));
+                            const statusSpan = element('span', statusClass, [latencyText, statusLabel].filter(Boolean).join(' '));
+                            meta.append(statusSpan);
+                        }
+                        if (isRecent) {
+                            if (meta.childNodes.length)
+                                meta.append(document.createTextNode(' · '));
+                            meta.append(document.createTextNode('Recent'));
+                        }
+                        if (isGrouped && enabledVariantsCount < slot.variants.length) {
+                            if (meta.childNodes.length)
+                                meta.append(document.createTextNode(' · '));
+                            meta.append(document.createTextNode(`${enabledVariantsCount}/${slot.variants.length} on`));
+                        }
+                        info.append(title, meta);
                         if (model.nativePickerAvailable === false)
                             info.append(element('div', 'agy-muted agy-row-meta', typeof model.nativePickerError === 'string' ? model.nativePickerError :
                                 'Not currently available in the native model picker. Direct API access remains available.'));
