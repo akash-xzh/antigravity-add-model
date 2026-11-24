@@ -2,6 +2,7 @@ import * as googlePoolFailover from '../proxy/googlePoolFailover';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import * as url from 'node:url';
 import * as http from 'node:http';
 import * as net from 'node:net';
 import { tmpdir } from 'node:os';
@@ -18,6 +19,8 @@ import * as schemaValidator from '../schemaValidator';
 import * as subagentRouting from '../proxy/subagentRouting';
 import * as subagentModels from '../proxy/subagentModels';
 import * as nativeSubagentResponse from '../proxy/nativeSubagentResponse';
+import * as nativeLimits from '../proxy/nativeLimits';
+import * as conversationUsage from '../proxy/conversationUsage';
 import { listenProxy } from '../proxy/listen';
 import type { ProxyStartOptions } from '../proxy';
 
@@ -42,11 +45,11 @@ afterEach(async () => {
 });
 
 function request(port: number, target: string, headers: Record<string, string> = {}, body?: unknown, method = 'POST') {
-  return new Promise<{ status: number; body: string }>((resolve, reject) => {
+  return new Promise<{ status: number; headers: http.IncomingHttpHeaders; body: string }>((resolve, reject) => {
     const req = http.request({ hostname: '127.0.0.1', port, path: target, headers, method }, (res) => {
       const chunks: Buffer[] = [];
       res.on('data', (chunk) => chunks.push(chunk));
-      res.on('end', () => resolve({ status: res.statusCode!, body: Buffer.concat(chunks).toString() }));
+      res.on('end', () => resolve({ status: res.statusCode!, headers: res.headers, body: Buffer.concat(chunks).toString() }));
     });
     req.on('error', reject);
     req.end(body === undefined ? undefined : JSON.stringify(body));
@@ -108,6 +111,7 @@ async function fixture(options: ProxyStartOptions = {}) {
     },
     fs,
     path,
+    url,
     electron: { app: { getAppPath: () => directory } },
     'electron-log': { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
     './proxy/shared': shared,
@@ -122,6 +126,10 @@ async function fixture(options: ProxyStartOptions = {}) {
     './proxy/subagentModels': subagentModels,
     './proxy/googlePoolFailover': googlePoolFailover,
     './proxy/nativeSubagentResponse': nativeSubagentResponse,
+
+    './proxy/nativeLimits': nativeLimits,
+
+    './proxy/conversationUsage': conversationUsage,
     './proxy/cloudCodeRouting': {},
     './proxy/loopbackSecurity': loopbackSecurity,
     './proxy/listen': {
@@ -203,6 +211,50 @@ describe('desktop proxy HTTP boundaries', () => {
       });
       expect(response).toMatch(/^HTTP\/1\.1 403 /);
     }
+  });
+
+  it('rejects Sec-Fetch-Site: cross-site on GET requests unless authenticated by an owned loopback origin', async () => {
+    const app = await fixture();
+    // Cross-site GET without Origin (e.g. external site <img>/<script>/no-cors fetch) must be rejected
+    expect((await request(app.port, '/health', { 'Sec-Fetch-Site': 'cross-site' }, undefined, 'GET')).status).toBe(403);
+    // Cross-site GET with foreign Referer must be rejected
+    expect(
+      (
+        await request(
+          app.port,
+          '/health',
+          { 'Sec-Fetch-Site': 'cross-site', Referer: 'https://attacker.test/page' },
+          undefined,
+          'GET',
+        )
+      ).status,
+    ).toBe(403);
+    // Same-origin GET is allowed
+    expect((await request(app.port, '/health', { 'Sec-Fetch-Site': 'same-origin' }, undefined, 'GET')).status).toBe(200);
+    // Owned LS renderer Origin/Referer (https -> http scheme downgrade) is allowed
+    app.setLanguageServerPortResolver(() => app.lsPort);
+    expect(
+      (
+        await request(
+          app.port,
+          '/health',
+          { 'Sec-Fetch-Site': 'cross-site', Origin: `https://127.0.0.1:${app.lsPort}` },
+          undefined,
+          'GET',
+        )
+      ).status,
+    ).toBe(200);
+    expect(
+      (
+        await request(
+          app.port,
+          '/health',
+          { 'Sec-Fetch-Site': 'cross-site', Referer: `https://127.0.0.1:${app.lsPort}/` },
+          undefined,
+          'GET',
+        )
+      ).status,
+    ).toBe(200);
   });
 
   it('keeps native localhost callers, same-origin browser calls and only the registered live LS origin working', async () => {
@@ -304,6 +356,34 @@ describe('desktop proxy HTTP boundaries', () => {
     expect(app.downloads.some((call) => call.hostname === 'attacker.invalid')).toBe(false);
     await send('https://generativelanguage.googleapis.com/image.png', 'image/png');
     expect(app.downloads).toHaveLength(2);
+  });
+  it('restricts /_ui/* Access-Control-Allow-Origin to allowed loopback origins and never emits wildcard *', async () => {
+    const app = await fixture();
+    app.setLanguageServerPortResolver(() => app.lsPort);
+    const noOrigin = await request(app.port, '/_ui/custom-providers.json', {}, undefined, 'GET');
+    expect(noOrigin.status).toBe(200);
+    expect(noOrigin.headers['access-control-allow-origin']).toBeUndefined();
+    const lsOrigin = `https://127.0.0.1:${app.lsPort}`;
+    const withOrigin = await request(app.port, '/_ui/custom-providers.json', { Origin: lsOrigin }, undefined, 'GET');
+    expect(withOrigin.status).toBe(200);
+    expect(withOrigin.headers['access-control-allow-origin']).toBe(lsOrigin);
+    expect(withOrigin.headers['access-control-allow-origin']).not.toBe('*');
+  });
+
+  it('decodes percent-encoded file:/// URIs cleanly in resolveFileData', async () => {
+    const app = await fixture();
+    const tempFile = path.join(directories[directories.length - 1], 'hello world.txt');
+    fs.writeFileSync(tempFile, 'UTF-8 content: İstanbul 🚀', 'utf8');
+    const fileUri = url.pathToFileURL(tempFile).href;
+    const res = await request(
+      app.port,
+      generationRoute,
+      {},
+      { contents: [{ role: 'user', parts: [{ fileData: { fileUri, mimeType: 'text/plain' } }] }] },
+    );
+    expect(res.status).toBe(200);
+    const providerCall = app.calls.find((call) => call.path.startsWith('/provider'));
+    expect(providerCall?.body).toContain('UTF-8 content: İstanbul 🚀');
   });
 });
 

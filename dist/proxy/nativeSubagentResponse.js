@@ -1,11 +1,16 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
+exports.wasForwardedSuccessfully = wasForwardedSuccessfully;
 exports.forwardNativeGeneration = forwardNativeGeneration;
 const stream_1 = require("stream");
 const promises_1 = require("stream/promises");
 const string_decoder_1 = require("string_decoder");
 const zlib_1 = require("zlib");
 const subagentRouting_1 = require("./subagentRouting");
+/** Gate telemetry/account-success bookkeeping on a real successful generation. */
+function wasForwardedSuccessfully(result) {
+    return result?.ok === true;
+}
 const JSON_LIMIT = 16 * 1024 * 1024;
 const EVENT_LIMIT = 4 * 1024 * 1024;
 const HOP_HEADERS = new Set([
@@ -155,6 +160,7 @@ function decoders(encoding) {
  */
 async function forwardNativeGeneration(upstream, downstream, routing, streamHint) {
     const successful = (upstream.statusCode || 200) >= 200 && (upstream.statusCode || 200) < 300;
+    let succeeded = successful;
     const contentType = upstream.headers['content-type'];
     const streaming = contentType ? contentType.split(';')[0].trim().toLowerCase() === 'text/event-stream' : streamHint;
     let source = upstream;
@@ -213,7 +219,7 @@ async function forwardNativeGeneration(upstream, downstream, routing, streamHint
     try {
         if (disconnected) {
             onClose();
-            return;
+            return { ok: false };
         }
         if (successful) {
             const transforms = decoders(upstream.headers['content-encoding']);
@@ -285,6 +291,7 @@ async function forwardNativeGeneration(upstream, downstream, routing, streamHint
         downstream.end();
     }
     catch (error) {
+        succeeded = false;
         upstream.destroy();
         if (source !== upstream)
             source.destroy();
@@ -315,5 +322,6 @@ async function forwardNativeGeneration(upstream, downstream, routing, streamHint
         downstream.off('close', onClose);
         downstream.off('error', onDownstreamError);
     }
+    return { ok: succeeded };
 }
 //# sourceMappingURL=nativeSubagentResponse.js.map

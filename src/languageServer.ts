@@ -179,62 +179,74 @@ function setupNodeModules(env: Record<string, string | undefined>, modules: Node
  * After resolving, callers should monitor `handle.exitPromise` to detect
  * crashes that occur after startup.
  */
-export function startLanguageServer(port: number, csrf: string, headless?: boolean): Promise<LanguageServerHandle> {
-  return new Promise(async (resolve, reject) => {
-    const terminationGeneration = _terminationGeneration;
-    _lsPort = 0;
-    const logStream = fs.createWriteStream(getLsLogPath(), { flags: 'w' });
-
-    let proxyPort: number;
-    try {
-      if (_intentionalTermination) throw new Error('Language server startup cancelled during shutdown');
-      setLanguageServerPortResolver(getLsPort);
-      proxyPort = await startProxy();
-      // Shutdown may finish while proxy startup is pending. A later explicit
-      // restart must not revive this older, cancelled startup attempt either.
-      if (_intentionalTermination || terminationGeneration !== _terminationGeneration) {
-        throw new Error('Language server startup cancelled during shutdown');
-      }
-    } catch (err) {
-      console.error('[LanguageServer] Failed to start local proxy:', err);
+export async function startLanguageServer(
+  port: number,
+  csrf: string,
+  headless?: boolean,
+): Promise<LanguageServerHandle> {
+  const terminationGeneration = _terminationGeneration;
+  _lsPort = 0;
+  const logStream = fs.createWriteStream(getLsLogPath(), { flags: 'w' });
+  let logStreamEnded = false;
+  const closeLogStream = () => {
+    if (!logStreamEnded) {
+      logStreamEnded = true;
       logStream.end();
-      reject(err);
-      return;
     }
+  };
 
-    const apiServerUrl = `http://localhost:${proxyPort}`;
-
-    // We need to pass the override flags because the LS is running in standalone mode
-    const args: string[] = [
-      '--standalone',
-      '--override_ide_name',
-      'antigravity',
-      '--subclient_type',
-      'hub',
-      '--override_ide_version',
-      app.getVersion(),
-      '--override_user_agent_name',
-      'antigravity',
-      '--https_server_port',
-      String(port),
-      '--csrf_token',
-      csrf,
-      '--app_data_dir',
-      getAppDataDirName(),
-      '--api_server_url',
-      apiServerUrl,
-      '--cloud_code_endpoint',
-      apiServerUrl,
-      '--inference_api_server_url',
-      apiServerUrl,
-      '--enable_sidecars',
-    ];
-    if (headless) {
-      args.push('--headless');
+  let proxyPort: number;
+  try {
+    if (_intentionalTermination) throw new Error('Language server startup cancelled during shutdown');
+    setLanguageServerPortResolver(getLsPort);
+    proxyPort = await startProxy();
+    // Shutdown may finish while proxy startup is pending. A later explicit
+    // restart must not revive this older, cancelled startup attempt either.
+    if (_intentionalTermination || terminationGeneration !== _terminationGeneration) {
+      throw new Error('Language server startup cancelled during shutdown');
     }
-    // P0-3: Mask CSRF token in terminal output
-    const safeArgs = args.map((a) => (a === csrf ? '***' : a));
-    console.log(`\nSpawning: ${LS_BINARY} ${safeArgs.join(' ')}\n`);
+  } catch (err) {
+    console.error('[LanguageServer] Failed to start local proxy:', err);
+    closeLogStream();
+    throw err;
+  }
+
+  const apiServerUrl = `http://localhost:${proxyPort}`;
+
+  // We need to pass the override flags because the LS is running in standalone mode
+  const args: string[] = [
+    '--standalone',
+    '--override_ide_name',
+    'antigravity',
+    '--subclient_type',
+    'hub',
+    '--override_ide_version',
+    app.getVersion(),
+    '--override_user_agent_name',
+    'antigravity',
+    '--https_server_port',
+    String(port),
+    '--csrf_token',
+    csrf,
+    '--app_data_dir',
+    getAppDataDirName(),
+    '--api_server_url',
+    apiServerUrl,
+    '--cloud_code_endpoint',
+    apiServerUrl,
+    '--inference_api_server_url',
+    apiServerUrl,
+    '--enable_sidecars',
+  ];
+  if (headless) {
+    args.push('--headless');
+  }
+  // P0-3: Mask CSRF token in terminal output
+  const safeArgs = args.map((a) => (a === csrf ? '***' : a));
+  console.log(`\nSpawning: ${LS_BINARY} ${safeArgs.join(' ')}\n`);
+
+  let child: ChildProcess;
+  try {
     // Electron apps don't inherit shell environment variables when they are not launched through the terminal.
     // We need to load the shell env explicitly so the language server can discover tools in the user's environment.
     const env: Record<string, string | undefined> = { ...process.env, ...shellEnvSync() };
@@ -249,21 +261,81 @@ export function startLanguageServer(port: number, csrf: string, headless?: boole
         relativePath: ['build', 'src', 'bin', 'chrome-devtools-mcp.js'],
       },
     ]);
-    const child = spawn(LS_BINARY, args, {
+    child = spawn(LS_BINARY, args, {
       stdio: ['pipe', 'pipe', 'pipe'],
       env: env as Record<string, string>,
     });
+  } catch (err) {
+    closeLogStream();
+    throw err;
+  }
+
+  return await new Promise<LanguageServerHandle>((resolve, reject) => {
     _lsProcess = child;
+    let resolved = false;
+    let exitSettled = false;
+
+    const combined = new PassThrough();
+    const stderrChunks: string[] = [];
+    let stderrLength = 0;
+    const rl = readline.createInterface({ input: combined, crlfDelay: Infinity });
+
+    let exitResolve!: (info: ExitInfo) => void;
+    const exitPromise = new Promise<ExitInfo>((res) => {
+      exitResolve = res;
+    });
+
+    const settleExit = (code: number | null, signal: NodeJS.Signals | null) => {
+      if (exitSettled) return;
+      exitSettled = true;
+      const fullStderr = stderrChunks.join('');
+      const crashStackTrace = extractCrashStackTrace(fullStderr);
+      exitResolve({ code, signal, crashStackTrace });
+    };
+
+    const timer = setTimeout(() => {
+      if (!resolved) {
+        resolved = true;
+        try {
+          child.kill?.('SIGTERM');
+        } catch {
+          // Process may have already exited
+        }
+        if (_lsProcess === child) clearLsProcess();
+        rl.close();
+        closeLogStream();
+        settleExit(null, 'SIGTERM');
+        reject(new Error(`Timeout: language server did not report its port within ${LS_STARTUP_TIMEOUT_MS / 1000}s`));
+      }
+    }, LS_STARTUP_TIMEOUT_MS);
+
+    // Attach immediately after spawn() so async spawn errors (ENOENT/EACCES/EBUSY)
+    // reject cleanly instead of crashing Electron main with an unhandled 'error' event.
+    child.on('error', (err) => {
+      if (_lsProcess === child) clearLsProcess();
+      clearTimeout(timer);
+      rl.close();
+      closeLogStream();
+      if (!resolved) {
+        resolved = true;
+        const message =
+          err instanceof Error
+            ? err.message
+            : err && typeof err === 'object' && 'message' in err && typeof (err as { message?: unknown }).message === 'string'
+              ? (err as { message: string }).message
+              : String(err);
+        reject(new Error(`Failed to spawn language server: ${message}`));
+      }
+      settleExit(null, null);
+    });
+
     if (!headless) {
       // Close stdin immediately — the LS may block waiting for metadata on stdin.
       child.stdin?.end();
     }
-    const combined = new PassThrough();
     child.stdout?.pipe(combined, { end: false });
     child.stderr?.pipe(combined, { end: false });
     // Buffer stderr for crash log extraction (ring buffer)
-    const stderrChunks: string[] = [];
-    let stderrLength = 0;
     child.stderr?.on('data', (data) => {
       const str = data.toString();
       stderrChunks.push(str);
@@ -272,20 +344,9 @@ export function startLanguageServer(port: number, csrf: string, headless?: boole
         stderrLength -= stderrChunks.shift()!.length;
       }
     });
-    let resolved = false;
-    let logStreamEnded = false;
-    const timer = setTimeout(() => {
-      if (!resolved) {
-        resolved = true;
-        reject(new Error(`Timeout: language server did not report its port within ${LS_STARTUP_TIMEOUT_MS / 1000}s`));
-      }
-    }, LS_STARTUP_TIMEOUT_MS);
-    const rl = readline.createInterface({ input: combined, crlfDelay: Infinity });
+
     rl.on('close', () => {
-      if (!logStreamEnded) {
-        logStreamEnded = true;
-        logStream.end();
-      }
+      closeLogStream();
     });
     rl.on('line', (line) => {
       if (!logStreamEnded) {
@@ -314,25 +375,18 @@ export function startLanguageServer(port: number, csrf: string, headless?: boole
         console.log('='.repeat(60) + '\n');
       }
     });
-    // Exit promise — resolves whenever the process exits (whether during
-    // startup or after). Includes crash stack trace extraction.
-    const exitPromise = new Promise<ExitInfo>((exitResolve) => {
-      child.on('exit', (code, signal) => {
-        if (_lsProcess === child) clearLsProcess();
-        if (!logStreamEnded) {
-          logStreamEnded = true;
-          logStream.end();
-        }
-        const fullStderr = stderrChunks.join('');
-        const crashStackTrace = extractCrashStackTrace(fullStderr);
-        // If we haven't resolved the startup promise yet, reject it.
-        if (!resolved) {
-          resolved = true;
-          clearTimeout(timer);
-          reject(new Error(`Language server exited unexpectedly (code=${code}, signal=${signal})`));
-        }
-        exitResolve({ code, signal, crashStackTrace });
-      });
+
+    child.on('exit', (code, signal) => {
+      if (_lsProcess === child) clearLsProcess();
+      clearTimeout(timer);
+      rl.close();
+      closeLogStream();
+      // If we haven't resolved the startup promise yet, reject it.
+      if (!resolved) {
+        resolved = true;
+        reject(new Error(`Language server exited unexpectedly (code=${code}, signal=${signal})`));
+      }
+      settleExit(code, signal);
     });
   });
 }
@@ -387,29 +441,39 @@ function monitorLsCrashInternal(
     if (now - _lastRestartTime > RESTART_WINDOW_MS) {
       _restartCount = 0;
     }
-    _lastRestartTime = now;
-    if (_restartCount >= MAX_RESTARTS) {
-      const msg = `Language server crashed ${MAX_RESTARTS} times in a row. Giving up.`;
-      console.error(msg);
-      return;
-    }
-    _restartCount++;
-    console.log(`Attempting restart ${_restartCount}/${MAX_RESTARTS} in ${RESTART_COOLDOWN_MS / 1000}s...`);
-    await sleep(RESTART_COOLDOWN_MS);
-    if (_intentionalTermination || _lsProcess) {
-      return;
-    }
-    try {
-      const newHandle = await startLanguageServer(port, csrf);
-      _lsPort = newHandle.port;
-      if (options.onPortChanged) {
-        options.onPortChanged(_lsPort);
+    while (_restartCount < MAX_RESTARTS) {
+      _lastRestartTime = Date.now();
+      _restartCount++;
+      const backoffMs = RESTART_COOLDOWN_MS * _restartCount;
+      console.log(`Attempting restart ${_restartCount}/${MAX_RESTARTS} in ${backoffMs / 1000}s...`);
+      await sleep(backoffMs);
+      if (_intentionalTermination || _lsProcess) {
+        return;
       }
-      // Recurse
-      monitorLsCrashInternal(newHandle, port, csrf, options);
-    } catch (err) {
-      console.error(`Failed to restart language server: ${(err as Error).message}`);
+      try {
+        const newHandle = await startLanguageServer(port, csrf, options.headless);
+        _lsPort = newHandle.port;
+        if (options.onPortChanged) {
+          options.onPortChanged(_lsPort);
+        }
+        // Recurse
+        monitorLsCrashInternal(newHandle, port, csrf, options);
+        return;
+      } catch (err) {
+        const message =
+          err instanceof Error
+            ? err.message
+            : err && typeof err === 'object' && 'message' in err && typeof (err as { message?: unknown }).message === 'string'
+              ? (err as { message: string }).message
+              : String(err);
+        console.error(`Failed to restart language server (attempt ${_restartCount}/${MAX_RESTARTS}): ${message}`);
+        if (_intentionalTermination || _lsProcess) {
+          return;
+        }
+      }
     }
+    const msg = `Language server crashed ${MAX_RESTARTS} times in a row. Giving up.`;
+    console.error(msg);
   });
 }
 

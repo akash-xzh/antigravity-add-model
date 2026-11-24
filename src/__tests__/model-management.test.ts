@@ -4,7 +4,8 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import * as http from 'node:http';
 import { AddressInfo } from 'node:net';
-import { ModelStore, normalizeModelConfig } from '../modelStore';
+import { ModelStore, isMaskedSecret, normalizeModelConfig, writeJsonAtomic } from '../modelStore';
+import { validateCustomModel } from '../schemaValidator';
 import { createModelManager, modelListUrl, requestJson } from '../modelManagement';
 import { GoogleLoginOptions } from '../googleOAuth';
 import { GoogleAccount, acquireGoogleAccount, getGooglePoolStatus, resetGoogleAccountState } from '../googleAccounts';
@@ -1556,5 +1557,60 @@ describe('authenticated gateway integration', () => {
     );
     new ModelStore(manager.store.filename, codec).save(entry);
     await expect(manager.discoverModels(manager.store.list()[0])).rejects.toThrow('cannot be decrypted');
+  });
+
+  it('rejects missing/blank names, tightens isMaskedSecret, rejects encrypted customHeaders, and cleans .bak on write', () => {
+    const { directory, manager } = setup();
+    // Never create "models/undefined" or "models/"
+    expect(() => manager.store.save({ ...entry, name: undefined as unknown as string })).toThrow('Model name is required');
+    expect(() => manager.store.save({ ...entry, name: '' })).toThrow('Model name is required');
+    expect(() => manager.store.save({ ...entry, name: '   ' })).toThrow('Model name is required');
+    expect(() => manager.store.save({ ...entry, name: 'models/' })).toThrow('Model name is required');
+    expect(manager.store.read()).toHaveLength(0);
+
+    // isMaskedSecret only matches exact '********', never real keys with '...' or '***'
+    expect(isMaskedSecret('********')).toBe(true);
+    expect(isMaskedSecret('sk-abc...xyz')).toBe(false);
+    expect(isMaskedSecret('***real-prefix-token')).toBe(false);
+    manager.store.save({ ...entry, apiKey: 'sk-contains...dots', customHeaders: { 'x-tok': '***real-value' } });
+    const stored = manager.store.read()[0];
+    expect(codec.decryptString(stored.apiKey!)).toBe('sk-contains...dots');
+    expect(codec.decryptString((stored.customHeaders as Record<string, string>)['x-tok'])).toBe('***real-value');
+
+    // Reject already-encrypted ciphertext in customHeaders
+    expect(() =>
+      manager.store.save({
+        ...entry,
+        name: 'models/bad-hdr',
+        customHeaders: { 'x-auth': 'local-gcm:abc123' },
+      }),
+    ).toThrow('Machine-encrypted');
+    expect(() =>
+      manager.store.import({
+        models: [{ ...entry, name: 'models/bad-hdr-2', customHeaders: { 'x-auth': 'enc:abc123' } }],
+      }),
+    ).toThrow('Machine-encrypted');
+
+    // Stale/dead lockfile is reclaimed cleanly on save (hard-expired PID)
+    const lockPath = `${manager.store.filename}.lock`;
+    fs.writeFileSync(lockPath, JSON.stringify({ pid: process.pid, token: 'stale', createdAt: Date.now() - 11 * 60_000 }));
+    manager.store.save({ ...entry, name: 'models/after-stale-lock' });
+    expect(fs.existsSync(lockPath)).toBe(false);
+
+    // Plaintext migration .bak is removed once writeJsonAtomic succeeds on custom_models.json
+    const bakPath = `${manager.store.filename}.bak`;
+    fs.writeFileSync(bakPath, '{"models":[]}');
+    writeJsonAtomic(manager.store.filename, { models: manager.store.read() });
+    expect(fs.existsSync(bakPath)).toBe(false);
+
+    // schemaValidator rejects "models/" and falsy non-strings for optional string fields
+    expect(validateCustomModel({ ...entry, name: 'models/' }).valid).toBe(false);
+    expect(validateCustomModel({ ...entry, name: 'models/   ' }).valid).toBe(false);
+    for (const bad of [0, false, null]) {
+      expect(validateCustomModel({ ...entry, externalModelName: bad }).valid).toBe(false);
+      expect(validateCustomModel({ ...entry, displayName: bad }).valid).toBe(false);
+      expect(validateCustomModel({ ...entry, apiKey: bad }).valid).toBe(false);
+    }
+    expect(directory).toBeTruthy();
   });
 });

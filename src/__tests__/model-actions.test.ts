@@ -1,10 +1,13 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import * as fs from 'node:fs';
+import * as http from 'node:http';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import type { AddressInfo } from 'node:net';
 import { createModelManager } from '../modelManagement';
 import { createModelActions } from '../modelActions';
 import { allocateModelIdentities, NATIVE_MODEL_CAPACITY } from '../modelIdentity';
+import { clearHealthCache, type ModelHealthResult } from '../proxy/modelHealth';
 import type { ModelEntry } from '../modelStore';
 
 const directories: string[] = [];
@@ -98,7 +101,10 @@ describe('shared management model identity responses', () => {
     expect(f.manager.store.read()[0]).toMatchObject({ compactionThresholdPercent: 80, contextWindow: 85000 });
     expect(f.list()[0].nativeModelExperiments).toEqual(experiments);
     f.actions['storage:save-custom-model']({ ...returned, compactionThresholdPercent: undefined, compactionReasoningEffort: undefined });
-    expect(f.list()[0].nativeModelExperiments).toBeUndefined();
+    // A declared context window alone keeps the default 80% policy; only the summary override is gone.
+    expect(JSON.parse(
+      (f.list()[0].nativeModelExperiments as typeof experiments).experiments.CASCADE_USE_EXPERIMENT_CHECKPOINTER.stringValue,
+    )).toEqual({ tokenThreshold: 68000, maxTokenLimit: 75784 });
   });
 
   it('does not trust or persist identity fields supplied by save and import clients', () => {
@@ -160,5 +166,98 @@ describe('shared management model identity responses', () => {
     expect(new Set(available.map((model) => model.nativeModelId)).size).toBe(NATIVE_MODEL_CAPACITY);
     expect(response.filter((model) => !model.nativePickerAvailable)).toMatchObject([{ nativeModelId: undefined }]);
     expect(response.find((model) => !model.nativePickerAvailable)?.nativePickerError).toContain('capacity reached');
+  });
+
+  it('gets and saves model display settings via actions', () => {
+    const f = fixture();
+    const initial = f.actions['storage:get-display-settings']() as { showStatusEmoji: boolean };
+    expect(initial.showStatusEmoji).toBe(true);
+
+    const saved = f.actions['storage:save-display-settings']({ showStatusEmoji: false }) as {
+      success: boolean;
+      showStatusEmoji: boolean;
+    };
+    expect(saved.success).toBe(true);
+    expect(saved.showStatusEmoji).toBe(false);
+
+    const updated = f.actions['storage:get-display-settings']() as { showStatusEmoji: boolean };
+    expect(updated.showStatusEmoji).toBe(false);
+  });
+
+  it('decrypts stored credentials for storage:check-model-health and returns {} for unknown model names', async () => {
+    const f = fixture();
+    const receivedHeaders: http.IncomingHttpHeaders[] = [];
+    const server = http.createServer((req, res) => {
+      receivedHeaders.push(req.headers);
+      if (req.headers.authorization === 'Bearer real-secret-key' && req.headers['x-tenant'] === 'real-tenant-secret') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end('{"ok":true}');
+      } else {
+        res.writeHead(401, { 'Content-Type': 'application/json' });
+        res.end('{"error":"unauthorized"}');
+      }
+    });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()));
+    const port = (server.address() as AddressInfo).port;
+    try {
+      clearHealthCache(false, f.directory);
+      f.manager.saveModel({
+        ...example,
+        apiUrl: `http://127.0.0.1:${port}/v1`,
+        apiKey: 'real-secret-key',
+        customHeaders: { 'x-tenant': 'real-tenant-secret' },
+      });
+
+      // Unknown name must return {} without pinging any model
+      const missing = (await f.actions['storage:check-model-health']('models/does-not-exist')) as Record<
+        string,
+        ModelHealthResult
+      >;
+      expect(missing).toEqual({});
+      expect(receivedHeaders).toHaveLength(0);
+
+      // Single model check sends decrypted key & headers (never "********")
+      const single = (await f.actions['storage:check-model-health'](example.name)) as Record<string, ModelHealthResult>;
+      expect(single[example.name]?.status).toBe('healthy');
+      expect(receivedHeaders).toHaveLength(1);
+      expect(receivedHeaders[0].authorization).toBe('Bearer real-secret-key');
+      expect(receivedHeaders[0]['x-tenant']).toBe('real-tenant-secret');
+
+      // Full batch check also uses decrypted credentials
+      const all = (await f.actions['storage:check-model-health']()) as Record<string, ModelHealthResult>;
+      expect(all[example.name]?.status).toBe('healthy');
+      expect(receivedHeaders).toHaveLength(2);
+      expect(receivedHeaders[1].authorization).toBe('Bearer real-secret-key');
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+
+  it('reloads model_health_cache.json in storage:get-model-health when updated externally by the proxy', () => {
+    const f = fixture();
+    clearHealthCache(false, f.directory);
+    expect(f.actions['storage:get-model-health']()).toEqual({});
+
+    const cacheFile = path.join(f.directory, 'model_health_cache.json');
+    const firstPayload = {
+      models: {
+        'models/proxy-updated': { status: 'healthy', latencyMs: 42, checkedAt: Date.now() },
+      },
+      recent: ['models/proxy-updated'],
+    };
+    fs.writeFileSync(cacheFile, JSON.stringify(firstPayload, null, 2));
+    const firstRead = f.actions['storage:get-model-health']() as Record<string, ModelHealthResult>;
+    expect(firstRead['models/proxy-updated']?.status).toBe('healthy');
+
+    // Simulate proxy writing an updated health state with different size/mtime
+    const secondPayload = {
+      models: {
+        'models/proxy-updated': { status: 'cooldown', error: 'Rate Limit (429)', checkedAt: Date.now() + 1000 },
+      },
+      recent: ['models/proxy-updated'],
+    };
+    fs.writeFileSync(cacheFile, JSON.stringify(secondPayload, null, 2));
+    const secondRead = f.actions['storage:get-model-health']() as Record<string, ModelHealthResult>;
+    expect(secondRead['models/proxy-updated']?.status).toBe('cooldown');
   });
 });

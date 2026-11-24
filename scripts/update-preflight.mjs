@@ -13,6 +13,9 @@ import { serviceCommand } from './desktop-service.mjs';
 const exec = promisify(execFile);
 const usage = 'Use update-preflight.mjs check|prepare --resources PATH [--settings FILE] [--data-dir DIR] [--json]';
 const candidateName = /^(?:antigravity(?: ide)?|language_server(?:_[a-z0-9_]+)?)\.exe$/i;
+// Recognize the official standalone installer filename and browser download copies.
+// This is an in-progress-installer warning, NOT proof of a file lock or trusted signer.
+const standaloneInstallerName = /^antigravity-(?:x64|arm64)(?: \(\d+\))?\.exe$/i;
 const mutexName = /^[a-z0-9][a-z0-9._-]{0,127}$/i;
 function fail(code, message) { throw Object.assign(new Error(`${code}: ${message}`), { code }); }
 
@@ -133,6 +136,7 @@ async function inspectUpdateBlockers(installation, options, hooks) {
     ? { status: 'unavailable', items: [], error: mutexResult.reason.message }
     : { status: installation.kind === 'ide' ? 'checked' : 'not-applicable', items: mutexResult.value };
   const blocked = Boolean(processError || processes.matching.length || processes.otherInstallations.length || processes.unverifiable.length ||
+    processes.installers.length ||
     mutexes.status === 'unavailable' || mutexes.items.some(item => item.status !== 'absent'));
   return { processes, processError, mutexes, readyForPreparation: !blocked };
 }
@@ -140,9 +144,11 @@ async function inspectUpdateBlockers(installation, options, hooks) {
 function requireNoBlockers(snapshot) {
   if (snapshot.readyForPreparation) return;
   const reason = snapshot.processError || snapshot.mutexes.error ||
+    (snapshot.processes.installers.length
+      ? 'An Antigravity installer is running. Finish or cancel it normally before preparing the addon; this does not establish why the vendor installer failed.' :
     (snapshot.mutexes.items.some(item => item.status !== 'absent')
       ? 'An IDE or installer mutex is present or unverifiable. Close the app or finish/cancel the existing official installer normally; do not forcibly release its mutex.'
-      : 'Close the listed app/language-server processes, including other installations that may hold a shared updater mutex; unknown executable identities must be resolved manually.');
+      : 'Close the listed app/language-server processes, including other installations that may hold a shared updater mutex; unknown executable identities must be resolved manually.'));
   fail('PREPARE_BLOCKED', `${reason} Run update-preflight.mjs check --resources PATH --json for details. No files changed and no proxy was stopped.`);
 }
 
@@ -168,22 +174,23 @@ export function classifyUpdateProcesses(installation, processes, options = {}) {
   const resolve = options.realpath || fs.realpathSync;
   const normalize = value => platform === 'win32' ? value.toLowerCase() : value;
   const root = normalize(resolve(installation));
-  const result = { matching: [], otherInstallations: [], unverifiable: [] };
+  const result = { matching: [], otherInstallations: [], installers: [], unverifiable: [] };
   for (const processInfo of processes) {
     const { pid, name, executable } = processInfo;
     if (!Number.isInteger(pid) || typeof name !== 'string') fail('PROCESS_CHECK_UNAVAILABLE', 'Invalid process inventory.');
     if (!executable) {
-      if (candidateName.test(name)) result.unverifiable.push({ pid, name });
+      if (candidateName.test(name) || standaloneInstallerName.test(name)) result.unverifiable.push({ pid, name });
       continue;
     }
     let canonical;
     try { canonical = resolve(executable); } catch {
-      if (candidateName.test(name)) result.unverifiable.push({ pid, name });
+      if (candidateName.test(name) || standaloneInstallerName.test(name)) result.unverifiable.push({ pid, name });
       continue;
     }
     const relative = path.relative(root, normalize(canonical));
     const inside = relative !== '' && relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative);
     if (inside) result.matching.push({ pid, name, executable: canonical });
+    else if (standaloneInstallerName.test(name)) result.installers.push({ pid, name, executable: canonical });
     else if (candidateName.test(name)) result.otherInstallations.push({ pid, name, executable: canonical });
   }
   return result;
@@ -197,7 +204,7 @@ export async function updatePreflight(options, hooks = {}) {
   const dataDirectory = path.resolve(options.dataDirectory || path.join(os.homedir(), '.gemini', 'antigravity'));
   const snapshot = await inspectUpdateBlockers(installation, options, hooks);
   const report = { command, installation, dataDirectory, ...snapshot, actions: [],
-    guidance: 'This checks addon recovery, process identity and known IDE mutexes in the current Windows session, not every Windows file lock. If the official installer still fails, share the product/version, installer filename, this report and its installer log; redact personal paths and credentials.' };
+    guidance: 'readyForPreparation means the addon can be restored safely; it does not guarantee the vendor installer will succeed. Checks include application and recognized standalone-installer processes and known IDE mutexes in the current Windows session, not every file lock. If the official installer still fails after preparation, report the product/version, installer filename, this report and installer log; redact personal paths and credentials. Do not repeat prepare as a fix for vendor installer failures.' };
   if (command === 'check') return report;
   requireNoBlockers(snapshot);
   // Re-inspect immediately before writing; adapters additionally check their own transaction state.
@@ -224,7 +231,7 @@ export async function updatePreflight(options, hooks = {}) {
   report.guidance = (installation.status === 'managed'
     ? 'The verified managed changes were restored. '
     : 'No active managed restoration was available; no application or settings files were restored. Older untracked patches require separate recovery. ') +
-    'The owned proxy is stopped. Run the official installer manually. After updating, recheck compatibility before applying the addon again. Models and saved credentials were preserved.';
+    'The owned proxy is stopped. Run the official installer manually. This is not a guarantee of successful vendor installation; do not repeat preparation if it fails with no app processes. After updating, recheck compatibility before applying the addon again. Models and saved credentials were preserved.';
   return report;
 }
 

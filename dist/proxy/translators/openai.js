@@ -239,6 +239,22 @@ function mapGeminiToOpenAI(geminiBody, modelName, stateKey = modelName) {
         ...(needsNoTemperature ? {} : { temperature: geminiBody.generationConfig?.temperature ?? 0.7 }),
         ...(needsCompletionTokens ? { max_completion_tokens: maxTokens } : { max_tokens: maxTokens }),
     };
+    const thinkingConfig = geminiBody.generationConfig
+        ?.thinkingConfig;
+    if (thinkingConfig) {
+        const level = (thinkingConfig.thinkingLevel || thinkingConfig.thinking_level);
+        if (typeof level === 'string') {
+            const lower = level.toLowerCase();
+            if (lower === 'low')
+                payload.reasoning_effort = 'low';
+            else if (lower === 'medium')
+                payload.reasoning_effort = 'medium';
+            else if (lower === 'high')
+                payload.reasoning_effort = 'high';
+            else if (lower === 'extra' || lower === 'max' || lower === 'xhigh')
+                payload.reasoning_effort = 'xhigh';
+        }
+    }
     if (geminiBody.tools && Array.isArray(geminiBody.tools)) {
         const openaiTools = mapGeminiToolsToOpenAI(geminiBody.tools);
         if (openaiTools.length > 0)
@@ -420,7 +436,7 @@ function mapOpenAIChunkToGemini(chunk, modelName, streamKey, toolSchemas) {
         }
     }
     const finishReason = choice.finish_reason;
-    const completed = finishReason === 'stop' || finishReason === 'length' || finishReason === 'tool_calls';
+    const completed = Boolean(finishReason);
     if (delta?.content)
         context.accumulatedText += delta.content;
     const reasoning = delta?.reasoning_content || delta?.reasoning || '';
@@ -436,7 +452,7 @@ function mapOpenAIChunkToGemini(chunk, modelName, streamKey, toolSchemas) {
     const completionParts = reasoning ? [{ text: reasoning, thought: true }] : [];
     // A complete invoke can precede a fragmented parallel invoke. Keep both until
     // the provider finishes, including providers that finish DSML with tool_calls.
-    if (completed && Object.keys(context.toolCalls).length === 0) {
+    if (completed && finishReason !== 'content_filter' && Object.keys(context.toolCalls).length === 0) {
         const remaining = context.accumulatedText.slice(streamedTextPositions.get(context) || 0);
         const dsml = parseDSMLToolCalls(remaining);
         if (dsml && dsml.functionCalls.length > 0) {
@@ -458,16 +474,19 @@ function mapOpenAIChunkToGemini(chunk, modelName, streamKey, toolSchemas) {
         if (text)
             completionParts.push({ text });
     }
-    if (finishReason === 'stop' || finishReason === 'length') {
-        // Check for pending native tool_calls before closing stream
-        const pendingToolCalls = Object.values(context.toolCalls).filter((tc) => tc.name && tc.arguments);
+    if (completed) {
+        // Emit pending native tool_calls on completion (including zero-arg calls where arguments === "").
+        const pendingToolCalls = finishReason === 'content_filter'
+            ? []
+            : Object.values(context.toolCalls).filter((tc) => Boolean(tc.name));
         if (pendingToolCalls.length > 0) {
             const parts = pendingToolCalls.map((tc) => {
                 let args = {};
                 try {
-                    args = JSON.parse(tc.arguments);
+                    args = JSON.parse(tc.arguments || '{}');
                 }
-                catch (_e) {
+                catch (e) {
+                    electron_log_1.default.debug('[OpenAI] Stream tool args parse fallback:', e.message);
                     args = {};
                 }
                 args = (0, utils_1.normalizeToolArgs)(tc.name, args, toolSchemas);
@@ -477,6 +496,7 @@ function mapOpenAIChunkToGemini(chunk, modelName, streamKey, toolSchemas) {
                 (0, shared_1.touchStateTimestamp)(shared_1.stateTimestamps.toolCallIds, modelName);
                 const translated = (0, utils_1.translateToolCallToNative)(tc.name, args, toolSchemas);
                 if (translated.name !== tc.name) {
+                    translated.args = (0, utils_1.normalizeToolArgs)(translated.name, translated.args, toolSchemas);
                     shared_1.translatedToolCalls.set(tc.id, {
                         originalName: tc.name,
                         translatedName: translated.name,
@@ -491,39 +511,8 @@ function mapOpenAIChunkToGemini(chunk, modelName, streamKey, toolSchemas) {
             return { content: { parts: [...completionParts, ...parts], role: 'model' }, finishReason: 'STOP', index: 0 };
         }
         shared_1.activeStreamContexts.delete(streamId);
-        return { content: { parts: completionParts, role: 'model' }, finishReason: 'STOP', index: 0 };
-    }
-    // Only emit tool calls when finishReason signals completion (args are fully accumulated)
-    if (finishReason === 'tool_calls') {
-        const parts = Object.values(context.toolCalls).map((tc) => {
-            let args = {};
-            try {
-                args = JSON.parse(tc.arguments);
-            }
-            catch (e) {
-                electron_log_1.default.debug('[OpenAI] Stream tool args parse fallback:', e.message);
-                args = {};
-            }
-            args = (0, utils_1.normalizeToolArgs)(tc.name, args, toolSchemas);
-            const modelTCIds = shared_1.modelToolCallIds.get(modelName) || {};
-            modelTCIds[tc.name] = tc.id;
-            shared_1.modelToolCallIds.set(modelName, modelTCIds);
-            (0, shared_1.touchStateTimestamp)(shared_1.stateTimestamps.toolCallIds, modelName);
-            const translated = (0, utils_1.translateToolCallToNative)(tc.name, args, toolSchemas);
-            if (translated.name !== tc.name) {
-                translated.args = (0, utils_1.normalizeToolArgs)(translated.name, translated.args, toolSchemas);
-                shared_1.translatedToolCalls.set(tc.id, {
-                    originalName: tc.name,
-                    translatedName: translated.name,
-                    cmd: args.CommandLine || '',
-                    cwd: args.Cwd || '',
-                });
-                (0, shared_1.touchStateTimestamp)(shared_1.stateTimestamps.translatedCalls, tc.id);
-            }
-            return { functionCall: { name: translated.name, args: translated.args, id: tc.id } };
-        });
-        shared_1.activeStreamContexts.delete(streamId);
-        return { content: { parts: [...completionParts, ...parts], role: 'model' }, finishReason: 'STOP', index: 0 };
+        const mappedFinishReason = finishReason === 'content_filter' ? 'SAFETY' : finishReason === 'length' ? 'MAX_TOKENS' : 'STOP';
+        return { content: { parts: completionParts, role: 'model' }, finishReason: mappedFinishReason, index: 0 };
     }
     const text = takeStreamText(context);
     if (text) {

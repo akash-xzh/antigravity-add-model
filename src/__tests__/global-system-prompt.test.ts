@@ -25,6 +25,8 @@ function promptFile(text: string): string {
 }
 
 const previous = process.env.ANTIGRAVITY_GLOBAL_PROMPT;
+const previousSections = process.env.ANTIGRAVITY_PROMPT_SECTIONS_FILE;
+const previousObserved = process.env.ANTIGRAVITY_OBSERVED_SECTIONS_FILE;
 const servers: http.Server[] = [];
 afterEach(async () => {
   await Promise.all(
@@ -38,6 +40,10 @@ afterEach(async () => {
   );
   if (previous === undefined) delete process.env.ANTIGRAVITY_GLOBAL_PROMPT;
   else process.env.ANTIGRAVITY_GLOBAL_PROMPT = previous;
+  if (previousSections === undefined) delete process.env.ANTIGRAVITY_PROMPT_SECTIONS_FILE;
+  else process.env.ANTIGRAVITY_PROMPT_SECTIONS_FILE = previousSections;
+  if (previousObserved === undefined) delete process.env.ANTIGRAVITY_OBSERVED_SECTIONS_FILE;
+  else process.env.ANTIGRAVITY_OBSERVED_SECTIONS_FILE = previousObserved;
   delete process.env.ANTIGRAVITY_CAPTURE_SYSTEM_PROMPT;
   delete process.env.ANTIGRAVITY_GLOBAL_PROMPT_MODE;
   for (const dir of dirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
@@ -83,10 +89,55 @@ describe('global system prompt', () => {
     expect(injectGlobalSystemPrompt(raw)).toBe(raw);
   });
 
-  it('returns the original buffer when no prompt file exists', () => {
-    process.env.ANTIGRAVITY_GLOBAL_PROMPT = promptFile('');
-    const raw = Buffer.from(JSON.stringify({ request: { contents: [] } }));
-    expect(injectGlobalSystemPrompt(raw)).toBe(raw);
+  it('returns the original buffer when no prompt file exists and no section rewrites apply', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-global-prompt-'));
+    dirs.push(dir);
+    process.env.ANTIGRAVITY_GLOBAL_PROMPT = path.join(dir, 'missing-global.txt');
+    process.env.ANTIGRAVITY_PROMPT_SECTIONS_FILE = path.join(dir, 'missing-sections.json');
+    process.env.ANTIGRAVITY_OBSERVED_SECTIONS_FILE = path.join(dir, 'observed.json');
+    const rawEmpty = Buffer.from(JSON.stringify({ request: { contents: [] } }));
+    expect(injectGlobalSystemPrompt(rawEmpty)).toBe(rawEmpty);
+
+    const rawWithSystem = Buffer.from(
+      JSON.stringify({
+        request: { systemInstruction: { parts: [{ text: '<identity>Default</identity>' }] }, contents: [] },
+      }),
+    );
+    expect(injectGlobalSystemPrompt(rawWithSystem)).toBe(rawWithSystem);
+  });
+
+  it('still applies prompt section rewrites in injectGlobalSystemPrompt when global-system-prompt.txt is absent', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-global-prompt-'));
+    dirs.push(dir);
+    process.env.ANTIGRAVITY_GLOBAL_PROMPT = path.join(dir, 'missing-global.txt');
+    const sectionsFile = path.join(dir, 'sections.json');
+    fs.writeFileSync(
+      sectionsFile,
+      JSON.stringify({
+        overrides: { identity: 'Custom native identity' },
+        enabled: { guidelines: false },
+      }),
+    );
+    process.env.ANTIGRAVITY_PROMPT_SECTIONS_FILE = sectionsFile;
+    process.env.ANTIGRAVITY_OBSERVED_SECTIONS_FILE = path.join(dir, 'observed.json');
+
+    const envelope = {
+      model: 'gemini-3-pro',
+      request: {
+        systemInstruction: {
+          parts: [{ text: '<identity>Original</identity>\n<guidelines>Rules</guidelines>\n<skills>Keep</skills>' }],
+        },
+        contents: [],
+      },
+    };
+    const raw = Buffer.from(JSON.stringify(envelope));
+    const result = injectGlobalSystemPrompt(raw);
+    expect(result).not.toBe(raw);
+    const parsed = JSON.parse(result.toString('utf8'));
+    const text = parsed.request.systemInstruction.parts[0].text;
+    expect(text).toContain('<identity>\nCustom native identity\n</identity>');
+    expect(text).not.toContain('<guidelines>');
+    expect(text).toContain('<skills>Keep</skills>');
   });
 
   it('replaces the whole instruction in replace mode, and appends by default', () => {

@@ -1,4 +1,6 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
+/** Per-process token authenticating Electron's HTTPS->HTTP /main.js redirect. */
+export declare function getUiMitmToken(): string;
 /** Native language-server callers omit Origin; browser callers must use an owned origin. */
 export declare function guardLoopbackRequest(req: IncomingMessage, res: ServerResponse, languageServerPort?: number): boolean;
 /** The desktop supplies its current LS port, never a port learned from an HTTP caller. */

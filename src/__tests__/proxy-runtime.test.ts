@@ -1685,3 +1685,179 @@ describe('provider and configuration contracts', () => {
     expect(parseRetryAfter('999999')).toBe(30000);
   });
 });
+
+describe('production audit regression coverage', () => {
+  it.each([
+    { status: 413, body: JSON.stringify({ error: { message: 'request too large secret-test-token' } }) },
+    { status: 400, body: JSON.stringify({ error: { code: 'context_length_exceeded', message: 'maximum context length exceeded secret-test-token' } }) },
+  ])('allows fallback and adds an overflow hint on HTTP $status context overflow', async ({ status, body: errBody }) => {
+    let primaryHits = 0;
+    let fallbackHits = 0;
+    const primaryUrl = await serve((_req, res) => {
+      primaryHits += 1;
+      res.writeHead(status, { 'Content-Type': 'application/json' });
+      res.end(errBody);
+    });
+    const fallbackUrl = await serve((_req, res) => {
+      fallbackHits += 1;
+      success(res, 'larger-model-ok');
+    });
+    const backup = model(fallbackUrl);
+    const primary = model(primaryUrl, { fallbackModels: [backup.name] });
+    const response = await fetch(await proxy([primary, backup]));
+    expect(response.status).toBe(200);
+    expect(await response.text()).toContain('larger-model-ok');
+    expect(primaryHits).toBe(1);
+    expect(fallbackHits).toBe(1);
+
+    // Without a fallback, returns a clear context-overflow hint without echoing secrets.
+    const noFallbackRes = await fetch(await proxy([model(primaryUrl)]));
+    const noFallbackText = await noFallbackRes.text();
+    expect(noFallbackRes.status).toBe(status);
+    expect(noFallbackText).toContain('Context length exceeded');
+    expect(noFallbackText).not.toContain('secret-test-token');
+  });
+
+  it('falls back to a larger-context model when trimContext rejects the primary contextWindow', async () => {
+    let fallbackHits = 0;
+    const fallbackUrl = await serve((_req, res) => {
+      fallbackHits += 1;
+      success(res, 'big-window-ok');
+    });
+    const backup = model(fallbackUrl, { contextWindow: 200_000 });
+    const primary = model('http://127.0.0.1:1', { contextWindow: 100, fallbackModels: [backup.name] });
+    const url = await serve((_req, res) => {
+      void runCustomModelRequest(
+        res,
+        primary,
+        { contents: [{ role: 'user', parts: [{ text: 'x'.repeat(3000) }] }] },
+        false,
+        [primary, backup],
+        false,
+      );
+    });
+    const response = await fetch(url);
+    expect(response.status).toBe(200);
+    expect(await response.text()).toContain('big-window-ok');
+    expect(fallbackHits).toBe(1);
+  });
+
+  it('records usage and emits usageMetadata when a stream=true request gets a non-SSE JSON response', async () => {
+    const conversationId = '22222222-3333-4444-5555-666666666666';
+    const upstream = await serve((_req, res) => {
+      res.setHeader('Content-Type', 'application/json');
+      res.end(
+        JSON.stringify({
+          choices: [{ message: { content: 'non-sse fallback' }, finish_reason: 'stop' }],
+          usage: { prompt_tokens: 120, completion_tokens: 15, prompt_tokens_details: { cached_tokens: 40 } },
+        }),
+      );
+    });
+    const configured = model(upstream);
+    const url = await serve((_req, res) => {
+      void runCustomModelRequest(
+        res,
+        configured,
+        { conversationId, contents: [{ role: 'user', parts: [{ text: 'hello' }] }] },
+        true,
+        [configured],
+        false,
+      );
+    });
+    const response = await fetch(url);
+    expect(response.status).toBe(200);
+    const wire = await response.text();
+    expect(wire).toContain('non-sse fallback');
+    expect(wire).toContain('"usageMetadata"');
+    expect(wire).toContain('"promptTokenCount":120');
+  });
+
+  it('releases circuit breaker probing when a client aborts during retry backoff', async () => {
+    let hits = 0;
+    const upstream = await serve((_req, res) => {
+      hits += 1;
+      if (hits <= 2) {
+        res.writeHead(503);
+        res.end();
+      } else {
+        success(res, 'recovered-after-abort');
+      }
+    });
+    const configured = model(upstream, {
+      maxRetries: 2,
+      circuitBreaker: { failureThreshold: 1, cooldownMs: 25 },
+    });
+    const endpoint = await proxy([configured]);
+
+    // 1. Open the circuit (maxRetries=2 -> but let's use a 1-shot fail first via a separate model? No, same model:
+    //    first request fails with 503 after retries or abort? Use maxRetries=0 on first? Wait: circuitKey uses
+    //    [model.name, model.apiUrl, model.apiFormat || model.provider], so use same name with failureThreshold: 1!)
+    const opener = { ...configured, maxRetries: 0 };
+    const openEndpoint = await proxy([opener]);
+    expect((await fetch(openEndpoint)).status).toBe(503);
+    expect(hits).toBe(1);
+
+    // 2. Wait past cooldownMs (25ms) so next request enters half-open probe (probing = true).
+    await new Promise((resolve) => setTimeout(resolve, 40));
+
+    // 3. Probe hits upstream (hits=2 -> 503), enters 500ms retry backoff delay, then client aborts!
+    const abortController = new AbortController();
+    const probeReq = fetch(endpoint, { signal: abortController.signal }).catch(() => undefined);
+    await vi.waitFor(() => expect(hits).toBe(2));
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    abortController.abort();
+    await probeReq;
+
+    // 4. Subsequent request MUST NOT be permanently wedged in probing=true!
+    const recovery = await fetch(endpoint);
+    expect(recovery.status).toBe(200);
+    expect(await recovery.text()).toContain('recovered-after-abort');
+    expect(hits).toBe(3);
+  });
+
+  it('preserves HTTP 504 when idleTimeout destroys an upstream stream after headers', async () => {
+    const upstream = await serve((_req, res) => {
+      res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+      sse(res, { choices: [{ delta: { content: 'partial' } }] });
+      // Never finish: trigger idleTimeout post-headers.
+    });
+    const url = await proxy([model(upstream, { idleTimeout: 40, timeout: 500, maxRetries: 0 })], true);
+    const response = await fetch(url);
+    const wire = await response.text();
+    expect(wire).toContain('event: error');
+    expect(wire).toContain('"code":504');
+    expect(wire).toContain('Upstream idle timeout');
+  });
+
+  it('executes configured retries even after switching across multiple Google Cloud Code accounts', async () => {
+    let calls = 0;
+    const upstream = await serve((_req, res) => {
+      calls += 1;
+      if (calls <= 2) {
+        res.writeHead(503);
+        res.end('{}');
+      } else {
+        res.end(
+          JSON.stringify({
+            response: { candidates: [{ content: { role: 'model', parts: [{ text: 'retried-pool-ok' }] } }] },
+          }),
+        );
+      }
+    });
+    const url = await proxy([
+      model(upstream, {
+        provider: 'google-cloudcode',
+        maxRetries: 1,
+        googlePool: { cooldownMs: 10 },
+        googleAccounts: [
+          { id: 'acc-1', accessToken: 't1' },
+          { id: 'acc-2', accessToken: 't2' },
+        ],
+      }),
+    ]);
+    const response = await fetch(url);
+    expect(response.status).toBe(200);
+    expect(await response.text()).toContain('retried-pool-ok');
+    expect(calls).toBe(3);
+  });
+});

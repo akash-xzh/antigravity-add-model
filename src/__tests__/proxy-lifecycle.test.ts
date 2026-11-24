@@ -3,9 +3,12 @@ import * as loopbackSecurity from '../proxy/loopbackSecurity';
 import * as subagentRoutingModule from '../proxy/subagentRouting';
 import * as subagentModels from '../proxy/subagentModels';
 import * as nativeSubagentResponse from '../proxy/nativeSubagentResponse';
+import * as nativeLimits from '../proxy/nativeLimits';
+import * as conversationUsage from '../proxy/conversationUsage';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import * as url from 'node:url';
 import { tmpdir } from 'node:os';
 import { EventEmitter } from 'node:events';
 import * as http from 'node:http';
@@ -75,6 +78,7 @@ function fixture(fixed = true) {
     https: {},
     fs: {},
     path,
+    url,
     electron: { app: { getAppPath: () => directory } },
     'electron-log': { info: vi.fn(), error: vi.fn() },
     './proxy/shared': {
@@ -91,6 +95,10 @@ function fixture(fixed = true) {
     './proxy/subagentModels': subagentModels,
     './proxy/googlePoolFailover': googlePoolFailover,
     './proxy/nativeSubagentResponse': nativeSubagentResponse,
+
+    './proxy/nativeLimits': nativeLimits,
+
+    './proxy/conversationUsage': conversationUsage,
     './proxy/cloudCodeRouting': {},
     './modelIdentity': {},
     './proxy/customRequest': { stopCustomRequests: vi.fn(), getProxyMetrics: () => ({ requests: 0 }) },

@@ -195,6 +195,9 @@ checks the application, setup and update-readiness mutexes in the current
 Windows session. This also detects a setup process running from a temporary
 directory that would not appear in the application process list. The probe only
 opens existing handles for inspection; it never creates or releases a mutex.
+Standalone update-preflight also reports running processes with recognized
+desktop installer filenames separately from app processes, and refuses to
+prepare while they run. This is not evidence that the installer holds a lock.
 It does not inspect every Windows file lock or guarantee that an installer will
 succeed. Close the application and its language server normally, and finish or
 cancel any existing installer before preparing the same installation:

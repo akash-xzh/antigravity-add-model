@@ -81,4 +81,38 @@ describe('image context budgeting', () => {
   ])('does not exempt text, system instructions, non-image data or tool arguments from the budget', (body) => {
     expect(() => trimContext(body, 6000)).toThrow(/latest turn/);
   });
+
+  it.each(['application/pdf', 'audio/mpeg', 'video/mp4'])(
+    'budgets binary %s inlineData with a fixed token estimate instead of base64 byte count',
+    (mimeType) => {
+      const part = { inlineData: { mimeType, data: 'a'.repeat(1024 * 1024) } };
+      const body: GeminiBody = { contents: [{ role: 'user', parts: [{ text: 'Inspect attachment.' }, part] }] };
+      const result = trimContext(body, 4096, 1024);
+      expect(result.contents).toEqual(body.contents);
+      expect(result.contents?.[0].parts?.[1]).toEqual(part);
+    },
+  );
+
+  it('rejects cleanly when maxOutputTokens meets or exceeds contextWindow', () => {
+    const body: GeminiBody = { contents: [{ role: 'user', parts: [{ text: 'hi' }] }] };
+    expect(() => trimContext(body, 4096, 4096)).toThrow(/latest turn/);
+    expect(() => trimContext(body, 4096, 8192)).toThrow(/latest turn/);
+  });
+
+  it('progressively drops oldest complete tool exchanges inside a single oversized agentic turn', () => {
+    const body: GeminiBody = {
+      contents: [
+        { role: 'user', parts: [{ text: 'Initial user goal' }] },
+        { role: 'model', parts: [{ functionCall: { name: 'read', args: { p: '1' } } }] },
+        { role: 'user', parts: [{ functionResponse: { name: 'read', response: { text: 'A'.repeat(9000) } } }] },
+        { role: 'model', parts: [{ functionCall: { name: 'read', args: { p: '2' } } }] },
+        { role: 'user', parts: [{ functionResponse: { name: 'read', response: { text: 'B'.repeat(9000) } } }] },
+        { role: 'model', parts: [{ functionCall: { name: 'read', args: { p: '3' } } }] },
+        { role: 'user', parts: [{ functionResponse: { name: 'read', response: { text: 'latest-tool-result' } } }] },
+      ],
+    };
+    const result = trimContext(body, 1500, 100);
+    // Initial user prompt and latest complete tool exchange must be preserved; oldest pairs dropped.
+    expect(result.contents).toEqual([body.contents![0], body.contents![5], body.contents![6]]);
+  });
 });

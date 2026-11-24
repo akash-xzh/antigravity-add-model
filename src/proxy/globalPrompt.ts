@@ -77,17 +77,21 @@ export function withGlobalSystemPrompt<T extends GeminiBody>(body: T): T {
   let workingBody: T = body;
   const rawInstruction = (body.systemInstruction ?? {}) as { parts?: unknown[]; [key: string]: unknown };
   if (Array.isArray(rawInstruction.parts) && rawInstruction.parts.length > 0) {
+    let sectionsChanged = false;
     const updatedParts = rawInstruction.parts.map((p) => {
       const partObj = p as { text?: unknown; [key: string]: unknown };
       if (typeof partObj?.text === 'string') {
         const rewritten = rewritePromptSections(partObj.text);
         if (rewritten !== partObj.text) {
+          sectionsChanged = true;
           return { ...partObj, text: rewritten };
         }
       }
       return p;
     });
-    workingBody = { ...body, systemInstruction: { ...rawInstruction, parts: updatedParts } };
+    if (sectionsChanged) {
+      workingBody = { ...body, systemInstruction: { ...rawInstruction, parts: updatedParts } };
+    }
   }
 
   const text = globalSystemPrompt();
@@ -137,8 +141,8 @@ export function injectGlobalSystemPrompt(raw: Buffer): Buffer {
   const isEnvelope = !!envelope && typeof envelope === 'object' && !Array.isArray(envelope);
   const target = (isEnvelope ? envelope : parsed) as GeminiBody;
   captureSystemPrompt(target);
-  if (!globalSystemPrompt()) return raw;
-  // In replace mode the captured body is left alone only if it already matches.
+  // Always run withGlobalSystemPrompt so prompt-section rewrites apply even when
+  // global-system-prompt.txt is empty or absent; returns `target` unchanged if nothing modified it.
   const updated = withGlobalSystemPrompt(target);
   if (updated === target) return raw;
   return Buffer.from(JSON.stringify(isEnvelope ? { ...parsed, request: updated } : updated));

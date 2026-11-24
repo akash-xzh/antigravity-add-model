@@ -4,6 +4,11 @@ export interface ContextModel {
     externalModelName?: string;
     provider?: string;
     contextWindow?: number;
+    maxOutputTokens?: number;
+    supportsVision?: boolean;
+    supportsThinking?: boolean;
+    compactionReasoningEffort?: string;
+    compactionThresholdPercent?: number;
 }
 export interface ChatContextRequest {
     conversationId?: string;
@@ -13,11 +18,40 @@ export interface ChatContextRequest {
 }
 export interface ChatContextUsage {
     conversationId: string;
-    source: 'estimated' | 'unavailable';
+    source: 'actual' | 'estimated' | 'unavailable';
+    /** Real provider prompt tokens (uncached input + cache read) when Antigravity recorded them. */
+    actualTokens?: number;
+    /** Real tokens spent on what the transcript cannot show: system prompt, tool definitions, images. */
+    overheadTokens?: number;
     /** Visible transcript only: excludes hidden prompts, tool definitions and images. */
     currentTokens?: number;
+    visibleInputTokens?: number;
+    visibleOutputTokens?: number;
+    actualInputTokens?: number;
+    actualCachedTokens?: number;
+    actualOutputTokens?: number;
+    sessionInputTokens?: number;
+    sessionCachedTokens?: number;
+    sessionOutputTokens?: number;
+    turns?: number;
+    compactions?: number;
+    tokensPerTurn?: number;
+    turnsUntilCompaction?: number;
     maxTokens?: number;
-    limitSource?: 'configured' | 'public-catalog';
+    limitSource?: 'configured' | 'native-catalog' | 'public-catalog';
+    /** Measured provider generation speed of the last turn. */
+    tokensPerSecond?: number;
+    /** Measured time to first token of the last turn. */
+    ttftMs?: number;
+    compactionThresholdPercent?: number;
+    compactionAtTokens?: number;
+    tokensUntilCompaction?: number;
+    /**
+     * Which policy the IDE checkpoints with: `custom` and `default` are the proxy's per-model
+     * override (the default is 80% of a declared context window), `ide` is the IDE's own new-token
+     * default that a window percentage cannot describe.
+     */
+    compactionSource?: 'custom' | 'default' | 'ide';
 }
 /** Never let an earlier prefix match shadow an exact model or effort variant. */
 export declare function findContextModel(name: string | undefined, models: ContextModel[]): ContextModel | undefined;

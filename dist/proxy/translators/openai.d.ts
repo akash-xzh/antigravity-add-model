@@ -93,6 +93,7 @@ interface OpenAIRequestBody {
     max_completion_tokens?: number;
     tools?: OpenAITool[];
     stream?: boolean;
+    reasoning_effort?: string;
 }
 interface OpenAIResponse {
     choices?: OpenAIChoice[];

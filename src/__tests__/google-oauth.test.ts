@@ -367,4 +367,25 @@ describe('explicit Google desktop OAuth', () => {
       name: 'Hello World',
     });
   });
+
+  it('does not throw ERR_HTTP_HEADERS_SENT if the callback socket closes before token exchange finishes', async () => {
+    let finishExchange!: (value: typeof tokenResponse) => void;
+    const exchange = vi.fn(
+      () =>
+        new Promise<typeof tokenResponse>((resolve) => {
+          finishExchange = resolve;
+        }),
+    );
+    const attempt = makeAttempt({ clientId }, exchange);
+    const auth = await attempt.authorization;
+    const req = http.request(callback(auth), { method: 'GET', agent: false });
+    req.on('error', () => {});
+    req.end();
+    await vi.waitFor(() => expect(exchange).toHaveBeenCalledOnce());
+    // Destroy the browser callback socket before token exchange completes.
+    req.destroy();
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    finishExchange(tokenResponse);
+    await expect(attempt.result).resolves.toMatchObject({ accessToken: 'test-access' });
+  });
 });

@@ -6,6 +6,7 @@ interface CustomModelEntry {
   displayName?: string;
   description?: string;
   provider: string;
+  providerName?: string;
   apiKey: string;
   apiUrl: string;
   externalModelName: string;
@@ -83,10 +84,13 @@ interface QuotaBucket {
   groupName?: string;
   remainingFraction?: number;
   resetTime?: string;
+  window?: string;
+  description?: string;
+  disabled?: boolean;
 }
 interface AccountQuota {
   buckets: QuotaBucket[];
-  groups?: { name?: string; displayName?: string; buckets?: QuotaBucket[] }[];
+  groups?: { name?: string; displayName?: string; description?: string; buckets?: QuotaBucket[] }[];
   planTier?: string;
   email?: string;
 }
@@ -126,12 +130,21 @@ const storageAPI = {
       }
     >
   > => ipcRenderer.invoke('storage:check-model-health', name),
+  getDisplaySettings: (): Promise<{ showStatusEmoji: boolean }> =>
+    ipcRenderer.invoke('storage:get-display-settings'),
+  saveDisplaySettings: (settings: { showStatusEmoji: boolean }): Promise<ActionResult> =>
+    ipcRenderer.invoke('storage:save-display-settings', settings),
 };
 
 window.addEventListener('DOMContentLoaded', () => {
   let modelList: CustomModelEntry[] = [];
   let renderVersion = 0;
+  let lastRenderedSnapshot = '';
+  let listPollTimer: ReturnType<typeof setInterval> | undefined;
   let searchTerm = '';
+  type ModelFilter = 'all' | 'enabled' | 'disabled' | 'unhealthy';
+  let filterMode: ModelFilter = 'all';
+  const collapsedGroups = new Set<string>();
   let cancelModalOperation: (() => void) | undefined;
   const requireSuccess = (result: ActionResult): ActionResult => {
     if (!result?.success) throw new Error(result?.error || 'The operation could not be completed.');
@@ -286,9 +299,39 @@ window.addEventListener('DOMContentLoaded', () => {
       #agy-custom-models-section h3{font-size:13px;margin:0;color:#f4f4f5}
       .agy-toolbar,.agy-actions,.agy-group-heading,.agy-row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
       .agy-toolbar{justify-content:space-between;margin-bottom:12px}.agy-actions{margin:10px 0}
+      .agy-toolbar .agy-btn{padding:4px 9px;font-size:11px;border-radius:6px}
       .agy-muted{color:#a1a1aa;font-size:12px;overflow-wrap:anywhere}.agy-group{margin-top:16px;border-top:1px solid #303036;padding-top:14px}
-      .agy-group-heading{justify-content:space-between}.agy-row{justify-content:space-between;border:1px solid #303036;border-radius:8px;padding:12px;margin-top:8px;background:#202024}
-      .agy-row-info{flex:1;min-width:150px;overflow-wrap:anywhere}.agy-row[data-enabled="false"] .agy-row-info{opacity:.55}
+      .agy-group-heading{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:8px;padding:2px 0;flex-wrap:nowrap}
+      .agy-group-heading .agy-actions{margin:0;justify-content:flex-end}
+      #agy-custom-models-section .agy-group-heading .agy-disclosure{padding:0;width:23px;height:23px;justify-content:center;background:transparent;border-color:#3f3f46}
+      .agy-models{display:flex;flex-direction:column;gap:4px;margin-top:8px}
+      .agy-row{display:flex;flex-wrap:wrap;align-items:center;gap:5px 10px;border:1px solid #2b2b31;border-radius:8px;padding:6px 9px 6px 11px;margin-top:0;background:#202024;min-width:0;font-size:12px}
+      .agy-row:hover{background:#242429;border-color:#3f3f46}
+      .agy-row .agy-btn{padding:3px 8px;font-size:11px;border-radius:6px}
+      .agy-row .agy-muted{font-size:11px}
+      .agy-row .agy-status{margin-top:2px;font-size:11px}
+      .agy-row-info{display:flex;flex-direction:column;gap:3px;min-width:0;overflow:hidden;flex:1 1 240px}
+      .agy-row-title{display:flex;align-items:center;gap:6px;min-width:0}
+      .agy-row-title strong{flex:1 1 auto;font-size:12px;font-weight:600;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+      .agy-row-meta{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+      .agy-row-actions{display:flex;align-items:center;gap:6px;margin-left:auto;flex:0 0 auto}
+      .agy-menu{position:relative}
+      .agy-menu-btn{list-style:none;cursor:pointer;display:inline-flex;align-items:center;justify-content:center;width:23px;height:23px;border-radius:6px;border:1px solid #414149;background:#27272c;color:#d4d4d8;font-size:13px;line-height:1;user-select:none}
+      .agy-menu-btn::-webkit-details-marker{display:none}
+      .agy-menu-btn:hover,.agy-menu[open] .agy-menu-btn{background:#33333a;color:#fafafa}
+      .agy-menu-list{position:absolute;right:0;top:calc(100% + 4px);z-index:30;display:flex;flex-direction:column;min-width:170px;padding:4px;border:1px solid #414149;border-radius:8px;background:#1c1c20;box-shadow:0 12px 32px #0009}
+      #agy-custom-models-section .agy-menu-list .agy-btn{width:100%;text-align:left;border:0;background:transparent;border-radius:6px;padding:6px 9px;font-size:12px}
+      #agy-custom-models-section .agy-menu-list .agy-btn:hover{background:#2b2b31}
+      #agy-custom-models-section .agy-menu-list .agy-danger{color:#fca5a5}
+      .agy-row[data-enabled="false"] .agy-row-info,.agy-row[data-enabled="false"] .agy-row-actions>.agy-btn{opacity:.6}
+      .agy-effort-chip{display:inline-block;padding:0 5px;border-radius:4px;background:#27272c;color:#a1a1aa;font-size:10px;line-height:15px;white-space:nowrap}
+      .agy-sticky-bar{position:sticky;top:0;z-index:6;display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:0 0 8px;padding:8px 0;background:#18181b;border-bottom:1px solid #303036}
+      .agy-sticky-bar .agy-field{margin:0;flex:1 1 220px}
+      .agy-chip{appearance:none;font:inherit;font-size:11px;color:#a1a1aa;background:#202024;border:1px solid #303036;border-radius:9999px;padding:3px 9px;cursor:pointer;white-space:nowrap}
+      .agy-chip:hover{color:#fafafa;border-color:#414149}
+      .agy-chip[aria-pressed="true"]{color:#18181b;background:#e4e4e7;border-color:#e4e4e7;font-weight:600}
+      .agy-group-heading .agy-btn{padding:3px 8px;font-size:11px;border-radius:5px}
+      .agy-group-heading h3{font-size:12px}
       #agy-custom-models-section .agy-btn,#agy-modal-overlay .agy-btn{appearance:none;font:inherit;color:#e4e4e7;background:#27272c;border:1px solid #414149;border-radius:6px;padding:6px 10px;cursor:pointer;white-space:nowrap}
       #agy-custom-models-section .agy-primary,#agy-modal-overlay .agy-primary{background:#e4e4e7;color:#18181b;border-color:#e4e4e7;font-weight:600}
       #agy-custom-models-section .agy-btn:hover,#agy-modal-overlay .agy-btn:hover{filter:brightness(1.12)}
@@ -297,16 +340,21 @@ window.addEventListener('DOMContentLoaded', () => {
       .agy-status{color:#86efac;font-size:12px;margin-top:8px;white-space:pre-wrap;overflow-wrap:anywhere}.agy-status:empty{display:none}.agy-error{color:#fca5a5}
       .agy-field{display:flex;flex-direction:column;gap:5px;margin-bottom:12px;min-width:0;color:#a1a1aa}
       #agy-custom-models-section input,#agy-modal-overlay input,#agy-modal-overlay select,#agy-modal-overlay textarea{font:inherit;width:100%;background:#25252a;border:1px solid #414149;border-radius:6px;color:#fafafa;padding:8px 10px;min-width:0}
-      #agy-modal-overlay textarea{font-family:ui-monospace,monospace;resize:vertical}#agy-modal-overlay input[type=checkbox]{width:auto;accent-color:#a78bfa}
+      #agy-modal-overlay textarea{font-family:ui-monospace,monospace;resize:vertical}#agy-modal-overlay input[type=checkbox],#agy-custom-models-section input[type=checkbox]{width:auto!important;accent-color:#a78bfa;cursor:pointer;margin:0 6px 0 0}
+      .agy-options-row{display:flex;align-items:center;gap:16px;margin:8px 0 12px;font-size:12px;color:#d4d4d8}
+      .agy-toggle-label{display:inline-flex;align-items:center;gap:6px;cursor:pointer;user-select:none}
       #agy-modal-overlay{position:fixed;inset:0;z-index:999999;background:#000a;display:flex;align-items:center;justify-content:center;padding:20px}
       #agy-modal-card{width:680px;max-width:100%;max-height:90vh;overflow:auto;background:#18181b;border:1px solid #414149;border-radius:12px;padding:24px;box-shadow:0 24px 80px #0008}
       .agy-grid{display:grid;grid-template-columns:1fr 1fr;gap:0 14px}.agy-discovery{max-height:240px;overflow:auto;margin:12px 0}
       .agy-choice{display:flex;gap:10px;align-items:center;padding:7px 0;overflow-wrap:anywhere}.agy-choice span{min-width:0}
       #agy-modal-overlay details{border:1px solid #303036;border-radius:8px;margin:12px 0;padding:12px}#agy-modal-overlay summary{cursor:pointer;margin-bottom:10px;font-weight:500}
-      .agy-fleet{margin:18px 0;border:1px solid #303036;border-radius:10px;padding:14px;min-width:0}.agy-fleet-table{width:100%;border-collapse:separate;border-spacing:0 12px;text-align:left;table-layout:fixed}.agy-fleet-table td{padding:0}.agy-fleet-card{background:#202024;border:1px solid #3f3f46;border-radius:10px;padding:16px;min-width:0}.agy-fleet-card-header{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap}.agy-fleet-card-header .agy-actions{margin:0}.agy-fleet-label{font-size:14px;font-weight:600;overflow-wrap:anywhere}.agy-fleet-pools{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,300px),1fr));gap:12px;margin-top:14px}.agy-fleet-pool{border:1px solid #303036;border-radius:8px;padding:12px;background:#18181b;min-width:0}.agy-fleet-pool .agy-actions{margin-bottom:0}.agy-fleet-account-state{margin-top:5px}.agy-pool-badge{display:inline-block;padding:2px 6px;border-radius:5px;background:#27272c;color:#a1a1aa;font-size:11px}.agy-pool-preferred,.agy-plan-pro{color:#86efac}.agy-pool-disabled{color:#fca5a5}.agy-fleet-quotas{display:grid;gap:10px;margin:12px 0}.agy-quota-group{display:grid;gap:8px}.agy-quota-group-title{font-size:11px;font-weight:600;color:#d4d4d8}.agy-quota-bucket{min-width:0}.agy-quota-heading{display:flex;justify-content:space-between;gap:8px;font-size:12px;flex-wrap:wrap}.agy-quota-bucket progress{display:block;width:100%;height:7px;margin:5px 0;accent-color:#86efac}.agy-quota-bucket[data-exhausted="true"] progress{accent-color:#f87171}.agy-quota-bucket[data-exhausted="true"] .agy-quota-value{color:#fca5a5}.agy-quota-reset{font-size:11px;color:#a1a1aa}.agy-fleet-fallback{display:flex;align-items:center;gap:8px;font-size:12px}.agy-fleet-fallback input{width:auto!important;accent-color:#86efac}.agy-fleet-details[hidden]{display:none}
+      .agy-fleet{margin:18px 0;border:1px solid #303036;border-radius:10px;padding:14px;min-width:0}.agy-fleet-table{width:100%;border-collapse:separate;border-spacing:0 12px;text-align:left;table-layout:fixed}.agy-fleet-table td{padding:0}.agy-fleet-card{background:#202024;border:1px solid #3f3f46;border-radius:10px;padding:16px;min-width:0}.agy-fleet-card-header{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap}.agy-fleet-card-header .agy-actions{margin:0}.agy-fleet-label{font-size:14px;font-weight:600;overflow-wrap:anywhere}.agy-fleet-pools{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,300px),1fr));gap:12px;margin-top:14px}.agy-fleet-pool{border:1px solid #303036;border-radius:8px;padding:12px;background:#18181b;min-width:0}.agy-fleet-pool .agy-actions{margin-bottom:0}.agy-fleet-account-state{margin-top:5px}.agy-pool-badge{display:inline-block;padding:2px 6px;border-radius:5px;background:#27272c;color:#a1a1aa;font-size:11px}.agy-pool-preferred,.agy-plan-pro{color:#86efac}.agy-plan-pro{background:rgba(34,197,94,.12);border:1px solid rgba(134,239,172,.3)}.agy-plan-ultra{color:#c4b5fd;background:rgba(139,92,246,.16);border:1px solid rgba(167,139,250,.35)}.agy-pool-disabled{color:#fca5a5}.agy-fleet-quotas{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,220px),1fr));gap:10px;margin:12px 0}.agy-quota-group{display:grid;gap:8px;align-content:start;background:#202024;border:1px solid #2b2b31;border-radius:8px;padding:10px}.agy-quota-group-title{font-size:11px;font-weight:600;color:#d4d4d8}.agy-quota-note{font-size:10px;color:#71717a;line-height:1.35;overflow:hidden;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical}.agy-quota-bucket[data-disabled="true"]{opacity:.55}.agy-quota-bucket{min-width:0}.agy-quota-heading{display:flex;justify-content:space-between;gap:8px;font-size:12px;flex-wrap:wrap}.agy-quota-bucket progress{display:block;width:100%;height:7px;margin:5px 0;accent-color:#86efac}.agy-quota-bucket[data-quota-level="high"] progress{accent-color:#86efac}.agy-quota-bucket[data-quota-level="high"] .agy-quota-value{color:#86efac}.agy-quota-bucket[data-quota-level="mid"] progress{accent-color:#fbbf24}.agy-quota-bucket[data-quota-level="mid"] .agy-quota-value{color:#fcd34d}.agy-quota-bucket[data-quota-level="low"] progress{accent-color:#f87171}.agy-quota-bucket[data-quota-level="low"] .agy-quota-value{color:#fca5a5}.agy-quota-bucket[data-exhausted="true"] progress{accent-color:#ef4444}.agy-quota-bucket[data-exhausted="true"] .agy-quota-value{color:#fca5a5}.agy-quota-reset{font-size:11px;color:#a1a1aa}.agy-fleet-fallback{display:flex;align-items:center;gap:8px;font-size:12px}.agy-fleet-fallback input{width:auto!important;accent-color:#86efac}.agy-fleet-details[hidden]{display:none}
       #agy-fleet-target-pool{font:inherit;color:#fafafa;background:#25252a;border:1px solid #414149;border-radius:6px;padding:6px;max-width:240px}#agy-fleet-target-pool option{background:#25252a;color:#fafafa}
-      .agy-model-search-box{padding:6px 8px}.agy-model-search-input{box-sizing:border-box;width:100%;font:inherit;color:inherit;background:transparent;border:1px solid #52525b;border-radius:5px;padding:6px}.agy-model-no-results{padding:8px;color:#a1a1aa;font-size:12px}
-      @media(max-width:600px){.agy-grid{grid-template-columns:1fr}#agy-modal-card{padding:16px}.agy-row .agy-actions{width:100%}}
+      .agy-model-search-box{padding:4px 6px 6px}.agy-model-search-wrap{position:relative;display:flex;align-items:center}.agy-model-search-icon{position:absolute;left:8px;width:13px;height:13px;color:#a1a1aa;pointer-events:none;flex-shrink:0}.agy-model-search-input{box-sizing:border-box;width:100%;font:inherit;font-size:12px;color:inherit;background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.14);border-radius:6px;padding:5px 26px 5px 27px;outline:none;transition:border-color .12s,background .12s}.agy-model-search-input:focus{border-color:rgba(255,255,255,.32);background:rgba(255,255,255,.07)}.agy-model-search-clear{position:absolute;right:5px;border:0;background:transparent;color:#a1a1aa;cursor:pointer;font-size:12px;line-height:1;padding:2px 4px;border-radius:4px}.agy-model-search-clear:hover{color:#fafafa;background:rgba(255,255,255,.1)}.agy-model-no-results{padding:8px;color:#a1a1aa;font-size:12px}
+      .agy-provider-divider{height:1px;background:rgba(255,255,255,.08);margin:4px 0}
+      .agy-provider-row{display:flex;align-items:center;justify-content:space-between;gap:8px;cursor:pointer;user-select:none;outline:none}.agy-provider-row:not([class*=" "]){padding:6px 8px;border-radius:6px;font-size:12px;color:inherit}.agy-provider-row[data-open="true"],.agy-provider-row:hover,.agy-provider-row:focus{background:rgba(255,255,255,.08)}.agy-provider-row-left{display:flex;align-items:center;gap:6px;min-width:0;overflow:hidden}.agy-provider-row-name{font-weight:inherit;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.agy-provider-row-active{font-size:inherit;opacity:.6;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:120px}.agy-provider-row-right{display:flex;align-items:center;gap:6px;flex-shrink:0;opacity:.65}
+      .agy-provider-sidepanel{position:fixed;z-index:9999999;min-width:240px;max-width:340px;max-height:70vh;overflow-y:auto;padding:4px;box-shadow:0 12px 36px rgba(0,0,0,.55)}.agy-sidepanel-item{display:flex;align-items:center;justify-content:space-between;gap:8px;cursor:pointer;user-select:none;outline:none}.agy-sidepanel-item:not([class*=" "]){padding:6px 8px;border-radius:6px;font-size:12px;color:inherit}.agy-sidepanel-item:hover,.agy-sidepanel-item:focus{background:rgba(255,255,255,.08)}.agy-sidepanel-item[data-disabled="true"]{opacity:.45;cursor:not-allowed}.agy-sidepanel-item-left{display:flex;align-items:center;gap:6px;min-width:0;overflow:hidden}.agy-sidepanel-item-label{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.agy-sidepanel-item-right{display:flex;align-items:center;gap:6px;flex-shrink:0;opacity:.75}
+      @media(max-width:600px){.agy-grid{grid-template-columns:1fr}.agy-row-actions{margin-left:0;width:100%;justify-content:flex-end}#agy-modal-card{padding:16px}}
     `;
     document.head.append(style);
   }
@@ -782,7 +830,6 @@ window.addEventListener('DOMContentLoaded', () => {
     const restore = captureScrollPosition(document.getElementById('agy-custom-models-section') || document.body);
     fleetEpoch++;
     quotaCache.clear();
-    customModelsCache.ts = 0;
     await renderCustomModelsList();
     const mount = findSettingsMount();
     if (mount) findRefreshButton(mount)?.click();
@@ -836,8 +883,10 @@ window.addEventListener('DOMContentLoaded', () => {
             (document.activeElement === document.body || document.activeElement === focusAfterClose)) {
             const remainingRows = Array.from(document.querySelectorAll<HTMLElement>('#agy-custom-models-content [data-model-name]'));
             const adjacentRow = adjacentNames.map((name) => remainingRows.find((row) => row.dataset.modelName === name)).find(Boolean);
-            const nextFocus = Array.from(adjacentRow?.querySelectorAll<HTMLButtonElement>('button') || [])
-              .find((button) => button.textContent === 'Delete') || document.getElementById('agy-add-model');
+            // The overflow menu is closed after a delete, so focus the next row's visible toggle:
+            // a button inside a closed <details> is not rendered and cannot take focus.
+            const nextFocus = adjacentRow?.querySelector<HTMLButtonElement>('.agy-row-actions > .agy-btn')
+              || document.getElementById('agy-add-model');
             nextFocus?.focus({ preventScroll: true });
           }
         },
@@ -1002,7 +1051,8 @@ window.addEventListener('DOMContentLoaded', () => {
   function renderPoolQuota(quota: HTMLElement, cached: ReturnType<typeof quotaCache.get>): void {
     if (cached?.quota?.planTier) {
       const tier = cached.quota.planTier;
-      quota.append(element('span', `agy-pool-badge${/\bpro\b/i.test(tier) ? ' agy-plan-pro' : ''}`, tier));
+      const tierClass = /\bpro\b/i.test(tier) ? ' agy-plan-pro' : /\bultra\b/i.test(tier) ? ' agy-plan-ultra' : '';
+      quota.append(element('span', `agy-pool-badge${tierClass}`, tier));
     }
     if (cached?.error) {
       quota.append(element('div', 'agy-status agy-error', cached.error));
@@ -1015,33 +1065,111 @@ window.addEventListener('DOMContentLoaded', () => {
     // The flat snapshot contains every parsed bucket, including groups. Never
     // deduplicate across projects, model pools, or distinct model buckets.
     const buckets = cached.quota?.buckets || [];
-    if (!buckets.length) {
+    if (!buckets.length && !(cached.quota?.groups || []).some((group) => (group.buckets || []).length)) {
       quota.append(element('span', 'agy-muted', 'Quota unavailable — Google returned no buckets.'));
       return;
     }
-    const groups = new Map<string, QuotaBucket[]>();
-    for (const bucket of buckets) {
-      const title = bucket.groupName || 'Reported quota';
-      groups.set(title, [...(groups.get(title) || []), bucket]);
+    // Native groups decide the order and wording: Gemini and Claude/GPT pools share a weekly
+    // and a 5-hour limit, and some plans expose extra per-model groups. Free tiers simply
+    // report fewer groups. Quota that is spent early on expensive models lasts less time.
+    const prettyBucket = (bucket: QuotaBucket): string => {
+      const source = bucket.window || bucket.id;
+      if (/weekly/i.test(source)) return 'Weekly limit';
+      if (/5h|five.?hour/i.test(source)) return '5-hour limit';
+      if (/daily/i.test(source)) return 'Daily limit';
+      return (bucket.displayName || bucket.id)
+        .replace(/\s*limit remaining$/i, ' limit')
+        .replace(/\s*remaining$/i, '')
+        .trim();
+    };
+    const ordered: { title: string; description?: string; buckets: QuotaBucket[] }[] = [];
+    // Free plans only meter a weekly limit per group; a 5-hour pool there is not part of the plan.
+    const freePlan = /^free\b/i.test((cached.quota?.planTier || '').trim());
+    const planned = (items: QuotaBucket[]) =>
+      freePlan ? items.filter((bucket) => !/5h|five.?hour/i.test(bucket.window || bucket.id)) : items;
+    for (const source of cached.quota?.groups || []) {
+      const items = planned((source.buckets || []).filter((bucket) => bucket && typeof bucket === 'object'));
+      if (items.length)
+        ordered.push({
+          title: source.displayName || source.name || 'Reported quota',
+          description: source.description,
+          buckets: items,
+        });
     }
-    for (const [title, buckets] of groups) {
+    if (!ordered.length) {
+      const flat = new Map<string, QuotaBucket[]>();
+      for (const bucket of planned(buckets)) {
+        const title = bucket.groupName ||
+          (/claude|gpt|anthropic|openai|third[- ]?party/i.test(`${bucket.displayName || ''} ${bucket.id}`)
+            ? 'Claude and GPT models'
+            : 'Gemini Models');
+        flat.set(title, [...(flat.get(title) || []), bucket]);
+      }
+      for (const [title, items] of flat) ordered.push({ title, buckets: items });
+    }
+    // Native order: Gemini pools, then Claude/GPT pools, then any extra per-model groups.
+    const canonical = ['gemini models', 'claude and gpt models'];
+    const rank = (title: string) => {
+      const index = canonical.indexOf(title.toLowerCase().trim());
+      return index === -1 ? canonical.length : index;
+    };
+    ordered.sort((left, right) => rank(left.title) - rank(right.title) ||
+      (rank(left.title) < canonical.length ? 0 : left.title.localeCompare(right.title)));
+    const windowRank = (bucket: QuotaBucket) => {
+      const source = `${bucket.window || ''} ${bucket.id}`.toLowerCase();
+      if (/weekly/.test(source)) return 1;
+      if (/5h|five|hour/.test(source)) return 2;
+      if (/daily|day/.test(source)) return 3;
+      return 4;
+    };
+    for (const groupInfo of ordered) groupInfo.buckets.sort((left, right) => windowRank(left) - windowRank(right));
+    for (const groupInfo of ordered) {
       const group = element('div', 'agy-quota-group');
-      group.append(element('div', 'agy-quota-group-title', title));
-      for (const bucket of buckets) {
+      group.append(element('div', 'agy-quota-group-title', groupInfo.title));
+      if (groupInfo.description) {
+        const note = element('div', 'agy-quota-note', groupInfo.description);
+        note.title = groupInfo.description;
+        group.append(note);
+      }
+      for (const bucket of groupInfo.buckets) {
         const block = element('div', 'agy-quota-bucket');
         const fraction = bucket.remainingFraction;
         const known = typeof fraction === 'number' && Number.isFinite(fraction);
+        const disabled = bucket.disabled === true;
+        block.dataset.disabled = String(disabled);
         block.dataset.exhausted = String(known && fraction <= 0);
-        const title = bucket.displayName || ({ weekly: 'Weekly limit', five_hour: 'Five-hour limit', daily: 'Daily limit' } as Record<string, string>)[bucket.id] || bucket.id;
+        block.dataset.quotaLevel = !known
+          ? 'unknown'
+          : fraction <= 0
+            ? 'exhausted'
+            : fraction < 0.2
+              ? 'low'
+              : fraction <= 0.5
+                ? 'mid'
+                : 'high';
+        const label = prettyBucket(bucket);
         const heading = element('div', 'agy-quota-heading');
-        heading.append(element('span', 'agy-muted', title),
-          element('span', 'agy-quota-value', known ? `${Math.round(Math.max(0, Math.min(1, fraction)) * 100)}% remaining` : 'Remaining quota unknown'));
+        heading.append(
+          element('span', 'agy-muted', label),
+          element(
+            'span',
+            'agy-quota-value',
+            disabled
+              ? 'Not applicable'
+              : known
+                ? fraction <= 0
+                  ? 'Exhausted'
+                  : `${Math.round(Math.max(0, Math.min(1, fraction)) * 100)}% left`
+                : 'Unknown',
+          ),
+        );
         block.append(heading);
-        if (known) {
+        if (bucket.description) block.title = bucket.description;
+        if (known && !disabled) {
           const progress = element('progress');
           progress.max = 1;
           progress.value = Math.max(0, Math.min(1, fraction));
-          progress.setAttribute('aria-label', `${bucket.groupName || ''} ${title} remaining quota`.trim());
+          progress.setAttribute('aria-label', `${groupInfo.title} ${label} remaining quota`.trim());
           block.append(progress);
         }
         if (bucket.resetTime) {
@@ -1232,37 +1360,85 @@ window.addEventListener('DOMContentLoaded', () => {
     restoreScroll();
   }
 
-  async function renderCustomModelsList(): Promise<void> {
+  let rowMenuDismissInstalled = false;
+
+  function shouldSkipBackgroundRefresh(target: HTMLElement): boolean {
+    if (!target.isConnected) return true;
+    if (document.getElementById('agy-modal-overlay')) return true;
+    if (target.querySelector('details.agy-menu[open]')) return true;
+    const active = document.activeElement;
+    if (active && target.contains(active)) return true;
+    for (const statusEl of target.querySelectorAll('.agy-status')) {
+      if (statusEl.textContent?.trim()) return true;
+    }
+    return false;
+  }
+
+  async function renderCustomModelsList(options?: { background?: boolean }): Promise<void> {
+    const background = Boolean(options?.background);
     const target = document.getElementById('agy-custom-models-content');
     if (!target) return;
+    if (background && shouldSkipBackgroundRefresh(target)) return;
     const version = ++renderVersion;
     try {
-      const [models, healthMap] = await Promise.all([
+      const [models, healthMap, displaySettings] = await Promise.all([
         storageAPI.getCustomModels(),
         storageAPI.getModelHealth().catch(
           () =>
             ({} as Record<
               string,
-              { status: 'healthy' | 'unhealthy'; error?: string; latencyMs?: number; checkedAt: number }
+              { status: 'healthy' | 'slow' | 'unhealthy' | 'cooldown'; error?: string; latencyMs?: number; checkedAt: number }
             >),
         ),
+        storageAPI.getDisplaySettings().catch(() => ({ showStatusEmoji: true })),
       ]);
       if (version !== renderVersion || !target.isConnected) return;
+      if (background && shouldSkipBackgroundRefresh(target)) return;
+      const showStatusEmoji = displaySettings?.showStatusEmoji !== false;
+      const snapshot = JSON.stringify({
+        models,
+        healthMap,
+        showStatusEmoji,
+        searchTerm,
+        filterMode,
+        collapsed: Array.from(collapsedGroups).sort(),
+      });
+      if (background && snapshot === lastRenderedSnapshot) return;
+      const emojiToggle = document.getElementById('agy-toggle-status-emojis') as HTMLInputElement | null;
+      if (emojiToggle && typeof displaySettings?.showStatusEmoji === 'boolean') {
+        emojiToggle.checked = displaySettings.showStatusEmoji;
+      }
       const restoreScroll = captureScrollPosition(target);
       modelList = models;
       renderGoogleFleet();
       void refreshFleetQuotas();
       const content = document.createDocumentFragment();
+      const allModelsByGroupKey = new Map<string, CustomModelEntry[]>();
       const groups = new Map<string, CustomModelEntry[]>();
       for (const model of models) {
+        const groupLabel = (model.providerName || '').trim() || model.provider;
+        const key = `${groupLabel}\n${model.apiUrl}`;
+        allModelsByGroupKey.set(key, [...(allModelsByGroupKey.get(key) || []), model]);
         if (
           searchTerm &&
-          !`${model.displayName} ${model.name} ${model.externalModelName} ${model.provider}`
+          !`${model.displayName} ${model.name} ${model.externalModelName} ${model.provider} ${model.providerName || ''}`
             .toLowerCase()
             .includes(searchTerm)
         )
           continue;
-        const key = `${model.provider}\n${model.apiUrl}`;
+        if (filterMode === 'enabled' && model.enabled === false) continue;
+        if (filterMode === 'disabled' && model.enabled !== false) continue;
+        if (filterMode === 'unhealthy') {
+          const health = healthMap?.[model.name];
+          const isUnhealthy =
+            Boolean(health) &&
+            (health.status === 'unhealthy' ||
+              health.status === 'slow' ||
+              health.status === 'cooldown' ||
+              Boolean(health.error) ||
+              (typeof health.status === 'string' && health.status !== 'healthy'));
+          if (!isUnhealthy) continue;
+        }
         groups.set(key, [...(groups.get(key) || []), model]);
       }
       if (!groups.size)
@@ -1283,26 +1459,72 @@ window.addEventListener('DOMContentLoaded', () => {
       for (const groupModels of sortedGroups) {
         const modelsInGroup = [...groupModels].sort((a, b) => (b.isRecent ? 1 : 0) - (a.isRecent ? 1 : 0));
         const first = modelsInGroup[0];
+        const groupDisplayName = (first.providerName || '').trim() || first.provider;
         const group = element('section', 'agy-group');
+        const groupKey = `${groupDisplayName}\n${first.apiUrl}`;
+        const fullGroupModels = allModelsByGroupKey.get(groupKey) || modelsInGroup;
+        const collapsed = collapsedGroups.has(groupKey);
         const header = element('div', 'agy-group-heading');
         const heading = element('div');
-        heading.append(
+        heading.style.cssText = 'display:flex;align-items:center;gap:8px;min-width:0';
+        const titleBlock = element('div');
+        titleBlock.style.minWidth = '0';
+        const disclosure = element('button', 'agy-btn agy-disclosure', collapsed ? '▸' : '▾');
+        disclosure.type = 'button';
+        disclosure.title = collapsed ? 'Expand provider' : 'Collapse provider';
+        disclosure.setAttribute('aria-expanded', String(!collapsed));
+        disclosure.addEventListener('click', () => {
+          if (collapsed) collapsedGroups.delete(groupKey);
+          else collapsedGroups.add(groupKey);
+          void renderCustomModelsList();
+        });
+        titleBlock.append(
           element(
             'h3',
             '',
-            `${first.provider} · ${modelsInGroup.filter((model) => model.enabled !== false).length}/${modelsInGroup.length} enabled`,
+            `${groupDisplayName}${first.providerName && first.providerName !== first.provider ? ` (${first.provider})` : ''} · ${modelsInGroup.filter((model) => model.enabled !== false).length}/${modelsInGroup.length} enabled`,
           ),
           element('div', 'agy-muted', first.apiUrl),
         );
+        heading.append(disclosure, titleBlock);
         const groupStatus = statusNode();
         const actions = element('div', 'agy-actions');
-        actions.append(button('Discover models', () => openModelModal(first, 'discover'), groupStatus));
-        const allEnabled = modelsInGroup.every((model) => model.enabled !== false);
+        actions.append(
+          button('Discover models', () => openModelModal(first, 'discover'), groupStatus),
+          ...(first.provider === 'custom'
+            ? [
+                button('Rename provider', () => {
+                  const { body, status, close } = openModal('Rename provider group');
+                  const nameInput = field(body, 'Provider name', 'agy-rename-provider', first.providerName || '');
+                  nameInput.placeholder = `e.g. Agnes AI, Coarena (blank resets to ${first.provider})`;
+                  const modalActions = element('div', 'agy-actions');
+                  modalActions.append(
+                    button(
+                      'Save',
+                      async () => {
+                        const nextName = nameInput.value.trim() || undefined;
+                        for (const model of fullGroupModels) {
+                          requireSuccess(await storageAPI.saveCustomModel({ ...model, providerName: nextName }));
+                        }
+                        await modelsChanged();
+                        close();
+                      },
+                      status,
+                      true,
+                    ),
+                    button('Cancel', close),
+                  );
+                  body.append(modalActions);
+                }, groupStatus),
+              ]
+            : []),
+        );
+        const allEnabled = fullGroupModels.every((model) => model.enabled !== false);
         actions.append(
           button(
             allEnabled ? 'Disable group' : 'Enable group',
             async () => {
-              for (const model of modelsInGroup)
+              for (const model of fullGroupModels)
                 requireSuccess(await storageAPI.saveCustomModel({ ...model, enabled: !allEnabled }));
               await modelsChanged();
             },
@@ -1311,19 +1533,26 @@ window.addEventListener('DOMContentLoaded', () => {
         );
         header.append(heading, actions);
         group.append(header, groupStatus);
+        if (collapsed) {
+          content.append(group);
+          continue;
+        }
+        const modelsList = element('div', 'agy-models');
         for (const model of modelsInGroup) {
           const rawName = model.displayName || model.name;
           const cleanName = rawName.replace(/^⭐\s*/u, '').replace(/^[🟢🔴⚪🟡⭐\s•·|-]+(?:\[[^\]]+\]\s*)?[•·|-]?\s*/u, '').trim();
           const health = healthMap ? healthMap[model.name] : undefined;
           const isRecent = Boolean(model.isRecent);
-          const starPrefix = isRecent ? '⭐ ' : '';
-          const statusDot = health?.status === 'slow'
-            ? '🟡'
-            : health?.status === 'cooldown'
-              ? '🟡'
-              : !health || health.status === 'healthy'
-                ? '🟢'
-                : '🔴';
+          const starPrefix = isRecent && showStatusEmoji ? '⭐ ' : '';
+          const statusDot = !showStatusEmoji
+            ? ''
+            : health?.status === 'slow'
+              ? '🟡 '
+              : health?.status === 'cooldown'
+                ? '🟡 '
+                : !health || health.status === 'healthy'
+                  ? '🟢 '
+                  : '🔴 ';
           const latencyText = health?.latencyMs !== undefined ? ` · ${health.latencyMs}ms` : '';
           const statusNotice = health?.status === 'slow'
             ? ' · Slow'
@@ -1337,7 +1566,9 @@ window.addEventListener('DOMContentLoaded', () => {
           row.dataset.modelName = model.name;
           row.dataset.enabled = String(model.enabled !== false);
           const info = element('div', 'agy-row-info');
-          const titleEl = element('strong', '', `${starPrefix}${statusDot} ${cleanName}`);
+          const effort = /\((minimal|low|medium|high|xhigh|extra)\)\s*$/i.exec(cleanName)?.[1];
+          const shortName = effort ? cleanName.slice(0, cleanName.length - effort.length - 2).trim() : cleanName;
+          const titleEl = element('strong', '', `${starPrefix}${statusDot}${shortName}`);
           titleEl.title = health
             ? health.status === 'healthy'
               ? `Healthy${latencyText} · Checked ${new Date(health.checkedAt).toLocaleTimeString()}`
@@ -1347,25 +1578,23 @@ window.addEventListener('DOMContentLoaded', () => {
               ? `Cooldown / Rate Limit (429) · Checked ${new Date(health.checkedAt).toLocaleTimeString()}`
               : `Unhealthy: ${health.error || 'Failed'} · Checked ${new Date(health.checkedAt).toLocaleTimeString()}`
             : 'Status unknown';
-          info.append(
+          const title = element('div', 'agy-row-title');
+          title.append(
             titleEl,
-            element('div', 'agy-muted', `${model.externalModelName || ''}${latencyText}${statusNotice}${isRecent ? ' · Recent' : ''}`),
+            ...(effort ? [element('span', 'agy-effort-chip', effort.toUpperCase())] : []),
           );
-          if (model.nativePickerAvailable === false) info.append(element('div', 'agy-muted',
+          info.append(
+            title,
+            element('div', 'agy-muted agy-row-meta', `${model.externalModelName || ''}${latencyText}${statusNotice}${isRecent ? ' · Recent' : ''}`),
+          );
+          if (model.nativePickerAvailable === false) info.append(element('div', 'agy-muted agy-row-meta',
             typeof model.nativePickerError === 'string' ? model.nativePickerError :
               'Not currently available in the native model picker. Direct API access remains available.'));
           const rowStatus = statusNode();
           info.append(rowStatus);
-          const actions = element('div', 'agy-actions');
-          actions.append(
-            button(
-              model.enabled === false ? 'Enable' : 'Disable',
-              async () => {
-                requireSuccess(await storageAPI.saveCustomModel({ ...model, enabled: model.enabled === false }));
-                await modelsChanged();
-              },
-              rowStatus,
-            ),
+          const actions = element('div', 'agy-row-actions');
+          const menuList = element('div', 'agy-menu-list');
+          menuList.append(
             button(
               'Check',
               async () => {
@@ -1427,14 +1656,44 @@ window.addEventListener('DOMContentLoaded', () => {
                     rowStatus,
                   ),
                 ]),
-            button('Delete', () => openDeleteModelModal(model), rowStatus),
+          );
+          const menu = element('details', 'agy-menu');
+          const menuSummary = element('summary', 'agy-menu-btn', '⋯');
+          menuSummary.title = 'More actions';
+          menuSummary.setAttribute('aria-label', `More actions for ${shortName}`);
+          const deleteButton = button('Delete', () => openDeleteModelModal(model), rowStatus);
+          deleteButton.classList.add('agy-danger');
+          menuList.append(deleteButton);
+          menu.append(menuSummary, menuList);
+          // Picking an item closes the menu again; the summary is not a button and stays unaffected.
+          menu.addEventListener('click', (event) => {
+            if ((event.target as HTMLElement).closest('button')) menu.open = false;
+          });
+          menu.addEventListener('toggle', () => {
+            if (!menu.open) return;
+            for (const other of target.querySelectorAll<HTMLDetailsElement>('details.agy-menu[open]')) {
+              if (other !== menu) other.open = false;
+            }
+          });
+          actions.append(
+            button(
+              model.enabled === false ? 'Enable' : 'Disable',
+              async () => {
+                requireSuccess(await storageAPI.saveCustomModel({ ...model, enabled: model.enabled === false }));
+                await modelsChanged();
+              },
+              rowStatus,
+            ),
+            menu,
           );
           row.append(info, actions);
-          group.append(row);
+          modelsList.append(row);
         }
+        group.append(modelsList);
         content.append(group);
       }
       target.replaceChildren(content);
+      lastRenderedSnapshot = snapshot;
       restoreScroll();
     } catch (error) {
       setStatus(target, error instanceof Error ? error.message : 'Could not load custom models.', true);
@@ -1474,6 +1733,18 @@ window.addEventListener('DOMContentLoaded', () => {
         providers.map((preset) => [preset.id, preset.label]),
         existing?.provider || providers[0].id,
       );
+      const providerNameInput = field(
+        body,
+        'Provider name (optional, for grouping)',
+        'agy-provider-name',
+        existing?.providerName || '',
+      );
+      providerNameInput.placeholder = 'e.g. Agnes AI, Coarena';
+      const updateProviderNameVisibility = () => {
+        const label = providerNameInput.closest('label');
+        if (label) label.hidden = provider.value !== 'custom';
+      };
+      updateProviderNameVisibility();
       const preset = () => providers.find((value) => value.id === provider.value) || providers[0];
       const apiUrl = field(body, 'API URL', 'agy-api-url', existing?.apiUrl || preset().defaultUrl, 'url');
       const workersHint = element(
@@ -1675,9 +1946,9 @@ window.addEventListener('DOMContentLoaded', () => {
       );
       compactionThreshold.min = '10';
       compactionThreshold.max = '90';
-      compactionThreshold.placeholder = 'IDE default';
+      compactionThreshold.placeholder = '80';
       advancedGrid.append(element('p', 'agy-muted',
-        'Optional, 10–90% of the actual context window in new tokens since the previous checkpoint. Native counts may differ from provider totals. With many tools, start at 50%; higher values can trim older history before a full checkpoint. Leave blank for IDE defaults. The threshold is capped to reserve the model output limit plus 1,024 tokens. Set accurate context and output limits, then fully quit and reopen the IDE; the model cache may take an additional turn to refresh.',
+        'Optional, 10–90% of the actual context window in new tokens since the previous checkpoint. Leave blank to use 80% of a context window you set above; without a context window the IDE keeps its own 50,000-token default. Native counts may differ from provider totals, and a high value can trim older history before a full checkpoint. The threshold is capped to reserve the model output limit plus 1,024 tokens. Set accurate context and output limits, then fully quit and reopen the IDE; the model cache may take an additional turn to refresh.',
       ));
       advancedGrid.append(element('p', 'agy-muted',
         'IDE 2.5.5 needs at least 50,000 input tokens after those reserves. Its native picker may show a compatibility context, for example 90,000 for a real 85,000-token model. Your saved context and provider limit remain 85,000 in that example, and the custom checkpoint policy uses that real limit.',
@@ -1868,6 +2139,7 @@ window.addEventListener('DOMContentLoaded', () => {
           ...connection(),
           name: localName || name.value.trim() || uniqueName(`models/${provider.value}/${id}`),
           provider: provider.value,
+          providerName: provider.value === 'custom' ? providerNameInput.value.trim() || undefined : undefined,
           apiUrl: apiUrl.value.trim(),
           apiKey: keylessOpencode() ? 'none' : apiKey.value.trim() || 'none',
           externalModelName: id.trim(),
@@ -2079,6 +2351,7 @@ window.addEventListener('DOMContentLoaded', () => {
         apiKey.value = '';
         apiKey.placeholder = preset().keyRequired ? 'Enter provider API key' : 'Optional for local servers';
         updateWorkersHint();
+        updateProviderNameVisibility();
         choices = [];
         selected.clear();
         discoverySearch.value = '';
@@ -2593,12 +2866,69 @@ window.addEventListener('DOMContentLoaded', () => {
       button('Remote gateway', openGateway),
       button('Diagnostics', openDiagnostics),
     );
-    const search = field(section, 'Search models', 'agy-model-search', searchTerm, 'search');
-    search.placeholder = 'Search by name, model ID or provider';
+    const optionsRow = element('div', 'agy-options-row');
+    const emojiToggleLabel = element('label', 'agy-toggle-label');
+    const emojiToggleCheckbox = document.createElement('input');
+    emojiToggleCheckbox.type = 'checkbox';
+    emojiToggleCheckbox.id = 'agy-toggle-status-emojis';
+    emojiToggleCheckbox.checked = true;
+    emojiToggleCheckbox.title = 'Prefix model names with status circle (🟢/🟡/🔴) and star (⭐). Uncheck to display only clean model names.';
+    emojiToggleCheckbox.addEventListener('change', async () => {
+      const enabled = emojiToggleCheckbox.checked;
+      try {
+        await storageAPI.saveDisplaySettings({ showStatusEmoji: enabled });
+        setStatus(
+          status,
+          enabled
+            ? 'Status emojis enabled for model names.'
+            : 'Status emojis disabled. Model names will show without emojis.',
+        );
+        await modelsChanged();
+      } catch (err) {
+        setStatus(status, 'Failed to save display setting', true);
+      }
+    });
+    emojiToggleLabel.append(
+      emojiToggleCheckbox,
+      document.createTextNode('Show status emojis before model names (🟢 • name)'),
+    );
+    optionsRow.append(emojiToggleLabel);
+
+    storageAPI.getDisplaySettings().then((settings) => {
+      if (settings && typeof settings.showStatusEmoji === 'boolean') {
+        emojiToggleCheckbox.checked = settings.showStatusEmoji;
+      }
+    }).catch(() => {});
+
+    const bar = element('div', 'agy-sticky-bar');
+    bar.setAttribute('role', 'search');
+    const search = field(bar, 'Search models', 'agy-model-search', searchTerm, 'search');
+    search.placeholder = 'Search name, model ID or provider';
     search.addEventListener('input', () => {
       searchTerm = search.value.trim().toLowerCase();
       void renderCustomModelsList();
     });
+    const chips = element('div', 'agy-actions');
+    const filters: Array<[ModelFilter, string]> = [
+      ['all', 'All'],
+      ['enabled', 'Enabled'],
+      ['disabled', 'Disabled'],
+      ['unhealthy', 'Unhealthy'],
+    ];
+    const chipButtons = new Map<ModelFilter, HTMLButtonElement>();
+    for (const [mode, label] of filters) {
+      const chip = element('button', 'agy-chip', label);
+      chip.type = 'button';
+      chip.setAttribute('aria-pressed', String(filterMode === mode));
+      chip.addEventListener('click', () => {
+        filterMode = mode;
+        for (const [key, node] of chipButtons) node.setAttribute('aria-pressed', String(key === mode));
+        void renderCustomModelsList();
+      });
+      chipButtons.set(mode, chip);
+      chips.append(chip);
+    }
+    bar.append(chips);
     const content = element('div');
     content.id = 'agy-custom-models-content';
     const fleet = element('div', 'agy-fleet');
@@ -2611,9 +2941,26 @@ window.addEventListener('DOMContentLoaded', () => {
       header,
       element('p', 'agy-muted', 'Provider connections, local models and remote gateways.'),
       actions,
+      optionsRow,
     );
-    section.append(status, fleet, content);
+    section.append(status, fleet, bar, content);
     mount.append(section);
+    if (!rowMenuDismissInstalled) {
+      rowMenuDismissInstalled = true;
+      const closeOpenRowMenus = (except?: Node | null) => {
+        for (const openMenu of document.querySelectorAll<HTMLDetailsElement>('#agy-custom-models-content details.agy-menu[open]')) {
+          if (!except || !openMenu.contains(except)) openMenu.open = false;
+        }
+      };
+      document.addEventListener('click', (event) => closeOpenRowMenus(event.target as Node | null));
+      document.addEventListener('keydown', (event) => {
+        if (event.key !== 'Escape') return;
+        const active = document.activeElement as HTMLElement | null;
+        const activeMenu = active?.closest<HTMLDetailsElement>('#agy-custom-models-content details.agy-menu[open]');
+        closeOpenRowMenus();
+        activeMenu?.querySelector('summary')?.focus({ preventScroll: true });
+      });
+    }
     void renderCustomModelsList();
   }
   let pickerSearch: { menu: HTMLElement; update: () => void; cleanup: () => void } | undefined;
@@ -2627,6 +2974,13 @@ window.addEventListener('DOMContentLoaded', () => {
     return true;
   }
   function checkModelPickerSearch(): void {
+    if (document.documentElement?.dataset.agyMitmSelector === '1') {
+      if (pickerSearch) {
+        pickerSearch.cleanup();
+        pickerSearch = undefined;
+      }
+      return;
+    }
     if (pickerSearch) {
       if (pickerVisible(pickerSearch.menu)) { pickerSearch.update(); return; }
       pickerSearch.cleanup();
@@ -2646,20 +3000,92 @@ window.addEventListener('DOMContentLoaded', () => {
     if (!menu) return;
     installStyles();
     const box = element('div', 'agy-model-search-box');
+    const wrap = element('div', 'agy-model-search-wrap');
+    const searchIcon = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+    searchIcon.setAttribute('viewBox', '0 0 16 16');
+    searchIcon.setAttribute('fill', 'none');
+    searchIcon.setAttribute('aria-hidden', 'true');
+    searchIcon.classList.add('agy-model-search-icon');
+    searchIcon.innerHTML =
+      '<path d="M7 12A5 5 0 1 0 7 2a5 5 0 0 0 0 10ZM14 14l-3.2-3.2" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>';
     const input = element('input', 'agy-model-search-input');
     input.type = 'search';
     input.placeholder = 'Search models…';
     input.setAttribute('aria-label', 'Search models');
+    const clearBtn = document.createElement('button');
+    clearBtn.type = 'button';
+    clearBtn.className = 'agy-model-search-clear';
+    clearBtn.textContent = '✕';
+    clearBtn.setAttribute('aria-label', 'Clear search');
+    clearBtn.hidden = true;
+    wrap.append(searchIcon, input, clearBtn);
+    box.append(wrap);
     const empty = element('div', 'agy-model-no-results', 'No matching models');
     empty.hidden = true;
-    box.append(input);
     const header = Array.from(menu.querySelectorAll<HTMLElement>('*')).find((node) => !node.children.length && node.textContent?.trim() === 'Model');
     (header || menu).insertAdjacentElement(header ? 'afterend' : 'afterbegin', box);
     box.after(empty);
+
     const displays = new Map<HTMLElement, { value: string; priority: string }>();
-    const items = () => Array.from(menu.querySelectorAll<HTMLElement>('[role="menuitem"], [role="menuitemradio"], [role="option"], button'))
-      .filter((node) => !node.parentElement?.closest('[role="menuitem"], [role="menuitemradio"], [role="option"]') &&
-        !node.closest('.agy-model-search-box') && !/^View\s+Usage/i.test(node.textContent?.trim() || ''));
+    const injectedNodes: HTMLElement[] = [];
+    let sidepanelEl: HTMLElement | null = null;
+    let activeProviderRow: HTMLElement | null = null;
+    let closeTimer: ReturnType<typeof setTimeout> | undefined;
+    let bridgedNode: HTMLElement | null = null;
+    let bridgedOldStyle = '';
+
+    const stripStatusPrefix = (text: string): string =>
+      text
+        .replace(/^⭐\s*/u, '')
+        .replace(/^[🟢🔴⚪🟡⭐\s•·|-]+(?:\[[^\]]+\]\s*)?[•·|-]?\s*/u, '')
+        .replace(/\s+/g, ' ')
+        .trim();
+
+    const effortWords = new Set(['low', 'medium', 'high', 'xhigh', 'minimal', 'extra', 'default']);
+    const inferProviderGroup = (model: CustomModelEntry): string => {
+      const explicit = (model.providerName || '').trim();
+      if (explicit) return explicit;
+      const clean = stripStatusPrefix(model.displayName || model.name);
+      const matches = Array.from(clean.matchAll(/\(([^()]+)\)/g));
+      for (let i = matches.length - 1; i >= 0; i--) {
+        const candidate = matches[i][1].trim();
+        if (candidate && !effortWords.has(candidate.toLowerCase())) {
+          return candidate;
+        }
+      }
+      return model.provider || 'custom';
+    };
+
+    const isItemSelected = (node: HTMLElement): boolean => {
+      if (node.getAttribute('aria-checked') === 'true' || node.getAttribute('aria-selected') === 'true') return true;
+      if (node.dataset.state === 'checked') return true;
+      return Boolean(node.querySelector('svg[data-lucide="check"], .lucide-check'));
+    };
+
+    const hasEffortSubmenu = (node: HTMLElement): boolean => {
+      if (node.getAttribute('aria-haspopup') === 'menu') return true;
+      return Boolean(node.querySelector('svg[data-lucide="chevron-right"], .lucide-chevron-right'));
+    };
+
+    const viewUsageNode = () =>
+      Array.from(menu.querySelectorAll<HTMLElement>('[role="menuitem"], [role="menuitemradio"], [role="option"], button')).find(
+        (node) => !node.closest('.agy-model-search-box, .agy-provider-row') && /^View\s+Usage$/i.test(node.textContent?.trim() || ''),
+      );
+
+    const rawItems = () =>
+      Array.from(menu.querySelectorAll<HTMLElement>('[role="menuitem"], [role="menuitemradio"], [role="option"], button')).filter(
+        (node) =>
+          !node.parentElement?.closest('[role="menuitem"], [role="menuitemradio"], [role="option"]') &&
+          !node.closest('.agy-model-search-box, .agy-provider-row') &&
+          !/^View\s+Usage/i.test(node.textContent?.trim() || ''),
+      );
+
+    const hideNode = (node: HTMLElement) => {
+      if (displays.has(node)) return;
+      displays.set(node, { value: node.style.getPropertyValue('display'), priority: node.style.getPropertyPriority('display') });
+      node.style.setProperty('display', 'none', 'important');
+    };
+
     const restore = (node: HTMLElement) => {
       const old = displays.get(node);
       if (!old) return;
@@ -2667,21 +3093,367 @@ window.addEventListener('DOMContentLoaded', () => {
       else node.style.removeProperty('display');
       displays.delete(node);
     };
+
+    const unbridgeNode = () => {
+      if (!bridgedNode) return;
+      bridgedNode.setAttribute('style', bridgedOldStyle);
+      bridgedNode = null;
+      bridgedOldStyle = '';
+    };
+
+    const closeSidepanel = () => {
+      if (closeTimer) {
+        clearTimeout(closeTimer);
+        closeTimer = undefined;
+      }
+      unbridgeNode();
+      if (sidepanelEl) {
+        sidepanelEl.remove();
+        sidepanelEl = null;
+      }
+      if (activeProviderRow) {
+        activeProviderRow.removeAttribute('data-open');
+        activeProviderRow = null;
+      }
+    };
+
+    const scheduleCloseSidepanel = () => {
+      if (closeTimer) clearTimeout(closeTimer);
+      closeTimer = setTimeout(() => {
+        const subOpen = document.querySelector('[data-radix-menu-sub-content]:hover, [data-radix-dropdown-menu-sub-content]:hover');
+        if (!subOpen) closeSidepanel();
+      }, 160);
+    };
+
+    const createChevronSvg = (sampleNode?: HTMLElement): SVGElement => {
+      const existingSvg = sampleNode?.querySelector('svg[data-lucide="chevron-right"], .lucide-chevron-right') as SVGElement | null;
+      if (existingSvg) return existingSvg.cloneNode(true) as SVGElement;
+      const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+      svg.setAttribute('viewBox', '0 0 24 24');
+      svg.setAttribute('width', '14');
+      svg.setAttribute('height', '14');
+      svg.setAttribute('fill', 'none');
+      svg.setAttribute('stroke', 'currentColor');
+      svg.setAttribute('stroke-width', '2');
+      svg.setAttribute('stroke-linecap', 'round');
+      svg.setAttribute('stroke-linejoin', 'round');
+      svg.innerHTML = '<path d="m9 18 6-6-6-6"/>';
+      return svg;
+    };
+
+    let lastRenderKey = '';
+
+    const openProviderSidepanel = (
+      providerRow: HTMLElement,
+      providerName: string,
+      entries: Array<{ node: HTMLElement; model: CustomModelEntry }>,
+      officialSample?: HTMLElement,
+    ) => {
+      if (closeTimer) {
+        clearTimeout(closeTimer);
+        closeTimer = undefined;
+      }
+      if (activeProviderRow === providerRow && sidepanelEl?.isConnected) return;
+      closeSidepanel();
+      activeProviderRow = providerRow;
+      providerRow.setAttribute('data-open', 'true');
+
+      const panel = element('div', `${menu.className ? menu.className + ' ' : ''}agy-provider-sidepanel`);
+      panel.setAttribute('role', 'menu');
+      const menuStyle = window.getComputedStyle(menu);
+      if (menuStyle.backgroundColor && menuStyle.backgroundColor !== 'rgba(0, 0, 0, 0)') {
+        panel.style.backgroundColor = menuStyle.backgroundColor;
+      } else {
+        panel.style.backgroundColor = '#18181b';
+      }
+      if (menuStyle.borderColor) panel.style.borderColor = menuStyle.borderColor;
+      if (menuStyle.borderStyle && menuStyle.borderStyle !== 'none') panel.style.borderStyle = menuStyle.borderStyle;
+      if (menuStyle.borderWidth && menuStyle.borderWidth !== '0px') panel.style.borderWidth = menuStyle.borderWidth;
+      if (menuStyle.borderRadius) panel.style.borderRadius = menuStyle.borderRadius;
+      if (menuStyle.color) panel.style.color = menuStyle.color;
+      if (menuStyle.fontFamily) panel.style.fontFamily = menuStyle.fontFamily;
+      if (menuStyle.fontSize) panel.style.fontSize = menuStyle.fontSize;
+
+      const sampleClass = officialSample?.className || '';
+      const chevronSample = officialSample || entries.find((e) => hasEffortSubmenu(e.node))?.node;
+
+      for (const { node, model } of entries) {
+        const item = element('div', `${sampleClass ? sampleClass + ' ' : ''}agy-sidepanel-item`);
+        item.setAttribute('role', 'menuitem');
+        item.tabIndex = -1;
+        const disabled = node.getAttribute('aria-disabled') === 'true' || (node as HTMLButtonElement).disabled;
+        if (disabled) item.setAttribute('data-disabled', 'true');
+
+        const rawLabel = (node.textContent || model.displayName || model.name).replace(/\s+/g, ' ').trim();
+        const left = element('span', 'agy-sidepanel-item-left');
+        left.append(element('span', 'agy-sidepanel-item-label', rawLabel));
+
+        const right = element('span', 'agy-sidepanel-item-right');
+        if (isItemSelected(node)) {
+          right.append(element('span', '', '✓'));
+        }
+        const hasSub = hasEffortSubmenu(node);
+        if (hasSub) {
+          right.append(createChevronSvg(chevronSample));
+        }
+        item.append(left, right);
+
+        item.addEventListener('pointerenter', () => {
+          if (closeTimer) {
+            clearTimeout(closeTimer);
+            closeTimer = undefined;
+          }
+          unbridgeNode();
+          if (hasSub && !disabled) {
+            const rect = item.getBoundingClientRect();
+            bridgedNode = node;
+            bridgedOldStyle = node.getAttribute('style') || '';
+            node.style.cssText = `position:fixed!important;left:${rect.left}px!important;top:${rect.top}px!important;width:${rect.width}px!important;height:${rect.height}px!important;opacity:0!important;pointer-events:none!important;display:flex!important;z-index:-1!important;`;
+            for (const ev of ['pointerover', 'pointerenter', 'mouseover', 'mouseenter', 'pointermove']) {
+              node.dispatchEvent(new MouseEvent(ev, { bubbles: true, cancelable: true, clientX: rect.left + 8, clientY: rect.top + 8 }));
+            }
+          }
+        });
+
+        item.addEventListener('pointerdown', (e) => e.stopPropagation());
+        item.addEventListener('click', (e) => {
+          e.stopPropagation();
+          if (disabled) return;
+          closeSidepanel();
+          restore(node);
+          node.click();
+        });
+        item.addEventListener('keydown', (e) => {
+          if (e.key === 'Escape' || e.key === 'ArrowLeft') {
+            e.preventDefault();
+            e.stopPropagation();
+            closeSidepanel();
+            providerRow.focus();
+          } else if (e.key === 'Enter' || e.key === ' ') {
+            e.preventDefault();
+            e.stopPropagation();
+            item.click();
+          } else if (e.key === 'ArrowDown') {
+            e.preventDefault();
+            (item.nextElementSibling as HTMLElement | null)?.focus();
+          } else if (e.key === 'ArrowUp') {
+            e.preventDefault();
+            const prev = item.previousElementSibling as HTMLElement | null;
+            if (prev && prev.classList.contains('agy-sidepanel-item')) prev.focus();
+          }
+        });
+
+        panel.append(item);
+      }
+
+      panel.addEventListener('pointerenter', () => {
+        if (closeTimer) {
+          clearTimeout(closeTimer);
+          closeTimer = undefined;
+        }
+      });
+      panel.addEventListener('pointerleave', scheduleCloseSidepanel);
+      for (const ev of ['pointerdown', 'mousedown', 'click']) {
+        panel.addEventListener(ev, (e) => e.stopPropagation());
+      }
+
+      document.body.append(panel);
+      sidepanelEl = panel;
+
+      const menuRect = menu.getBoundingClientRect();
+      const rowRect = providerRow.getBoundingClientRect();
+      const panelRect = panel.getBoundingClientRect();
+      let left = menuRect.right + 4;
+      if (left + panelRect.width > window.innerWidth - 8) {
+        left = Math.max(8, menuRect.left - panelRect.width - 4);
+      }
+      let top = rowRect.top - 4;
+      if (top + panelRect.height > window.innerHeight - 8) {
+        top = Math.max(8, window.innerHeight - panelRect.height - 8);
+      }
+      panel.style.left = `${left}px`;
+      panel.style.top = `${top}px`;
+    };
+
+    const clearInjectedProviders = () => {
+      closeSidepanel();
+      while (injectedNodes.length) {
+        injectedNodes.pop()?.remove();
+      }
+    };
+
+    const stripTrailingSuffix = (text: string): string =>
+      text
+        .replace(/(?:\s*(?:Low|Medium|High|XHigh|Minimal|Extra|New|Notice|Unavailable|✓|›|>))+$/iu, '')
+        .trim();
+
+    const stripEffortParens = (text: string): string =>
+      text.replace(/\s*\((?:low|medium|high|xhigh|minimal|extra)\)\s*$/iu, '').trim();
+
+    const matchNodeToCustomModel = (node: HTMLElement, sortedModels: Array<{ model: CustomModelEntry; clean: string; base: string }>): CustomModelEntry | undefined => {
+      const attrLabel =
+        node.getAttribute('data-model-label') ||
+        node.querySelector<HTMLElement>('[data-model-base]')?.getAttribute('data-model-base') ||
+        '';
+      const nodeClean = stripStatusPrefix(attrLabel || node.textContent || '');
+      if (!nodeClean) return undefined;
+      const nodeBase = stripEffortParens(stripTrailingSuffix(nodeClean)).toLowerCase();
+      const nodeCleanLower = nodeClean.toLowerCase();
+      const isTruncated = nodeBase.endsWith('...') || nodeBase.endsWith('…');
+      const truncatedPrefix = isTruncated ? nodeBase.replace(/(?:\.\.\.|…)+$/, '').trim() : '';
+
+      for (const { model, clean, base } of sortedModels) {
+        if (!clean) continue;
+        const cleanLower = clean.toLowerCase();
+        const baseLower = base.toLowerCase();
+        if (
+          nodeBase === cleanLower ||
+          nodeBase === baseLower ||
+          nodeCleanLower === cleanLower ||
+          nodeCleanLower === baseLower ||
+          nodeCleanLower.startsWith(cleanLower) ||
+          nodeCleanLower.startsWith(baseLower)
+        ) {
+          return model;
+        }
+        if (truncatedPrefix.length >= 12 && (cleanLower.startsWith(truncatedPrefix) || baseLower.startsWith(truncatedPrefix))) {
+          return model;
+        }
+      }
+      return undefined;
+    };
+
     const update = () => {
       const query = input.value.trim().toLowerCase();
+      clearBtn.hidden = !query;
+
+      const allNodes = rawItems();
+      const enabledModels = modelList.filter((m) => m.enabled !== false);
+      const sortedModels = enabledModels
+        .map((model) => {
+          const clean = stripStatusPrefix(model.displayName || model.name);
+          return { model, clean, base: stripEffortParens(clean) };
+        })
+        .sort((a, b) => b.base.length - a.base.length || b.clean.length - a.clean.length);
+
+      const providerGroups = new Map<string, Array<{ node: HTMLElement; model: CustomModelEntry }>>();
+      const customNodes = new Set<HTMLElement>();
+      let officialSample: HTMLElement | undefined;
+
+      if (sortedModels.length > 0) {
+        for (const node of allNodes) {
+          const matched = matchNodeToCustomModel(node, sortedModels);
+          if (matched) {
+            customNodes.add(node);
+            const groupName = inferProviderGroup(matched);
+            const list = providerGroups.get(groupName) || [];
+            list.push({ node, model: matched });
+            providerGroups.set(groupName, list);
+          } else if (!officialSample && pickerVisible(node)) {
+            officialSample = node;
+          }
+        }
+      }
+
+      const renderKey = `${query}|${allNodes.length}|${Array.from(providerGroups.keys()).join(',')}|${allNodes.findIndex((n) => isItemSelected(n))}`;
+      if (!query && providerGroups.size > 0 && renderKey === lastRenderKey && injectedNodes.some((n) => n.isConnected)) {
+        return;
+      }
+      lastRenderKey = renderKey;
+      clearInjectedProviders();
+
+      if (!query && providerGroups.size > 0) {
+        // Grouped Provider View: keep Official Models visible, hide flat Custom Models, inject Provider Rows
+        for (const node of allNodes) {
+          if (customNodes.has(node)) {
+            hideNode(node);
+          } else {
+            restore(node);
+          }
+        }
+
+        const anchor = viewUsageNode();
+        const divider = element('div', 'agy-provider-divider');
+        injectedNodes.push(divider);
+        if (anchor) anchor.insertAdjacentElement('beforebegin', divider);
+        else menu.append(divider);
+
+        const rowClass = officialSample?.className ? `${officialSample.className} agy-provider-row` : 'agy-provider-row';
+        const chevronSample = officialSample || Array.from(customNodes).find((n) => hasEffortSubmenu(n));
+
+        for (const [providerName, entries] of providerGroups.entries()) {
+          const row = element('div', rowClass);
+          row.setAttribute('role', 'menuitem');
+          row.setAttribute('aria-haspopup', 'menu');
+          row.tabIndex = -1;
+
+          const activeEntry = entries.find((e) => isItemSelected(e.node));
+          const left = element('span', 'agy-provider-row-left');
+          left.append(element('span', 'agy-provider-row-name', providerName));
+          if (activeEntry) {
+            const activeClean = stripStatusPrefix(activeEntry.model.displayName || activeEntry.model.name);
+            left.append(element('span', 'agy-provider-row-active', activeClean));
+          }
+
+          const right = element('span', 'agy-provider-row-right');
+          if (activeEntry) {
+            right.append(element('span', '', '✓'));
+          }
+          right.append(createChevronSvg(chevronSample));
+          row.append(left, right);
+
+          row.addEventListener('pointerenter', () => openProviderSidepanel(row, providerName, entries, officialSample));
+          row.addEventListener('pointerleave', scheduleCloseSidepanel);
+          row.addEventListener('pointerdown', (e) => e.stopPropagation());
+          row.addEventListener('click', (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            openProviderSidepanel(row, providerName, entries, officialSample);
+          });
+          row.addEventListener('keydown', (e) => {
+            if (e.key === 'ArrowRight' || e.key === 'Enter' || e.key === ' ') {
+              e.preventDefault();
+              e.stopPropagation();
+              openProviderSidepanel(row, providerName, entries, officialSample);
+              (sidepanelEl?.querySelector('.agy-sidepanel-item') as HTMLElement | null)?.focus();
+            }
+          });
+
+          injectedNodes.push(row);
+          if (anchor) anchor.insertAdjacentElement('beforebegin', row);
+          else menu.append(row);
+        }
+
+        empty.hidden = true;
+        return;
+      }
+
+      // Search View (or fallback if no custom provider groups exist)
       let matches = 0;
-      for (const node of items()) {
-        const matched = !query || (node.textContent || '').toLowerCase().includes(query);
-        if (matched) { if (displays.has(node)) restore(node); if (pickerVisible(node)) matches++; }
-        else if (!displays.has(node)) {
-          displays.set(node, { value: node.style.getPropertyValue('display'), priority: node.style.getPropertyPriority('display') });
-          node.style.setProperty('display', 'none', 'important');
+      for (const node of allNodes) {
+        const matchedModel = sortedModels.length ? matchNodeToCustomModel(node, sortedModels) : undefined;
+        const providerHint = matchedModel ? inferProviderGroup(matchedModel) : '';
+        const haystack = `${node.textContent || ''} ${providerHint}`.toLowerCase();
+        const matched = !query || haystack.includes(query);
+        if (matched) {
+          if (displays.has(node)) restore(node);
+          if (pickerVisible(node)) matches++;
+        } else {
+          hideNode(node);
         }
       }
       const hidden = !query || matches > 0;
       if (empty.hidden !== hidden) empty.hidden = hidden;
     };
+
     for (const event of ['pointerdown', 'mousedown', 'click']) box.addEventListener(event, (e) => e.stopPropagation());
+    clearBtn.addEventListener('click', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      input.value = '';
+      update();
+      input.focus();
+    });
     input.addEventListener('input', update);
     input.addEventListener('keydown', (event) => {
       if (event.key === 'Escape' && !input.value) return;
@@ -2689,12 +3461,31 @@ window.addEventListener('DOMContentLoaded', () => {
       if (event.key === 'Escape') { event.preventDefault(); input.value = ''; update(); }
       else if (event.key === 'Enter' || event.key === 'ArrowDown') {
         event.preventDefault();
-        const first = items().find((node) => pickerVisible(node) && node.getAttribute('aria-disabled') !== 'true' && !(node as HTMLButtonElement).disabled);
+        const first = rawItems().find((node) => pickerVisible(node) && node.getAttribute('aria-disabled') !== 'true' && !(node as HTMLButtonElement).disabled);
         if (event.key === 'Enter') first?.click();
-        else first?.focus();
+        else (first || (injectedNodes.find((n) => n.classList.contains('agy-provider-row')) as HTMLElement | undefined))?.focus();
       }
     });
-    pickerSearch = { menu, update, cleanup: () => { for (const node of displays.keys()) restore(node); box.remove(); empty.remove(); } };
+
+    pickerSearch = {
+      menu,
+      update,
+      cleanup: () => {
+        clearInjectedProviders();
+        for (const node of Array.from(displays.keys())) restore(node);
+        box.remove();
+        empty.remove();
+      },
+    };
+    update();
+    if (!modelList.length) {
+      void storageAPI.getCustomModels().then((list) => {
+        modelList = list;
+        if (pickerSearch?.menu === menu && pickerVisible(menu)) {
+          update();
+        }
+      }).catch(() => {});
+    }
     setTimeout(() => { if (box.isConnected && pickerVisible(menu)) input.focus(); }, 0);
   }
   function setupInjectionObserver(): void {
@@ -2703,7 +3494,12 @@ window.addEventListener('DOMContentLoaded', () => {
     checkModelPickerSearch();
     fleetTimer = setInterval(() => { void refreshFleetQuotas(); }, 30_000);
     let pending: ReturnType<typeof setTimeout> | undefined;
-    const observer = new MutationObserver(() => {
+    const isAddonPickerNode = (target: Node | null): boolean => {
+      const el = target instanceof HTMLElement ? target : target?.parentElement;
+      return Boolean(el?.closest('.agy-provider-sidepanel, .agy-provider-row, .agy-provider-divider, .agy-model-search-box'));
+    };
+    const observer = new MutationObserver((mutations) => {
+      if (mutations.every((m) => isAddonPickerNode(m.target))) return;
       if (pending) clearTimeout(pending);
       pending = setTimeout(() => {
         pending = undefined;
@@ -2729,166 +3525,6 @@ window.addEventListener('DOMContentLoaded', () => {
     );
   }
 
-  // --- Network Interceptor for Model Injection --------------------------
-
-  function isSafeToIntercept(url: string): boolean {
-    // Never touch the internal Connect-RPC LanguageServerService channel —
-    // those responses are protocol-framed, not plain JSON, and rewriting
-    // them corrupts the renderer's RPC client / store hydration.
-    if (url.includes('exa.language_server_pb.')) return false;
-    if (url.includes('/LanguageServerService/')) return false;
-    return true;
-  }
-
-  function isJsonResponse(contentType: string | null): boolean {
-    return contentType?.split(';', 1)[0].trim().toLowerCase() === 'application/json';
-  }
-
-  const customModelsCache: { models: any[]; ts: number } = { models: [], ts: 0 };
-
-  function injectMissingCustomModels(parsed: Record<string, unknown>, customModels: any[]): boolean {
-    const key = ['models', 'availableModels', 'available_models'].find((name) => parsed[name] !== undefined) || 'models';
-    const collection = parsed[key];
-    // Preserve list/protocol shapes we do not own; the proxy handles array catalogs.
-    if (collection !== undefined && (!collection || typeof collection !== 'object' || Array.isArray(collection))) return false;
-    const modelsObj = (collection || {}) as Record<string, any>;
-    const legacySlug = (model: any) => 'custom-' + String(model.externalModelName || model.name || '')
-      .replace(/^models\//, '').replace(/[^a-zA-Z0-9]+/g, '-').replace(/^-+|-+$/g, '').toLowerCase();
-    const usedLabels = new Set(Object.values(modelsObj).map((entry) => entry?.displayName).filter((label) => typeof label === 'string'));
-    let changed = false;
-    for (const model of customModels) {
-      if (model.nativePickerAvailable === false) continue;
-      const authoritative = typeof model.nativeCatalogId === 'string' && typeof model.nativeModelId === 'string';
-      const slug = authoritative ? model.nativeCatalogId : legacySlug(model);
-      // Compatibility with older IPC: never guess a shared external alias for effort variants.
-      if (!authoritative && customModels.filter((other) => legacySlug(other) === slug).length !== 1) continue;
-      const placeholder = authoritative ? model.nativeModelId : 'MODEL_PLACEHOLDER_M' +
-        (400 + hashCodeStr(String(model.displayName || model.name || 'custom-model').toLowerCase()) % 200);
-      const baseLabel = model.displayName || model.name;
-      // The proxy is authoritative. Reinjection must not overwrite its capabilities or add a legacy duplicate.
-      if (Object.prototype.hasOwnProperty.call(modelsObj, slug) || Object.entries(modelsObj).some(([id, entry]) =>
-        id.startsWith('custom-') && entry?.model === placeholder && entry.displayName === baseLabel,
-      )) continue;
-      let displayName = baseLabel;
-      if (usedLabels.has(displayName) || customModels.filter((entry) => (entry.displayName || entry.name) === baseLabel).length > 1)
-        displayName = `${baseLabel} (${String(model.name).replace(/^models\//, '')})`;
-      let suffix = 2;
-      while (usedLabels.has(displayName)) displayName = `${baseLabel} (${String(model.name).replace(/^models\//, '')} #${suffix++})`;
-      usedLabels.add(displayName);
-      modelsObj[slug] = {
-        displayName, recommended: true,
-        maxTokens: model.nativeContextWindow || model.contextWindow || 1048576,
-        maxOutputTokens: model.nativeMaxOutputTokens || model.maxOutputTokens || 4096,
-        tokenizerType: 'LLAMA_WITH_SPECIAL', model: placeholder,
-        apiProvider: 'API_PROVIDER_GOOGLE_GEMINI', modelProvider: 'MODEL_PROVIDER_GOOGLE',
-        ...(authoritative && model.nativeModelExperiments ? { modelExperiments: model.nativeModelExperiments } : {}),
-      };
-      changed = true;
-    }
-    if (changed) parsed[key] = modelsObj;
-    return changed;
-  }
-
-  async function getCustomModelsForInjection(): Promise<any[]> {
-    if (Date.now() - customModelsCache.ts < 30000) return customModelsCache.models;
-    try {
-      customModelsCache.models = (await storageAPI.getCustomModels()).filter((model) => model.enabled !== false);
-      customModelsCache.ts = Date.now();
-    } catch {
-      /* ignore */
-    }
-    return customModelsCache.models;
-  }
-
-  // Intercept XHR to inject custom models into GetAvailableModels responses
-  const origXHROpen = XMLHttpRequest.prototype.open;
-  XMLHttpRequest.prototype.open = function (
-    method: string,
-    url: string | URL,
-    async?: boolean,
-    username?: string | null,
-    password?: string | null,
-  ) {
-    (this as any)._agy_url = typeof url === 'string' ? url : url.toString();
-    (this as any)._agy_method = method;
-    (this as any)._agy_async = async !== false;
-    return origXHROpen.call(this, method, url, async !== false, username, password);
-  };
-
-  const origXHRSend = XMLHttpRequest.prototype.send;
-  XMLHttpRequest.prototype.send = function (body?: Document | XMLHttpRequestBodyInit | null) {
-    const url: string = (this as any)._agy_url || '';
-
-    if ((url.includes('GetAvailableModels') || url.includes('fetchAvailableModels')) && isSafeToIntercept(url)) {
-      // Warm the cache without delaying native XHR events. If it is not ready by
-      // DONE, leave the response alone; load/readystatechange ordering must survive.
-      if ((this as any)._agy_async) void getCustomModelsForInjection();
-      const origOnReady = this.onreadystatechange;
-      this.onreadystatechange = (ev: Event) => {
-        if (
-          this.readyState === 4 &&
-          this.status === 200 &&
-          (this.responseType === '' || this.responseType === 'text') &&
-          isJsonResponse(this.getResponseHeader('content-type'))
-        ) {
-          const customModels = customModelsCache.models;
-          if (customModels && customModels.length > 0) {
-            try {
-              const responseText = this.responseText;
-              if (responseText && responseText.length > 10) {
-                const parsed = JSON.parse(responseText) as Record<string, unknown>;
-                if (injectMissingCustomModels(parsed, customModels)) {
-                  // Override only a changed response; keep native event ordering intact.
-                  Object.defineProperty(this, 'responseText', { value: JSON.stringify(parsed), writable: true });
-                  Object.defineProperty(this, 'response', { value: JSON.stringify(parsed), writable: true });
-                }
-              }
-            } catch {
-              /* ignore parse errors */
-            }
-          }
-        }
-        if (origOnReady) origOnReady.call(this, ev);
-      };
-    }
-    return origXHRSend.call(this, body);
-  };
-
-  // Intercept fetch responses for model endpoints
-  const origFetch = window.fetch;
-  window.fetch = async function (input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
-    const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
-    const response = await origFetch.call(window, input, init);
-
-    if (
-      (url.includes('GetAvailableModels') || url.includes('fetchAvailableModels')) &&
-      isSafeToIntercept(url) &&
-      response.ok
-    ) {
-      if (!isJsonResponse(response.headers.get('content-type'))) {
-        return response;
-      }
-      const customModels = await getCustomModelsForInjection();
-      if (customModels && customModels.length > 0) {
-        try {
-          const cloned = response.clone();
-          const text = await cloned.text();
-          if (text && text.length > 10) {
-            const parsed = JSON.parse(text) as Record<string, unknown>;
-            if (!injectMissingCustomModels(parsed, customModels)) return response;
-            return new Response(JSON.stringify(parsed), {
-              status: response.status,
-              statusText: response.statusText,
-              headers: response.headers,
-            });
-          }
-        } catch {
-          /* ignore parse errors */
-        }
-      }
-    }
-    return response;
-  };
 
   function hashCodeStr(s: string): number {
     let h = 5381;
@@ -2902,12 +3538,24 @@ window.addEventListener('DOMContentLoaded', () => {
   // Start the observer
   setupInjectionObserver();
 
-  window.addEventListener('focus', () => {
-    void renderCustomModelsList();
-  });
-  setInterval(() => {
+  const onWindowFocus = () => {
+    void renderCustomModelsList({ background: true });
+  };
+  window.addEventListener('focus', onWindowFocus);
+  listPollTimer = setInterval(() => {
     if (document.visibilityState === 'visible') {
-      void renderCustomModelsList();
+      void renderCustomModelsList({ background: true });
     }
   }, 4000);
+  window.addEventListener(
+    'pagehide',
+    () => {
+      if (listPollTimer !== undefined && typeof clearInterval === 'function') {
+        clearInterval(listPollTimer);
+        listPollTimer = undefined;
+      }
+      window.removeEventListener?.('focus', onWindowFocus);
+    },
+    { once: true },
+  );
 });

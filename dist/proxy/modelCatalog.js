@@ -4,6 +4,7 @@ exports.legacyModelSlug = legacyModelSlug;
 exports.localModelSlug = localModelSlug;
 exports.catalogModelSlug = catalogModelSlug;
 exports.matchesModelSlug = matchesModelSlug;
+exports.fallbackModelDisplayName = fallbackModelDisplayName;
 exports.catalogDisplayNames = catalogDisplayNames;
 exports.mergeCloudCodeCatalog = mergeCloudCodeCatalog;
 const node_crypto_1 = require("node:crypto");
@@ -31,8 +32,17 @@ function matchesModelSlug(model, value, models) {
     const id = value.replace(/^models\//, '');
     return id === localModelSlug(model) || id === catalogModelSlug(model, models);
 }
+function fallbackModelDisplayName(model) {
+    const display = typeof model.displayName === 'string' ? model.displayName.trim() : '';
+    if (display)
+        return display;
+    const external = typeof model.externalModelName === 'string' ? model.externalModelName.trim() : '';
+    if (external)
+        return external;
+    return String(model.name || '').replace(/^models\//, '').trim() || String(model.name || '');
+}
 /** The native IDE resolves sorted options by label, so display labels must also be unique. */
-function catalogDisplayNames(models, upstream = {}, healthMap, recentModels) {
+function catalogDisplayNames(models, upstream = {}, healthMap, recentModels, showStatusEmoji) {
     const used = new Set();
     if (upstream && typeof upstream === 'object') {
         for (const key of ['models', 'availableModels', 'available_models']) {
@@ -40,21 +50,29 @@ function catalogDisplayNames(models, upstream = {}, healthMap, recentModels) {
             if (!collection || typeof collection !== 'object')
                 continue;
             for (const entry of Object.values(collection)) {
-                if (typeof entry?.displayName === 'string')
+                if (typeof entry?.displayName === 'string') {
                     used.add(entry.displayName);
+                    const cleaned = (0, modelHealth_1.cleanModelDisplayName)(entry.displayName);
+                    if (cleaned)
+                        used.add(cleaned);
+                }
             }
         }
     }
     const counts = new Map();
     for (const model of models) {
-        const label = model.displayName || model.name;
-        counts.set(label, (counts.get(label) || 0) + 1);
+        const raw = fallbackModelDisplayName(model);
+        const cleaned = (0, modelHealth_1.cleanModelDisplayName)(raw) || raw;
+        counts.set(cleaned, (counts.get(cleaned) || 0) + 1);
     }
+    const emojiEnabled = showStatusEmoji !== undefined ? showStatusEmoji : (0, modelHealth_1.isStatusEmojiEnabled)();
     const labels = new Map();
+    const usedFinal = new Set(used);
     for (const model of [...models].sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0))) {
-        const base = model.displayName || model.name;
+        const rawBase = fallbackModelDisplayName(model);
+        const base = (0, modelHealth_1.cleanModelDisplayName)(rawBase) || rawBase;
         let label = base;
-        if (counts.get(base) > 1 || used.has(label))
+        if ((counts.get(base) || 0) > 1 || used.has(label))
             label = `${base} (${model.name.replace(/^models\//, '')})`;
         let suffix = 2;
         while (used.has(label))
@@ -65,11 +83,21 @@ function catalogDisplayNames(models, upstream = {}, healthMap, recentModels) {
                 ? recentModels.includes(model.name)
                 : recentModels.has(model.name)
             : false;
-        const finalLabel = healthMap
-            ? (0, modelHealth_1.formatHealthDisplayName)(label, healthMap.get(model.name), isRecent)
-            : isRecent
+        let finalLabel = healthMap
+            ? (0, modelHealth_1.formatHealthDisplayName)(label, healthMap.get(model.name), isRecent, emojiEnabled)
+            : isRecent && emojiEnabled
                 ? `⭐ ${label}`
                 : label;
+        while (usedFinal.has(finalLabel)) {
+            const disambiguated = `${base} (${model.name.replace(/^models\//, '')} #${suffix++})`;
+            used.add(disambiguated);
+            finalLabel = healthMap
+                ? (0, modelHealth_1.formatHealthDisplayName)(disambiguated, healthMap.get(model.name), isRecent, emojiEnabled)
+                : isRecent && emojiEnabled
+                    ? `⭐ ${disambiguated}`
+                    : disambiguated;
+        }
+        usedFinal.add(finalLabel);
         labels.set(model.name, finalLabel);
     }
     return labels;

@@ -8,6 +8,7 @@ import {
   type PoolFailoverOptions,
 } from '../proxy/googlePoolFailover';
 import { getGooglePoolStatus, resetGoogleAccountState } from '../googleAccounts';
+import { getConversationUsage } from '../proxy/conversationUsage';
 
 const servers: http.Server[] = [];
 const clients: http.ClientRequest[] = [];
@@ -295,5 +296,86 @@ describe('native Google account failover', () => {
     call.request.destroy();
     expect(getGooglePoolStatus().every((account) => account.inFlight === 0)).toBe(true);
     expect(getGooglePoolStatus().filter((account) => account.requests > 0)).toHaveLength(1);
+  });
+
+  it('excludes a failing account matched by unique project when its bearer token changed', async () => {
+    const upstream = await serve((req, res) => {
+      res.writeHead(200);
+      res.end(String(req.headers.authorization || ''));
+    });
+    const fixture = await gateway([pool(upstream)]);
+    const response = await new Promise<http.IncomingMessage>((resolve, reject) => {
+      const outgoing = http.request(
+        `${fixture.origin}/v1internal:streamGenerateContent?alt=sse`,
+        { method: 'POST', headers: { authorization: 'Bearer refreshed-token' } },
+        resolve,
+      );
+      outgoing.on('error', reject);
+      outgoing.end(JSON.stringify({ model: 'gemini-pro', project: 'standby-project' }));
+      clients.push(outgoing);
+    });
+    expect(response.statusCode).toBe(200);
+    expect(await text(response)).toBe('Bearer token-second');
+  });
+
+  it('clears the acquisition timeout once 200 OK streaming begins and records native stream timing', async () => {
+    const conversationId = '11111111-2222-3333-4444-555555555555';
+    const upstream = await serve((_req, res) => {
+      res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+      res.write('data: {"candidates":[]}\n\n');
+      setTimeout(() => res.write('data: {"candidates":[]}\n\n'), 35);
+      setTimeout(() => res.write('data: {"candidates":[]}\n\n'), 70);
+      setTimeout(() => res.end('data: [DONE]\n\n'), 105);
+    });
+    // timeoutMs (60ms) is shorter than total stream duration (105ms), but longer than chunk interval (35ms).
+    const fixture = await gateway([pool(upstream)], { timeoutMs: 60 });
+    const response = await new Promise<http.IncomingMessage>((resolve, reject) => {
+      const outgoing = http.request(
+        `${fixture.origin}/v1internal:streamGenerateContent?alt=sse`,
+        { method: 'POST', headers: { authorization: 'Bearer original' } },
+        resolve,
+      );
+      outgoing.on('error', reject);
+      outgoing.end(JSON.stringify({ model: 'gemini-pro', conversationId }));
+      clients.push(outgoing);
+    });
+    expect(response.statusCode).toBe(200);
+    expect(await text(response)).toContain('[DONE]');
+    const timing = getConversationUsage(conversationId);
+    expect(timing).toBeDefined();
+    expect(timing!.decodeMs).toBeGreaterThanOrEqual(50);
+  });
+
+  it('records failing account cooldown under the same scope key as acquireGoogleAccount', async () => {
+    const attempted: string[] = [];
+    const upstream = await serve((req, res) => {
+      attempted.push(req.headers.authorization!);
+      res.writeHead(200);
+      res.end('ok');
+    });
+    const configured = pool(upstream);
+    configured.googleAccounts = [
+      { id: 'first', accessToken: 'token-first', project: 'real-account-project' },
+      { id: 'second', accessToken: 'token-second', project: 'second-project' },
+    ];
+    const fixture = await gateway([configured]);
+    // Request 1 fails on token-first (whose request body had a different/missing project) -> fails over to second.
+    const firstRes = await new Promise<http.IncomingMessage>((resolve, reject) => {
+      const outgoing = http.request(
+        `${fixture.origin}/v1internal:streamGenerateContent?alt=sse`,
+        { method: 'POST', headers: { authorization: 'Bearer token-first' } },
+        resolve,
+      );
+      outgoing.on('error', reject);
+      outgoing.end(JSON.stringify({ model: 'gemini-pro' }));
+      clients.push(outgoing);
+    });
+    expect(firstRes.statusCode).toBe(200);
+    await text(firstRes);
+    // Subsequent request from another caller must honor token-first's cooldown and go straight to token-second.
+    const secondRes = await send(fixture.origin).response;
+    expect(secondRes.statusCode).toBe(200);
+    await text(secondRes);
+    expect(attempted).toEqual(['Bearer token-second', 'Bearer token-second']);
   });
 });

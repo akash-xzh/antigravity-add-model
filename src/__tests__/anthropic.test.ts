@@ -1,6 +1,11 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import * as shared from '../proxy/shared';
-import { mapGeminiToAnthropic, mapAnthropicToGemini, mapAnthropicChunkToGemini } from '../proxy/translators/anthropic';
+import {
+  mapGeminiToAnthropic,
+  mapAnthropicToGemini,
+  mapAnthropicChunkToGemini,
+  clearAnthropicThinkingCache,
+} from '../proxy/translators/anthropic';
 
 const toolArgumentCases: Array<{
   name: string;
@@ -56,6 +61,7 @@ beforeEach(() => {
   shared.stateTimestamps.reasoning.clear();
   shared.stateTimestamps.streamCtx.clear();
   shared.stateTimestamps.translatedCalls.clear();
+  clearAnthropicThinkingCache();
 });
 
 // ─── mapGeminiToAnthropic ──────────────────────────────────────────────────
@@ -147,7 +153,7 @@ describe('mapGeminiToAnthropic', () => {
     const result = mapGeminiToAnthropic(body, 'claude-3-5-sonnet-latest');
     expect(result.messages[0].role).toBe('assistant');
     expect(Array.isArray(result.messages[0].content)).toBe(true);
-    const blocks = result.messages[0].content as Array<Record<string, unknown>>;
+    const blocks = result.messages[0].content as unknown as Array<Record<string, unknown>>;
     expect(blocks.some((b) => b.type === 'tool_use')).toBe(true);
     expect(blocks.some((b) => b.type === 'text')).toBe(true);
   });
@@ -167,7 +173,7 @@ describe('mapGeminiToAnthropic', () => {
     const result = mapGeminiToAnthropic(body, 'claude-3-5-sonnet-latest');
     expect(result.messages[0].role).toBe('user');
     expect(Array.isArray(result.messages[0].content)).toBe(true);
-    const blocks = result.messages[0].content as Array<Record<string, unknown>>;
+    const blocks = result.messages[0].content as unknown as Array<Record<string, unknown>>;
     expect(blocks.some((b) => b.type === 'tool_result')).toBe(true);
   });
 
@@ -260,6 +266,214 @@ describe('mapGeminiToAnthropic', () => {
     expect(result.tools).toHaveLength(1);
     expect(result.tools![0].name).toBe('get_weather');
     expect(result.tools![0].input_schema).toBeDefined();
+  });
+
+  it('never leaks unsigned thought parts as visible assistant text (plain or tool-call turns)', () => {
+    const body = {
+      contents: [
+        { role: 'user', parts: [{ text: 'Solve this' }] },
+        {
+          role: 'model',
+          parts: [
+            { text: 'Private chain of thought 1', thought: true },
+            { functionCall: { name: 'search', id: 'call_1', args: { q: 'test' } } },
+          ],
+        },
+        {
+          role: 'user',
+          parts: [{ functionResponse: { name: 'search', id: 'call_1', response: { ok: true } } }],
+        },
+        {
+          role: 'model',
+          parts: [
+            { text: 'Private chain of thought 2', thought: true },
+            { text: 'Final visible answer' },
+          ],
+        },
+      ],
+    };
+    const result = mapGeminiToAnthropic(body, 'claude-3-5-sonnet-latest');
+    expect(result.messages[1]).toEqual({
+      role: 'assistant',
+      content: [{ type: 'tool_use', id: 'call_1', name: 'search', input: { q: 'test' } }],
+    });
+    expect(result.messages[3]).toEqual({
+      role: 'assistant',
+      content: 'Final visible answer',
+    });
+    expect(JSON.stringify(result.messages)).not.toContain('Private chain of thought');
+  });
+
+  it('reconstructs signed thinking and redacted_thinking blocks inline and omits them when thinking is disabled', () => {
+    const body = {
+      contents: [
+        { role: 'user', parts: [{ text: 'Check file' }] },
+        {
+          role: 'model',
+          parts: [
+            { text: 'Step 1. ', thought: true },
+            { text: 'Step 2.', thought: true },
+            { text: '', thought: true, thoughtSignature: 'sig_valid_123' },
+            { thought: true, thoughtSignature: 'redacted_blob_456' },
+            { text: 'Calling tool' },
+            { functionCall: { name: 'read_file', id: 'toolu_1', args: { path: 'a.ts' } } },
+          ],
+        },
+      ],
+    };
+
+    const enabled = mapGeminiToAnthropic(body, 'claude-opus-4');
+    expect(enabled.messages[1]).toEqual({
+      role: 'assistant',
+      content: [
+        { type: 'thinking', thinking: 'Step 1. Step 2.', signature: 'sig_valid_123' },
+        { type: 'redacted_thinking', data: 'redacted_blob_456' },
+        { type: 'text', text: 'Calling tool' },
+        { type: 'tool_use', id: 'toolu_1', name: 'read_file', input: { path: 'a.ts' } },
+      ],
+    });
+
+    const disabled = mapGeminiToAnthropic(
+      { ...body, generationConfig: { thinkingConfig: { thinkingBudget: 0 } } },
+      'claude-opus-4',
+    );
+    expect(disabled.messages[1]).toEqual({
+      role: 'assistant',
+      content: [
+        { type: 'text', text: 'Calling tool' },
+        { type: 'tool_use', id: 'toolu_1', name: 'read_file', input: { path: 'a.ts' } },
+      ],
+    });
+  });
+
+  it('replays signed thinking and redacted_thinking from cache when Turn 2 strips thought parts after tool_use', () => {
+    // Turn 1: non-streaming response with thinking + signature + redacted_thinking + tool_use
+    const turn1 = mapAnthropicToGemini(
+      {
+        content: [
+          { type: 'thinking', thinking: 'Checking disk...', signature: 'sig_turn1' },
+          { type: 'redacted_thinking', data: 'redacted_turn1' },
+          { type: 'tool_use', id: 'toolu_turn1', name: 'search', input: { query: 'a.ts' } },
+        ],
+        stop_reason: 'tool_use',
+      },
+      'claude-opus-4',
+    );
+    expect(turn1.candidates[0].content.parts).toEqual([
+      { text: 'Checking disk...', thought: true, thoughtSignature: 'sig_turn1' },
+      { thought: true, thoughtSignature: 'redacted_turn1' },
+      { functionCall: { name: 'search', args: { query: 'a.ts' }, id: 'toolu_turn1' } },
+    ]);
+
+    // Turn 2: IDE strips thought parts and replays only functionCall + functionResponse
+    const turn2Req = mapGeminiToAnthropic(
+      {
+        contents: [
+          { role: 'user', parts: [{ text: 'Search a.ts' }] },
+          {
+            role: 'model',
+            parts: [{ functionCall: { name: 'search', id: 'toolu_turn1', args: { query: 'a.ts' } } }],
+          },
+          {
+            role: 'user',
+            parts: [{ functionResponse: { name: 'search', id: 'toolu_turn1', response: { content: 'ok' } } }],
+          },
+        ],
+      },
+      'claude-opus-4',
+    );
+    expect(turn2Req.messages[1]).toEqual({
+      role: 'assistant',
+      content: [
+        { type: 'thinking', thinking: 'Checking disk...', signature: 'sig_turn1' },
+        { type: 'redacted_thinking', data: 'redacted_turn1' },
+        { type: 'tool_use', id: 'toolu_turn1', name: 'search', input: { query: 'a.ts' } },
+      ],
+    });
+  });
+
+  it('does not replay another conversation\'s signed thinking blocks', () => {
+    mapAnthropicToGemini(
+      {
+        content: [
+          { type: 'thinking', thinking: 'Private thought A', signature: 'sig_scope_a' },
+          { type: 'tool_use', id: 'toolu_shared_id', name: 'search', input: { query: 'a.ts' } },
+        ],
+        stop_reason: 'tool_use',
+      },
+      'conversation-A',
+    );
+    const turn2 = {
+      contents: [
+        { role: 'user', parts: [{ text: 'Search a.ts' }] },
+        { role: 'model', parts: [{ functionCall: { name: 'search', id: 'toolu_shared_id', args: { query: 'a.ts' } } }] },
+        { role: 'user', parts: [{ functionResponse: { name: 'search', id: 'toolu_shared_id', response: {} } }] },
+      ],
+    };
+    const sameScope = mapGeminiToAnthropic(turn2, 'claude-opus-4', 'conversation-A');
+    expect((sameScope.messages[1].content as unknown as Array<Record<string, unknown>>)[0]).toMatchObject({
+      type: 'thinking', signature: 'sig_scope_a',
+    });
+    const otherScope = mapGeminiToAnthropic(turn2, 'claude-opus-4', 'conversation-B');
+    expect((otherScope.messages[1].content as unknown as Array<Record<string, unknown>>).some((b) => b.type === 'thinking')).toBe(false);
+  });
+
+  it('merges consecutive same-role messages (including tool_result followed by user turn) and omits empty turns', () => {
+    const body = {
+      contents: [
+        { role: 'user', parts: [{ text: 'First prompt' }] },
+        { role: 'user', parts: [{ text: '' }] },
+        { role: 'user', parts: [{ text: 'Second prompt' }] },
+        {
+          role: 'model',
+          parts: [{ functionCall: { name: 'search', id: 'call_merge', args: { q: 'x' } } }],
+        },
+        {
+          role: 'user',
+          parts: [{ functionResponse: { name: 'search', id: 'call_merge', response: { found: true } } }],
+        },
+        { role: 'user', parts: [{ text: 'Follow up after tool result' }] },
+        { role: 'model', parts: [{ text: 'Only unsigned thought', thought: true }] },
+        { role: 'user', parts: [{ text: 'Another user line' }] },
+      ],
+    };
+    const result = mapGeminiToAnthropic(body, 'claude-3-5-sonnet-latest');
+    expect(result.messages).toEqual([
+      { role: 'user', content: 'First prompt\nSecond prompt' },
+      { role: 'assistant', content: [{ type: 'tool_use', id: 'call_merge', name: 'search', input: { q: 'x' } }] },
+      {
+        role: 'user',
+        content: [
+          { type: 'tool_result', tool_use_id: 'call_merge', content: '{"found":true}' },
+          { type: 'text', text: 'Follow up after tool result' },
+          { type: 'text', text: 'Another user line' },
+        ],
+      },
+    ]);
+  });
+
+  it('safely defaults malformed string functionCall args to {} instead of throwing', () => {
+    const body = {
+      contents: [
+        {
+          role: 'model',
+          parts: [
+            {
+              functionCall: {
+                name: 'broken_tool',
+                id: 'call_bad_json',
+                args: '{invalid json' as unknown as Record<string, unknown>,
+              },
+            },
+          ],
+        },
+      ],
+    };
+    const result = mapGeminiToAnthropic(body, 'claude-3-5-sonnet-latest');
+    expect(result.messages[0]).toEqual({
+      role: 'assistant',
+      content: [{ type: 'tool_use', id: 'call_bad_json', name: 'broken_tool', input: {} }],
+    });
   });
 });
 
@@ -562,5 +776,134 @@ describe('mapAnthropicChunkToGemini', () => {
     const r2 = mapAnthropicChunkToGemini(chunk2, 'claude-3-5-sonnet-latest');
     expect(r1).not.toBeNull();
     expect(r2).not.toBeNull();
+  });
+
+  it('captures streaming thinking + signature_delta + redacted_thinking and replays on Turn 2', () => {
+    const streamKey = 'stream-thinking-tool';
+    expect(
+      mapAnthropicChunkToGemini(
+        { type: 'content_block_start', index: 0, content_block: { type: 'thinking', thinking: '' } },
+        'claude-opus-4',
+        streamKey,
+      ),
+    ).toBeNull();
+    expect(
+      mapAnthropicChunkToGemini(
+        { type: 'content_block_delta', index: 0, delta: { type: 'thinking_delta', thinking: 'Inspecting ' } },
+        'claude-opus-4',
+        streamKey,
+      )?.content.parts,
+    ).toEqual([{ text: 'Inspecting ', thought: true }]);
+    expect(
+      mapAnthropicChunkToGemini(
+        { type: 'content_block_delta', index: 0, delta: { type: 'thinking_delta', thinking: 'logs.' } },
+        'claude-opus-4',
+        streamKey,
+      )?.content.parts,
+    ).toEqual([{ text: 'logs.', thought: true }]);
+    expect(
+      mapAnthropicChunkToGemini(
+        { type: 'content_block_delta', index: 0, delta: { type: 'signature_delta', signature: 'sig_stream_' } },
+        'claude-opus-4',
+        streamKey,
+      ),
+    ).toBeNull();
+    expect(
+      mapAnthropicChunkToGemini(
+        { type: 'content_block_delta', index: 0, delta: { type: 'signature_delta', signature: 'final' } },
+        'claude-opus-4',
+        streamKey,
+      ),
+    ).toBeNull();
+    expect(
+      mapAnthropicChunkToGemini({ type: 'content_block_stop', index: 0 }, 'claude-opus-4', streamKey)?.content.parts,
+    ).toEqual([{ text: '', thought: true, thoughtSignature: 'sig_stream_final' }]);
+    expect(
+      mapAnthropicChunkToGemini(
+        { type: 'content_block_start', index: 1, content_block: { type: 'redacted_thinking', data: 'redacted_s1' } },
+        'claude-opus-4',
+        streamKey,
+      )?.content.parts,
+    ).toEqual([{ thought: true, thoughtSignature: 'redacted_s1' }]);
+    expect(
+      mapAnthropicChunkToGemini(
+        {
+          type: 'content_block_start',
+          index: 2,
+          content_block: { type: 'tool_use', id: 'toolu_stream_1', name: 'search', input: {} },
+        },
+        'claude-opus-4',
+        streamKey,
+      ),
+    ).toBeNull();
+    expect(
+      mapAnthropicChunkToGemini(
+        { type: 'content_block_delta', index: 2, delta: { type: 'input_json_delta', partial_json: '{"q":"err"}' } },
+        'claude-opus-4',
+        streamKey,
+      ),
+    ).toBeNull();
+
+    const toolDelta = mapAnthropicChunkToGemini(
+      { type: 'message_delta', delta: { stop_reason: 'tool_use' } },
+      'claude-opus-4',
+      streamKey,
+    );
+    expect(toolDelta?.finishReason).toBe('STOP');
+    expect(toolDelta?.content.parts).toEqual([
+      { functionCall: { name: 'search', args: { q: 'err' }, id: 'toolu_stream_1' } },
+    ]);
+
+    // Subsequent message_stop must NOT emit a duplicate finishReason: 'STOP'
+    expect(mapAnthropicChunkToGemini({ type: 'message_stop' }, 'claude-opus-4', streamKey)).toBeNull();
+    expect(shared.activeStreamContexts.has(streamKey)).toBe(false);
+
+    // Turn 2 replay works even if IDE dropped thought parts completely
+    const turn2 = mapGeminiToAnthropic(
+      {
+        contents: [
+          { role: 'user', parts: [{ text: 'Check logs' }] },
+          {
+            role: 'model',
+            parts: [{ functionCall: { name: 'search', id: 'toolu_stream_1', args: { q: 'err' } } }],
+          },
+          {
+            role: 'user',
+            parts: [{ functionResponse: { name: 'search', id: 'toolu_stream_1', response: { lines: 0 } } }],
+          },
+        ],
+      },
+      'claude-opus-4',
+      streamKey,
+    );
+    expect(turn2.messages[1]).toEqual({
+      role: 'assistant',
+      content: [
+        { type: 'thinking', thinking: 'Inspecting logs.', signature: 'sig_stream_final' },
+        { type: 'redacted_thinking', data: 'redacted_s1' },
+        { type: 'tool_use', id: 'toolu_stream_1', name: 'search', input: { q: 'err' } },
+      ],
+    });
+  });
+
+  it('maps streaming message_delta stop_reason max_tokens to MAX_TOKENS on message_stop', () => {
+    const streamKey = 'stream-max-tokens';
+    expect(
+      mapAnthropicChunkToGemini(
+        { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'Truncated' } },
+        'claude-3-5-sonnet-latest',
+        streamKey,
+      )?.content.parts,
+    ).toEqual([{ text: 'Truncated' }]);
+    expect(
+      mapAnthropicChunkToGemini(
+        { type: 'message_delta', delta: { stop_reason: 'max_tokens' } },
+        'claude-3-5-sonnet-latest',
+        streamKey,
+      ),
+    ).toBeNull();
+    const stop = mapAnthropicChunkToGemini({ type: 'message_stop' }, 'claude-3-5-sonnet-latest', streamKey);
+    expect(stop).toEqual({ content: { parts: [], role: 'model' }, finishReason: 'MAX_TOKENS', index: 0 });
+    expect(shared.activeStreamContexts.has(streamKey)).toBe(false);
   });
 });

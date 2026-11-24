@@ -270,7 +270,14 @@ export class Router {
     // just the default provider, so `fallback` becomes the rest of the priority chain.
     // If you want to disable the global fallback (strict whitelist), set
     // DISABLE_GLOBAL_FALLBACK=1 in the environment.
-    const fallback = providerIds.filter(id => !tried.has(id) && this.adapters.has(id));
+    // DISABLE_GLOBAL_FALLBACK=1 enforces a strict whitelist: only the
+    // explicitly configured candidate providers may be used. Computing the
+    // fallback unconditionally made the second pass fail open to every other
+    // enabled provider, bypassing the whitelist after the first pass failed.
+    const globalFallbackDisabled = process.env.DISABLE_GLOBAL_FALLBACK === '1';
+    const fallback = globalFallbackDisabled
+      ? []
+      : providerIds.filter(id => !tried.has(id) && this.adapters.has(id));
     if (fallback.length > 0) {
       logger.warn(`[router] All explicit providers failed for ${model} — falling back to: ${fallback.join(' → ')} (last error: ${lastError})`);
       const fallbackRetries = Math.min(2, this.options.retries);

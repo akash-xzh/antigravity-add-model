@@ -8,7 +8,9 @@ import {
   type GoogleAccountLease,
 } from '../googleAccounts';
 import { classifyGoogleRateLimit } from '../googlePoolPolicy';
-import { forwardNativeGeneration, type NativeSubagentRouting } from './nativeSubagentResponse';
+import { recordConversationTiming } from './conversationUsage';
+import { forwardNativeGeneration, wasForwardedSuccessfully, type NativeSubagentRouting } from './nativeSubagentResponse';
+import { nativeConversationId } from './subagentRouting';
 
 const ERROR_LIMIT = 64 * 1024;
 type PoolModel = Pick<CustomModel, 'name' | 'provider' | 'externalModelName' | 'googleAccounts' | 'googlePool'> &
@@ -99,20 +101,23 @@ export async function attemptGooglePoolFailover(
   const originalToken = String(req.headers.authorization || '')
     .replace(/^Bearer\s+/i, '')
     .trim();
-  const failingAccount = pool.googleAccounts!.find((account) => account.accessToken === originalToken);
+  const projectMatches =
+    typeof body.project === 'string' && body.project
+      ? pool.googleAccounts!.filter((account) => account.project === body.project)
+      : [];
+  const failingAccount =
+    pool.googleAccounts!.find((account) => account.accessToken === originalToken) ||
+    (projectMatches.length === 1 ? projectMatches[0] : undefined);
   const decision = classifyGoogleRateLimit(errorBody, errorRes.headers['retry-after']);
+  const poolEndpoint = pool.apiUrl || cloudCodeOrigin;
   if (failingAccount)
     recordGoogleAccountFailure(
-      {
-        ...failingAccount,
-        project: typeof body.project === 'string' ? body.project : undefined,
-        cloudCodeEndpoint: undefined,
-      },
+      failingAccount,
       errorRes.statusCode!,
       decision.retryAfterMs ?? pool.googlePool?.cooldownMs,
       upstreamModel,
       decision.reason,
-      cloudCodeOrigin,
+      poolEndpoint,
     );
   let candidates = pool.googleAccounts!.filter(
     (account) => account.enabled !== false && account.id !== failingAccount?.id,
@@ -212,13 +217,18 @@ export async function attemptGooglePoolFailover(
       }
       const selectedLease = lease;
       const started = Date.now();
+      const conversationId = nativeConversationId(reqBody);
       const handled = await new Promise<boolean>((resolve) => {
         let settled = false;
         let request: http.ClientRequest | undefined;
         let response: http.IncomingMessage | undefined;
+        let restoreTap: (() => void) | undefined;
         const finish = (handled: boolean, result: Parameters<GoogleAccountLease['release']>[0]) => {
           if (settled) return;
           settled = true;
+          restoreTap?.();
+          restoreTap = undefined;
+          request?.setTimeout(0);
           controller.signal.removeEventListener('abort', abort);
           selectedLease.release(result);
           resolve(handled);
@@ -270,8 +280,10 @@ export async function attemptGooglePoolFailover(
                   const limited = isGoogleQuotaFailure(status, text);
                   const limit = limited ? classifyGoogleRateLimit(text, upstream.headers['retry-after']) : undefined;
                   if (status === 400 && !limited) {
-                    res.writeHead(status, options.forwardingHeaders(upstream.headers));
-                    res.end(Buffer.concat(chunks));
+                    if (!res.headersSent && !res.writableEnded && !res.destroyed) {
+                      res.writeHead(status, options.forwardingHeaders(upstream.headers));
+                      res.end(Buffer.concat(chunks));
+                    }
                     finish(true, { status });
                     return;
                   }
@@ -279,18 +291,61 @@ export async function attemptGooglePoolFailover(
                 });
                 return;
               }
-              const success = () => finish(true, { status, latencyMs: Date.now() - started });
+              // Once a failover upstream commits 200 OK headers, clear the failover acquisition
+              // deadline so long streams are not hard-killed after 60s; use an idle timeout instead.
+              clearTimeout(timeout);
+              const streamIdleMs = options.timeoutMs ?? pool.timeout ?? 60_000;
+              request?.setTimeout(streamIdleMs, fail);
+
+              const isStream =
+                target.pathname.includes('streamGenerateContent') || target.searchParams.get('alt') === 'sse';
+              let firstAt = 0;
+              let lastAt = 0;
+              if (isStream && status >= 200 && status < 300 && conversationId) {
+                const origWrite = res.write.bind(res) as typeof res.write;
+                const origEnd = res.end.bind(res) as typeof res.end;
+                res.write = ((chunk: unknown, ...args: unknown[]) => {
+                  const now = Date.now();
+                  if (!firstAt) firstAt = now;
+                  lastAt = now;
+                  return (origWrite as (...a: unknown[]) => boolean)(chunk, ...args);
+                }) as typeof res.write;
+                res.end = ((chunk?: unknown, ...args: unknown[]) => {
+                  if (chunk && typeof chunk !== 'function') {
+                    const now = Date.now();
+                    if (!firstAt) firstAt = now;
+                    lastAt = now;
+                  }
+                  return (origEnd as (...a: unknown[]) => http.ServerResponse)(chunk, ...args);
+                }) as typeof res.end;
+                restoreTap = () => {
+                  res.write = origWrite;
+                  res.end = origEnd;
+                };
+              }
+
+              const success = () => {
+                if (isStream && status >= 200 && status < 300 && conversationId) {
+                  recordConversationTiming(conversationId, {
+                    ttftMs: firstAt ? firstAt - started : undefined,
+                    decodeMs: firstAt && lastAt > firstAt ? lastAt - firstAt : undefined,
+                  });
+                }
+                finish(true, { status, latencyMs: Date.now() - started });
+              };
               if (nativeSubagent) {
-                void forwardNativeGeneration(
-                  upstream,
-                  res,
-                  nativeSubagent,
-                  target.pathname.includes('streamGenerateContent') || target.searchParams.get('alt') === 'sse',
-                ).then(success, fail);
+                void forwardNativeGeneration(upstream, res, nativeSubagent, isStream).then(
+                  (result) => { if (wasForwardedSuccessfully(result)) success(); else fail(); },
+                  fail,
+                );
               } else {
                 upstream.once('end', success);
-                res.writeHead(status, options.forwardingHeaders(upstream.headers));
-                upstream.pipe(res);
+                if (!res.headersSent && !res.writableEnded && !res.destroyed) {
+                  res.writeHead(status, options.forwardingHeaders(upstream.headers));
+                  upstream.pipe(res);
+                } else {
+                  fail();
+                }
               }
             },
           );

@@ -40,7 +40,9 @@ const http = __importStar(require("node:http"));
 const https = __importStar(require("node:https"));
 const googleAccounts_1 = require("../googleAccounts");
 const googlePoolPolicy_1 = require("../googlePoolPolicy");
+const conversationUsage_1 = require("./conversationUsage");
 const nativeSubagentResponse_1 = require("./nativeSubagentResponse");
+const subagentRouting_1 = require("./subagentRouting");
 const ERROR_LIMIT = 64 * 1024;
 function parsedRequest(body) {
     try {
@@ -104,14 +106,15 @@ async function attemptGooglePoolFailover(req, res, reqBody, errorRes, errorBody,
     const originalToken = String(req.headers.authorization || '')
         .replace(/^Bearer\s+/i, '')
         .trim();
-    const failingAccount = pool.googleAccounts.find((account) => account.accessToken === originalToken);
+    const projectMatches = typeof body.project === 'string' && body.project
+        ? pool.googleAccounts.filter((account) => account.project === body.project)
+        : [];
+    const failingAccount = pool.googleAccounts.find((account) => account.accessToken === originalToken) ||
+        (projectMatches.length === 1 ? projectMatches[0] : undefined);
     const decision = (0, googlePoolPolicy_1.classifyGoogleRateLimit)(errorBody, errorRes.headers['retry-after']);
+    const poolEndpoint = pool.apiUrl || cloudCodeOrigin;
     if (failingAccount)
-        (0, googleAccounts_1.recordGoogleAccountFailure)({
-            ...failingAccount,
-            project: typeof body.project === 'string' ? body.project : undefined,
-            cloudCodeEndpoint: undefined,
-        }, errorRes.statusCode, decision.retryAfterMs ?? pool.googlePool?.cooldownMs, upstreamModel, decision.reason, cloudCodeOrigin);
+        (0, googleAccounts_1.recordGoogleAccountFailure)(failingAccount, errorRes.statusCode, decision.retryAfterMs ?? pool.googlePool?.cooldownMs, upstreamModel, decision.reason, poolEndpoint);
     let candidates = pool.googleAccounts.filter((account) => account.enabled !== false && account.id !== failingAccount?.id);
     if (!candidates.length)
         return false;
@@ -200,14 +203,19 @@ async function attemptGooglePoolFailover(req, res, reqBody, errorRes, errorBody,
             }
             const selectedLease = lease;
             const started = Date.now();
+            const conversationId = (0, subagentRouting_1.nativeConversationId)(reqBody);
             const handled = await new Promise((resolve) => {
                 let settled = false;
                 let request;
                 let response;
+                let restoreTap;
                 const finish = (handled, result) => {
                     if (settled)
                         return;
                     settled = true;
+                    restoreTap?.();
+                    restoreTap = undefined;
+                    request?.setTimeout(0);
                     controller.signal.removeEventListener('abort', abort);
                     selectedLease.release(result);
                     resolve(handled);
@@ -263,8 +271,10 @@ async function attemptGooglePoolFailover(req, res, reqBody, errorRes, errorBody,
                                 const limited = isGoogleQuotaFailure(status, text);
                                 const limit = limited ? (0, googlePoolPolicy_1.classifyGoogleRateLimit)(text, upstream.headers['retry-after']) : undefined;
                                 if (status === 400 && !limited) {
-                                    res.writeHead(status, options.forwardingHeaders(upstream.headers));
-                                    res.end(Buffer.concat(chunks));
+                                    if (!res.headersSent && !res.writableEnded && !res.destroyed) {
+                                        res.writeHead(status, options.forwardingHeaders(upstream.headers));
+                                        res.end(Buffer.concat(chunks));
+                                    }
                                     finish(true, { status });
                                     return;
                                 }
@@ -272,14 +282,62 @@ async function attemptGooglePoolFailover(req, res, reqBody, errorRes, errorBody,
                             });
                             return;
                         }
-                        const success = () => finish(true, { status, latencyMs: Date.now() - started });
+                        // Once a failover upstream commits 200 OK headers, clear the failover acquisition
+                        // deadline so long streams are not hard-killed after 60s; use an idle timeout instead.
+                        clearTimeout(timeout);
+                        const streamIdleMs = options.timeoutMs ?? pool.timeout ?? 60000;
+                        request?.setTimeout(streamIdleMs, fail);
+                        const isStream = target.pathname.includes('streamGenerateContent') || target.searchParams.get('alt') === 'sse';
+                        let firstAt = 0;
+                        let lastAt = 0;
+                        if (isStream && status >= 200 && status < 300 && conversationId) {
+                            const origWrite = res.write.bind(res);
+                            const origEnd = res.end.bind(res);
+                            res.write = ((chunk, ...args) => {
+                                const now = Date.now();
+                                if (!firstAt)
+                                    firstAt = now;
+                                lastAt = now;
+                                return origWrite(chunk, ...args);
+                            });
+                            res.end = ((chunk, ...args) => {
+                                if (chunk && typeof chunk !== 'function') {
+                                    const now = Date.now();
+                                    if (!firstAt)
+                                        firstAt = now;
+                                    lastAt = now;
+                                }
+                                return origEnd(chunk, ...args);
+                            });
+                            restoreTap = () => {
+                                res.write = origWrite;
+                                res.end = origEnd;
+                            };
+                        }
+                        const success = () => {
+                            if (isStream && status >= 200 && status < 300 && conversationId) {
+                                (0, conversationUsage_1.recordConversationTiming)(conversationId, {
+                                    ttftMs: firstAt ? firstAt - started : undefined,
+                                    decodeMs: firstAt && lastAt > firstAt ? lastAt - firstAt : undefined,
+                                });
+                            }
+                            finish(true, { status, latencyMs: Date.now() - started });
+                        };
                         if (nativeSubagent) {
-                            void (0, nativeSubagentResponse_1.forwardNativeGeneration)(upstream, res, nativeSubagent, target.pathname.includes('streamGenerateContent') || target.searchParams.get('alt') === 'sse').then(success, fail);
+                            void (0, nativeSubagentResponse_1.forwardNativeGeneration)(upstream, res, nativeSubagent, isStream).then((result) => { if ((0, nativeSubagentResponse_1.wasForwardedSuccessfully)(result))
+                                success();
+                            else
+                                fail(); }, fail);
                         }
                         else {
                             upstream.once('end', success);
-                            res.writeHead(status, options.forwardingHeaders(upstream.headers));
-                            upstream.pipe(res);
+                            if (!res.headersSent && !res.writableEnded && !res.destroyed) {
+                                res.writeHead(status, options.forwardingHeaders(upstream.headers));
+                                upstream.pipe(res);
+                            }
+                            else {
+                                fail();
+                            }
                         }
                     });
                     request.once('error', fail);

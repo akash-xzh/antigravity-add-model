@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -21,6 +21,10 @@ import {
   isRecentModel,
   getRecentModels,
   sortCustomModels,
+  loadDisplaySettings,
+  saveDisplaySettings,
+  isStatusEmojiEnabled,
+  setStatusEmojiEnabled,
 } from '../proxy/modelHealth';
 import { catalogDisplayNames } from '../proxy/modelCatalog';
 import type { CustomModel } from '../proxy';
@@ -289,6 +293,165 @@ describe('Model Health Checker & Status Signals', () => {
 
       expect(labels.get('custom-1')).toBe('⭐ 🟢 • Claude 3.7');
       expect(labels.get('custom-2')).toBe('⭐ 🔴 • DeepSeek R1');
+    });
+
+    it('returns clean names without status emojis or stars when showStatusEmoji is false', () => {
+      recordModelSuccess('custom-1', 40);
+      recordRecentModel('custom-1');
+      recordModelFailure('custom-2', 'Server Error');
+
+      const models = [
+        { name: 'custom-1', displayName: 'Claude 3.7' },
+        { name: 'custom-2', displayName: 'DeepSeek R1' },
+      ];
+
+      // Explicit flag
+      const labels = catalogDisplayNames(models, {}, getCachedHealthMap(), getRecentModels(), false);
+      expect(labels.get('custom-1')).toBe('Claude 3.7');
+      expect(labels.get('custom-2')).toBe('DeepSeek R1');
+    });
+
+    it('respects display settings toggle persisted to disk', () => {
+      const models = [
+        { name: 'custom-1', displayName: 'Claude 3.7' },
+      ];
+
+      expect(isStatusEmojiEnabled()).toBe(true);
+
+      // Disable emoji status
+      setStatusEmojiEnabled(false);
+      expect(isStatusEmojiEnabled()).toBe(false);
+
+      const labelsDisabled = catalogDisplayNames(models, {}, getCachedHealthMap(), getRecentModels());
+      expect(labelsDisabled.get('custom-1')).toBe('Claude 3.7');
+
+      // Re-enable emoji status
+      setStatusEmojiEnabled(true);
+      expect(isStatusEmojiEnabled()).toBe(true);
+
+      const labelsEnabled = catalogDisplayNames(models, {}, getCachedHealthMap(), getRecentModels());
+      expect(labelsEnabled.get('custom-1')).toBe('🟢 • Claude 3.7');
+    });
+  });
+
+  describe('Display Settings Persistence', () => {
+    it('defaults to showStatusEmoji=true when no settings file exists', () => {
+      const settings = loadDisplaySettings(tempDir);
+      expect(settings.showStatusEmoji).toBe(true);
+      expect(isStatusEmojiEnabled(tempDir)).toBe(true);
+    });
+
+    it('saves and reloads display settings from disk', () => {
+      saveDisplaySettings({ showStatusEmoji: false }, tempDir);
+      const reloaded = loadDisplaySettings(tempDir);
+      expect(reloaded.showStatusEmoji).toBe(false);
+      expect(isStatusEmojiEnabled(tempDir)).toBe(false);
+    });
+
+    it('formatHealthDisplayName respects showStatusEmoji=false', () => {
+      const res = formatHealthDisplayName('My Cool Model', { status: 'healthy', checkedAt: Date.now() }, true, false);
+      expect(res).toBe('My Cool Model');
+    });
+
+    it('caches display settings per filePath and invalidates on size change', () => {
+      const otherDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-health-other-'));
+      try {
+        saveDisplaySettings({ showStatusEmoji: false }, tempDir);
+        saveDisplaySettings({ showStatusEmoji: true }, otherDir);
+        expect(loadDisplaySettings(tempDir).showStatusEmoji).toBe(false);
+        expect(loadDisplaySettings(otherDir).showStatusEmoji).toBe(true);
+        expect(loadDisplaySettings(tempDir).showStatusEmoji).toBe(false);
+      } finally {
+        fs.rmSync(otherDir, { recursive: true, force: true });
+      }
+    });
+  });
+
+  describe('Provider auth headers, batched writes & catalog deduplication', () => {
+    it('sends provider-appropriate auth headers for OpenAI, Anthropic, and Google', async () => {
+      const seen: { path: string; headers: http.IncomingHttpHeaders }[] = [];
+      const server = http.createServer((req, res) => {
+        seen.push({ path: req.url || '', headers: req.headers });
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end('{}');
+      });
+      await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()));
+      const port = (server.address() as any).port;
+      try {
+        await pingCustomModel({
+          name: 'models/oai',
+          displayName: 'OAI',
+          description: '',
+          provider: 'openai',
+          apiUrl: `http://127.0.0.1:${port}/openai`,
+          apiKey: 'oai-key',
+          externalModelName: 'gpt-4o',
+        });
+        await pingCustomModel({
+          name: 'models/ant',
+          displayName: 'ANT',
+          description: '',
+          provider: 'anthropic',
+          apiUrl: `http://127.0.0.1:${port}/anthropic`,
+          apiKey: 'ant-key',
+          externalModelName: 'claude-3-7',
+        });
+        await pingCustomModel({
+          name: 'models/goog',
+          displayName: 'GOOG',
+          description: '',
+          provider: 'google',
+          apiUrl: `http://127.0.0.1:${port}/google`,
+          apiKey: 'goog-key',
+          externalModelName: 'gemini-2.5-pro',
+        });
+
+        expect(seen[0].headers.authorization).toBe('Bearer oai-key');
+        expect(seen[1].headers['x-api-key']).toBe('ant-key');
+        expect(seen[1].headers['anthropic-version']).toBe('2023-06-01');
+        expect(seen[1].headers.authorization).toBeUndefined();
+        expect(seen[2].headers['x-goog-api-key']).toBe('goog-key');
+        expect(seen[2].headers.authorization).toBeUndefined();
+      } finally {
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+      }
+    });
+
+    it('batches recent + health into a single atomic disk write and cleans up .tmp on rename failure', () => {
+      const renameSpy = vi.spyOn(fs, 'renameSync');
+      recordModelSuccess('models/single-write', 80);
+      expect(renameSpy).toHaveBeenCalledTimes(1);
+      renameSpy.mockRestore();
+
+      // Simulate persistent rename failure and ensure .tmp file is cleaned up
+      const failRename = vi.spyOn(fs, 'renameSync').mockImplementation(() => {
+        throw Object.assign(new Error('disk error'), { code: 'EIO' });
+      });
+      try {
+        saveHealthCache(tempDir);
+      } finally {
+        failRename.mockRestore();
+      }
+      const leftoverTmp = fs.readdirSync(tempDir).filter((f) => f.endsWith('.tmp'));
+      expect(leftoverTmp).toEqual([]);
+    });
+
+    it('deduplicates catalogDisplayNames after stripping status and recent emojis', () => {
+      const models = [
+        { name: 'models/a', displayName: 'GPT-4o' },
+        { name: 'models/b', displayName: '🟢 • GPT-4o' },
+        { name: 'models/c', displayName: '⭐ Gemini 2.5 Pro' },
+      ];
+      const upstream = { models: { native: { displayName: 'Gemini 2.5 Pro' } } };
+
+      const withoutEmoji = catalogDisplayNames(models, upstream, getCachedHealthMap(), [], false);
+      expect(new Set(withoutEmoji.values()).size).toBe(3);
+      expect(withoutEmoji.get('models/a')).not.toBe(withoutEmoji.get('models/b'));
+      expect(withoutEmoji.get('models/c')).not.toBe('Gemini 2.5 Pro');
+
+      const withEmoji = catalogDisplayNames(models, upstream, getCachedHealthMap(), [], true);
+      expect(new Set(withEmoji.values()).size).toBe(3);
+      expect(withEmoji.get('models/a')).not.toBe(withEmoji.get('models/b'));
     });
   });
 });

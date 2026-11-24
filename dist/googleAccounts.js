@@ -65,9 +65,19 @@ const tokenCache = new Map();
 const refreshing = new Map();
 const poolStates = new Map();
 const sticky = new Map();
+let globalResetEpoch = 0;
+const accountResetEpochs = new Map();
 let selectionOrder = 0;
 const MEASUREMENT_TTL_MS = 10 * 60000;
 let persistAccount;
+function resetEpochFor(id) {
+    return Math.max(globalResetEpoch, accountResetEpochs.get(id) ?? 0);
+}
+function canRefreshAccount(account) {
+    return (Boolean(account.refreshToken) &&
+        Boolean(account.clientId) &&
+        !/^(enc:|fallback:|local-gcm:|DECRYPTION_FAILED)/.test(account.refreshToken));
+}
 function configureGoogleAccountPersistence(callback) {
     persistAccount = callback;
 }
@@ -260,29 +270,30 @@ async function postJson(url, headers, body, signal) {
     });
 }
 /** Refresh requests are coalesced and cached. Endpoint override is restricted to localhost fixtures. */
-async function refreshGoogleAccount(account, tokenEndpointOverride = 'https://oauth2.googleapis.com/token') {
+async function refreshGoogleAccount(account, tokenEndpointOverride = 'https://oauth2.googleapis.com/token', options = {}) {
     for (const [key, cached] of tokenCache)
         if (cached.expiresAt && cached.expiresAt < Date.now())
             tokenCache.delete(key);
     const key = accountKey(account);
-    const cached = tokenCache.get(key);
-    if (cached && validAccess(cached))
-        return {
-            ...account,
-            accessToken: cached.accessToken,
-            refreshToken: cached.refreshToken,
-            expiresAt: cached.expiresAt,
-        };
-    if (validAccess(account))
-        return { ...account };
-    if (!account.refreshToken ||
-        !account.clientId ||
-        /^(enc:|fallback:|local-gcm:|DECRYPTION_FAILED)/.test(account.refreshToken)) {
+    const startEpoch = resetEpochFor(account.id);
+    if (!options.force) {
+        const cached = tokenCache.get(key);
+        if (cached && validAccess(cached))
+            return {
+                ...account,
+                accessToken: cached.accessToken,
+                refreshToken: cached.refreshToken,
+                expiresAt: cached.expiresAt,
+            };
+        if (validAccess(account))
+            return { ...account };
+    }
+    if (!canRefreshAccount(account)) {
         throw new GoogleAccountError('This account requires a valid access token or a refresh token and your OAuth client ID.', 401);
     }
     const active = refreshing.get(key);
-    if (active) {
-        const updated = await active;
+    if (active && active.epoch === startEpoch && !options.force) {
+        const updated = await active.promise;
         // Sharing a token refresh must not replace this model's prepared project or service route.
         return {
             ...account,
@@ -291,6 +302,7 @@ async function refreshGoogleAccount(account, tokenEndpointOverride = 'https://oa
             expiresAt: updated.expiresAt,
         };
     }
+    let entry;
     const refresh = (async () => {
         const endpoint = checkedEndpoint(tokenEndpointOverride, ['oauth2.googleapis.com']);
         const body = new URLSearchParams({
@@ -311,11 +323,18 @@ async function refreshGoogleAccount(account, tokenEndpointOverride = 'https://oa
         const updated = { ...account, accessToken: data.access_token, expiresAt: Date.now() + expiresIn * 1000 };
         if (typeof data.refresh_token === 'string' && data.refresh_token)
             updated.refreshToken = data.refresh_token;
-        tokenCache.set(key, updated);
-        tokenCache.set(accountKey(updated), updated);
+        // Ignore results from refreshes that started before resetGoogleAccountState().
+        if (resetEpochFor(account.id) === startEpoch) {
+            tokenCache.set(key, updated);
+            tokenCache.set(accountKey(updated), updated);
+        }
         return updated;
-    })().finally(() => refreshing.delete(key));
-    refreshing.set(key, refresh);
+    })().finally(() => {
+        if (refreshing.get(key) === entry)
+            refreshing.delete(key);
+    });
+    entry = { promise: refresh, epoch: startEpoch, accountId: account.id };
+    refreshing.set(key, entry);
     return refresh;
 }
 /** Explicit quota refresh; never infers subscription eligibility or fabricates an available quota. */
@@ -462,6 +481,11 @@ async function fetchGoogleQuota(account, baseURL, options = {}) {
                 ...(groupName ? { groupName } : {}),
                 remainingFraction: bFraction,
                 resetTime: bReset,
+                ...(typeof bucket.window === 'string' && bucket.window.trim() ? { window: bucket.window.trim() } : {}),
+                ...(typeof bucket.description === 'string' && bucket.description.trim()
+                    ? { description: bucket.description.trim() }
+                    : {}),
+                ...(bucket.disabled === true ? { disabled: true } : {}),
                 scope: group.quotaScope === 'user' || bucket.quotaScope === 'user' || !account.project ? 'user' : 'project',
             };
             const explicitId = typeof bucket.bucketId === 'string' ? bucket.bucketId : bucket.id;
@@ -486,6 +510,9 @@ async function fetchGoogleQuota(account, baseURL, options = {}) {
             groups.push({
                 name: groupName || 'Models',
                 displayName: groupName || 'Models',
+                ...(typeof group.description === 'string' && group.description.trim()
+                    ? { description: group.description.trim() }
+                    : {}),
                 buckets: groupBuckets,
             });
         }
@@ -600,7 +627,7 @@ async function fetchGoogleModels(account, baseURL) {
     }
     return [...found.values()];
 }
-async function acquireGoogleAccount(modelName, accounts, options = {}, requestIdentity, cooldownScope = modelName, endpoint) {
+async function acquireGoogleAccount(modelName, accounts, options = {}, requestIdentity, cooldownScope = modelName, endpoint, tokenEndpointOverride) {
     const attempted = new Set();
     const identityKey = requestIdentity
         ? (0, crypto_1.createHash)('sha256').update(`${modelName}\0${requestIdentity}`).digest('hex')
@@ -648,11 +675,18 @@ async function acquireGoogleAccount(modelName, accounts, options = {}, requestId
         state.inFlight += 1;
         state.lastUsed = ++selectionOrder;
         try {
-            const updated = await refreshGoogleAccount(selected);
+            const force = Boolean(state.needsForceRefresh);
+            state.needsForceRefresh = false;
+            const updated = await refreshGoogleAccount(selected, tokenEndpointOverride, { force });
             if (updated.accessToken !== selected.accessToken ||
                 updated.refreshToken !== selected.refreshToken ||
                 updated.expiresAt !== selected.expiresAt) {
-                await persistAccount?.(modelName, updated, selected);
+                try {
+                    await persistAccount?.(modelName, updated, selected);
+                }
+                catch {
+                    // Transient disk persistence errors must not discard a valid refreshed token or poison the account.
+                }
             }
             if (identityKey)
                 sticky.set(identityKey, { accountKey: key, accountId: selected.id, at: Date.now() });
@@ -672,6 +706,8 @@ async function acquireGoogleAccount(modelName, accounts, options = {}, requestId
                     if (result.status >= 200 && result.status < 400) {
                         state.succeeded++;
                         state.consecutiveFailures = 0;
+                        state.forceRefreshAttempted = false;
+                        state.needsForceRefresh = false;
                         if (Number.isFinite(result.latencyMs) && result.latencyMs >= 0) {
                             const previous = measuredLatency(state);
                             state.latency = {
@@ -687,12 +723,19 @@ async function acquireGoogleAccount(modelName, accounts, options = {}, requestId
                     const quotaDenial = (result.status === 400 || result.status === 403) &&
                         (result.cooldownReason === 'quota-exhausted' || result.cooldownReason === 'rate-limited');
                     if (result.status === 401 || (result.status === 403 && !quotaDenial)) {
-                        state.authState = result.status === 401 ? 'unauthorized' : 'forbidden';
                         tokenCache.delete(accountKey(selected));
                         tokenCache.delete(accountKey(updated));
                         for (const [sKey, entry] of sticky) {
                             if (entry.accountId === selected.id || entry.accountKey === key)
                                 sticky.delete(sKey);
+                        }
+                        if (result.status === 401 && canRefreshAccount(updated) && !state.forceRefreshAttempted) {
+                            // Attempt one forced refresh on an unexpected 401 before permanently locking out the account.
+                            state.needsForceRefresh = true;
+                            state.forceRefreshAttempted = true;
+                        }
+                        else {
+                            state.authState = result.status === 401 ? 'unauthorized' : 'forbidden';
                         }
                     }
                     else if (quotaDenial ||
@@ -741,8 +784,14 @@ function recordGoogleAccountFailure(account, status, retryAfterMs, cooldownScope
     }
     const quotaDenial = (status === 400 || status === 403) && (reason === 'quota-exhausted' || reason === 'rate-limited');
     if (status === 401 || (status === 403 && !quotaDenial)) {
-        state.authState = status === 401 ? 'unauthorized' : 'forbidden';
         tokenCache.delete(accountKey(account));
+        if (status === 401 && canRefreshAccount(account) && !state.forceRefreshAttempted) {
+            state.needsForceRefresh = true;
+            state.forceRefreshAttempted = true;
+        }
+        else {
+            state.authState = status === 401 ? 'unauthorized' : 'forbidden';
+        }
     }
     else if (quotaDenial || status === 408 || status === 429 || (status && status >= 500)) {
         const delay = Number.isFinite(retryAfterMs) && retryAfterMs >= 0 ? retryAfterMs : 60000;
@@ -801,10 +850,18 @@ function resetGoogleAccountState(id) {
         if (!id || account.id === id)
             tokenCache.delete(key);
     if (!id) {
+        globalResetEpoch += 1;
+        accountResetEpochs.clear();
+        refreshing.clear();
         tokenCache.clear();
         sticky.clear();
     }
     else {
+        accountResetEpochs.set(id, resetEpochFor(id) + 1);
+        for (const [key, entry] of refreshing) {
+            if (entry.accountId === id)
+                refreshing.delete(key);
+        }
         for (const [key, entry] of sticky) {
             if (entry.accountId === id || entry.accountKey === id)
                 sticky.delete(key);

@@ -12,7 +12,7 @@
  */
 
 import { PROVIDERS, workersAiAccountPath } from './providers';
-import { COMPACTION_TOKEN_RESERVE, NATIVE_DEFAULT_CHECKPOINT_THRESHOLD, detectModelCapabilities } from './proxy/modelUtils';
+import { COMPACTION_TOKEN_RESERVE, detectModelCapabilities } from './proxy/modelUtils';
 
 interface ValidationResult {
   valid: boolean;
@@ -96,10 +96,13 @@ export function validateCustomModel(model: unknown): ValidationResult {
     }
   }
 
-  const name = m.name as string;
-  // Validate model name format: should start with "models/" or be a valid path
+  const name = (m.name as string).trim();
+  // Validate model name format: should start with "models/" and include a non-empty identifier
   if (!name.startsWith('models/') && !name.includes('/')) {
     return { valid: false, error: 'Model name must start with "models/"' };
+  }
+  if (name === 'models/' || name.endsWith('/') || (name.startsWith('models/') && !name.slice('models/'.length).trim())) {
+    return { valid: false, error: 'Model name must include an identifier after "models/"' };
   }
 
   const provider = m.provider as string;
@@ -127,13 +130,18 @@ export function validateCustomModel(model: unknown): ValidationResult {
   }
 
   // Validate optional fields
-  if (m.externalModelName && typeof m.externalModelName !== 'string') {
+  if (m.externalModelName !== undefined && typeof m.externalModelName !== 'string') {
     return { valid: false, error: 'externalModelName must be a string' };
   }
-  if (m.displayName && typeof m.displayName !== 'string') {
+  if (m.displayName !== undefined && typeof m.displayName !== 'string') {
     return { valid: false, error: 'displayName must be a string' };
   }
-  if (m.apiKey && typeof m.apiKey !== 'string') {
+  if (m.providerName !== undefined) {
+    if (typeof m.providerName !== 'string' || /[\u0000-\u001f\u007f]/.test(m.providerName) || m.providerName.length > 80) {
+      return { valid: false, error: 'providerName must be a string up to 80 characters' };
+    }
+  }
+  if (m.apiKey !== undefined && typeof m.apiKey !== 'string') {
     return { valid: false, error: 'apiKey must be a string' };
   }
   if (m.allowUnauthorized !== undefined && typeof m.allowUnauthorized !== 'boolean') {
@@ -171,8 +179,11 @@ export function validateCustomModel(model: unknown): ValidationResult {
       return { valid: false, error: 'Set the actual contextWindow before configuring compactionThresholdPercent' };
     }
     const cap = detectModelCapabilities(m as unknown as Parameters<typeof detectModelCapabilities>[0]);
-    if (cap.maxTokens - cap.maxOutputTokens - COMPACTION_TOKEN_RESERVE < NATIVE_DEFAULT_CHECKPOINT_THRESHOLD) {
-      return { valid: false, error: 'IDE 2.5.5 requires at least 50000 input tokens after reserving the real model output limit and 1024 extra tokens before it can apply a custom compaction threshold; use the actual provider limits or leave the threshold unset' };
+    // The old 50k floor rejected exactly the models that need a custom threshold:
+    // their whole window is below the IDE's 50k new-token default. Require only a
+    // positive input budget here; the >=1024 threshold check below is the real guard.
+    if (cap.maxTokens - cap.maxOutputTokens - COMPACTION_TOKEN_RESERVE <= 0) {
+      return { valid: false, error: 'Context window must exceed the reserved model output limit and 1024 extra tokens before applying a custom compaction threshold; use the actual provider limits or leave the threshold unset' };
     }
     const threshold = Math.min(
       Math.floor(cap.maxTokens * Number(m.compactionThresholdPercent) / 100),

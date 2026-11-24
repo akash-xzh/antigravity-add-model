@@ -9,16 +9,31 @@ window.addEventListener('DOMContentLoaded', () => {
     'button[aria-label*="Choose model" i], button[aria-label*="Switch model" i]';
   type Usage = {
     conversationId: string;
-    source: 'estimated' | 'unavailable';
+    source: 'actual' | 'estimated' | 'unavailable';
     currentTokens?: number;
+    actualTokens?: number;
+    overheadTokens?: number;
+    visibleInputTokens?: number;
+    visibleOutputTokens?: number;
+    actualInputTokens?: number;
+    actualCachedTokens?: number;
+    actualOutputTokens?: number;
+    sessionInputTokens?: number;
+    sessionCachedTokens?: number;
+    sessionOutputTokens?: number;
+    turns?: number;
+    compactions?: number;
+    tokensPerTurn?: number;
+    turnsUntilCompaction?: number;
     maxTokens?: number;
-    limitSource?: 'configured' | 'public-catalog';
+    limitSource?: 'configured' | 'native-catalog' | 'public-catalog';
+    tokensPerSecond?: number;
+    ttftMs?: number;
+    compactionThresholdPercent?: number;
+    compactionAtTokens?: number;
+    tokensUntilCompaction?: number;
+    compactionSource?: 'custom' | 'default' | 'ide';
   };
-  type ConversationProps = {
-    conversationId?: unknown; cascadeId?: unknown; activeConversationId?: unknown; currentConversationId?: unknown;
-    conversation?: { id?: unknown }; cascade?: { id?: unknown };
-  };
-  type ConversationFiber = { memoizedProps?: ConversationProps; return?: ConversationFiber };
   type Target = { trigger: HTMLElement; conversationId?: string; modelName: string; key: string };
   type State = {
     composer: HTMLElement;
@@ -33,8 +48,20 @@ window.addEventListener('DOMContentLoaded', () => {
   const states = new Map<HTMLElement, State>();
   const toolbarParents = new Set<HTMLElement>();
   const style = document.createElement('style');
-  style.textContent = '[data-agy-context-toolbar]:has(> [data-agy-context-ring]){display:inline-flex!important;align-items:center;gap:2px;max-width:100%}' +
-    '[data-agy-context-toolbar]>[data-testid="model-selector-trigger"]{min-width:0;flex:0 1 auto}';
+  style.textContent =
+    '[data-agy-context-toolbar]:has(> [data-agy-context-ring]){display:inline-flex!important;align-items:center;gap:4px;max-width:100%}' +
+    '[data-agy-context-toolbar]>[data-testid="model-selector-trigger"]{min-width:0;flex:0 1 auto}' +
+    '[data-agy-context-ring]{display:inline-flex;align-items:center;gap:5px;flex:none;height:22px;padding:0 8px 0 5px;border-radius:9999px;border:1px solid rgba(255,255,255,.12);background:rgba(255,255,255,.04);color:inherit;font-size:11px;line-height:1;font-variant-numeric:tabular-nums;cursor:pointer;white-space:nowrap;transition:background .12s,border-color .12s}' +
+    '[data-agy-context-ring]:hover{background:rgba(255,255,255,.09);border-color:rgba(255,255,255,.22)}' +
+    '.agy-ctx-popover{position:fixed;z-index:9999999;width:276px;padding:10px 12px;border-radius:10px;background:#18181b;border:1px solid rgba(255,255,255,.14);box-shadow:0 14px 36px rgba(0,0,0,.6);color:#e4e4e7;font:12px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;pointer-events:none}' +
+    '.agy-ctx-pop-head{display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:8px;font-weight:600;color:#fafafa}' +
+    '.agy-ctx-pop-badge{font-size:10px;font-weight:500;padding:1px 6px;border-radius:9999px;background:#27272c;color:#a1a1aa;flex-shrink:0}' +
+    '.agy-ctx-pop-bar{position:relative;height:6px;border-radius:9999px;background:rgba(255,255,255,.1);overflow:hidden;margin:6px 0}' +
+    '.agy-ctx-pop-fill{height:100%;border-radius:9999px;transition:width .15s}' +
+    '.agy-ctx-pop-row{display:flex;justify-content:space-between;gap:8px;font-size:11px;color:#d4d4d8;margin-top:4px}' +
+    '.agy-ctx-pop-row span:first-child{color:#a1a1aa}' +
+    '.agy-ctx-pop-section{margin-top:8px;padding-top:6px;border-top:1px solid rgba(255,255,255,.08)}' +
+    '.agy-ctx-pop-muted{font-size:10px;color:#a1a1aa;margin-top:7px;line-height:1.35}';
   document.head.append(style);
   const limits = new Map<string, { maxTokens: number; limitSource: Usage['limitSource']; expires: number }>();
   let stopped = false;
@@ -68,25 +95,13 @@ window.addEventListener('DOMContentLoaded', () => {
       const id = idFrom(element.getAttribute(attr));
       if (id) return id;
     }
-    // Only named conversation properties are identities. Never accept arbitrary React UUIDs,
-    // message IDs, tool IDs, storage entries, or the most recently modified conversation.
-    try {
-      const key = Object.keys(element).find((name) => name.startsWith('__reactFiber') || name.startsWith('__reactInternalInstance'));
-      let fiber = key ? (element as unknown as Record<string, ConversationFiber>)[key] : undefined;
-      for (let depth = 0; fiber && depth < 80; depth++, fiber = fiber.return) {
-        const props = fiber.memoizedProps;
-        if (!props || typeof props !== 'object') continue;
-        for (const value of [
-          props.conversationId, props.cascadeId, props.activeConversationId, props.currentConversationId,
-          props.conversation?.id, props.cascade?.id,
-        ]) {
-          const id = idFrom(value);
-          if (id) return id;
-        }
-      }
-    } catch {
-      /* Unknown React layout: leave identity unavailable. */
-    }
+    // React fiber expandos live in the page world and are invisible from this
+    // isolated preload world. uiMitm.ts writes the active id onto the selector
+    // DOM node (and the document root when there is only one composer).
+    const bridged = idFrom(element.closest('[data-agy-conversation-id]')?.getAttribute('data-agy-conversation-id'));
+    if (bridged) return bridged;
+    const rootId = idFrom(document.documentElement.getAttribute('data-agy-conversation-id'));
+    if (rootId && document.querySelectorAll('[data-agy-conversation-id]').length <= 1) return rootId;
     return undefined;
   }
 
@@ -128,26 +143,169 @@ window.addEventListener('DOMContentLoaded', () => {
     return { trigger, modelName, conversationId, key: `${conversationId || ''}\n${modelName}` };
   }
 
+  let activePopover: HTMLElement | undefined;
+  let activePopoverState: State | undefined;
+  const formatCompactTokens = (value: number): string => {
+    if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(1)}M`;
+    if (value >= 1_000) return `${(value / 1_000).toFixed(value >= 100_000 ? 0 : 1)}K`;
+    return String(value);
+  };
+  const formatLatency = (ms: number): string => (ms < 1000 ? `${Math.round(ms)}ms` : `${(ms / 1000).toFixed(2)}s`);
+  /** Provider generation speed, e.g. `42 t/s`. Empty when the sample was too short to measure. */
+  const formatSpeed = (value?: number): string =>
+    typeof value === 'number' && Number.isFinite(value) && value > 0
+      ? `${value >= 999.95 ? `${(value / 1000).toFixed(1)}k` : String(Math.round(value))} t/s`
+      : '';
+  const escapeHtml = (value: string): string =>
+    value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  const usageAccent = (fraction: number, nearCompact: boolean): string => {
+    if (nearCompact || fraction >= 0.85) return '#f87171';
+    if (fraction >= 0.6) return '#fbbf24';
+    return '#34d399';
+  };
+  const hidePopover = () => {
+    activePopover?.remove();
+    activePopover = undefined;
+    activePopoverState = undefined;
+  };
+  const showPopover = (state: State) => {
+    const reuse = activePopover && activePopover.isConnected && activePopoverState === state;
+    if (!reuse) hidePopover();
+    const { usage, target, ring } = state;
+    const limit = usage?.maxTokens;
+    const actual = usage?.source === 'actual' && typeof usage.actualTokens === 'number' && Number.isFinite(usage.actualTokens);
+    const known = actual || (typeof usage?.currentTokens === 'number' && Number.isFinite(usage.currentTokens));
+    const count = actual ? usage!.actualTokens! : known ? usage!.currentTokens! : 0;
+    const rawFraction = known && limit ? Math.max(0, count / limit) : 0;
+    const fraction = Math.min(1, rawFraction);
+    const pct = (rawFraction * 100).toFixed(1);
+    const compactPct = usage?.compactionThresholdPercent;
+    const untilCompact = usage?.tokensUntilCompaction;
+    const nearCompact = typeof untilCompact === 'number' && untilCompact <= 0;
+    const accent = known && limit ? usageAccent(fraction, nearCompact) : '#a1a1aa';
+    const num = (value?: number) =>
+      typeof value === 'number' && Number.isFinite(value) ? value.toLocaleString('en-US') : '—';
+    // Detail rows use the same compact scale as the pill so they stay on one line.
+    const cnum = (value?: number) =>
+      typeof value === 'number' && Number.isFinite(value) ? formatCompactTokens(value) : '—';
+
+    const pop = reuse ? activePopover! : document.createElement('div');
+    if (!reuse) pop.className = 'agy-ctx-popover';
+    const badge = actual ? 'Actual' : known ? 'Estimate' : 'Unavailable';
+    const usageLine = known
+      ? limit
+        ? `${actual ? '' : '~'}${num(count)} / ${num(limit)} (${pct}%)`
+        : `${actual ? '' : '~'}${num(count)} tokens`
+      : 'Unavailable';
+    const overhead =
+      typeof usage?.overheadTokens === 'number'
+        ? `<div class="agy-ctx-pop-row"><span>System prompt, tools &amp; images</span><span>${cnum(usage.overheadTokens)}</span></div>`
+        : '';
+    const visibleLine =
+      actual && typeof usage?.currentTokens === 'number'
+        ? `<div class="agy-ctx-pop-row"><span>Visible conversation</span><span>~${cnum(usage.currentTokens)}</span></div>`
+        : '';
+    const compactLine =
+      typeof untilCompact === 'number'
+        ? untilCompact > 0
+          ? `<div class="agy-ctx-pop-row"><span>Before compact (${compactPct ?? 80}%)</span><span style="color:${accent};font-weight:600">${num(untilCompact)} left${typeof usage?.turnsUntilCompaction === 'number' ? ` · ~${usage.turnsUntilCompaction} turns` : ''}</span></div>`
+          : `<div class="agy-ctx-pop-row"><span>Before compact (${compactPct ?? 80}%)</span><span style="color:#f87171;font-weight:600">Threshold reached</span></div>`
+        : usage?.compactionSource === 'ide'
+          ? `<div class="agy-ctx-pop-row"><span>Before compact</span><span>IDE default · ~50K new tokens</span></div>`
+          : '';
+    const cachedPct =
+      actual && typeof usage?.actualCachedTokens === 'number' && count > 0
+        ? Math.round((usage.actualCachedTokens / count) * 100)
+        : undefined;
+    const lastTurnLine = actual
+      ? `<div class="agy-ctx-pop-section"></div>` +
+        `<div class="agy-ctx-pop-row"><span>Last prompt</span><span>${cnum(usage?.actualInputTokens)} new · ${cnum(usage?.actualCachedTokens)} cached${cachedPct === undefined ? '' : ` (${cachedPct}% hit)`}</span></div>` +
+        `<div class="agy-ctx-pop-row"><span>Last output</span><span>${cnum(usage?.actualOutputTokens)}</span></div>`
+      : '';
+    const speed = formatSpeed(usage?.tokensPerSecond);
+    const generationLine = speed
+      ? `<div class="agy-ctx-pop-row"><span>Last generation</span><span>${speed}${typeof usage?.ttftMs === 'number' ? ` · ${formatLatency(usage.ttftMs)} first token` : ''}</span></div>`
+      : '';
+    const sessionLine =
+      actual && (typeof usage?.sessionInputTokens === 'number' || typeof usage?.sessionOutputTokens === 'number')
+        ? `<div class="agy-ctx-pop-section"></div>` +
+          `<div class="agy-ctx-pop-row"><span>Burned this session</span><span>${cnum((usage?.sessionInputTokens ?? 0) + (usage?.sessionCachedTokens ?? 0))} in · ${cnum(usage?.sessionOutputTokens)} out</span></div>` +
+          `<div class="agy-ctx-pop-row"><span>Turns · compactions</span><span>${num(usage?.turns)} · ${num(usage?.compactions ?? 0)}</span></div>`
+        : '';
+    pop.innerHTML =
+      `<div class="agy-ctx-pop-head"><span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escapeHtml(target.modelName)}</span><span class="agy-ctx-pop-badge">${badge}</span></div>` +
+      `<div class="agy-ctx-pop-row"><span>Context used</span><span>${usageLine}</span></div>` +
+      (limit ? `<div class="agy-ctx-pop-bar"><div class="agy-ctx-pop-fill" style="width:${(fraction * 100).toFixed(1)}%;background:${accent}"></div></div>` : '') +
+      compactLine +
+      (actual ? overhead + visibleLine : '') +
+      generationLine +
+      lastTurnLine +
+      sessionLine +
+      `<div class="agy-ctx-pop-muted">${!target.conversationId ? 'Open conversation could not be identified. ' : ''}${!limit ? 'Click pill to look up limit in public catalog.' : ''}</div>`;
+    if (!reuse) document.body.append(pop);
+    activePopover = pop;
+    activePopoverState = state;
+    const r = ring.getBoundingClientRect();
+    const pr = pop.getBoundingClientRect();
+    const left = Math.max(8, Math.min(window.innerWidth - pr.width - 8, r.left));
+    const top = Math.max(8, r.top - pr.height - 8);
+    pop.style.left = `${left}px`;
+    pop.style.top = `${top}px`;
+  };
+
   function render(state: State): void {
     const { usage, target, ring } = state;
     const limit = usage?.maxTokens;
-    const estimated = usage?.source === 'estimated' && typeof usage.currentTokens === 'number' && Number.isFinite(usage.currentTokens);
-    const count = estimated ? usage!.currentTokens! : 0;
-    let description = estimated
-      ? `Visible transcript estimate: ~${count.toLocaleString('en-US')} tokens`
-      : 'Context usage unavailable';
-    if (limit) description += ` / ${limit.toLocaleString('en-US')} context limit (${usage?.limitSource === 'configured' ? 'configured' : 'public catalog'})`;
-    description += '. Hidden prompts, tool definitions and images are not included; actual usage can be higher.';
+    const actual = usage?.source === 'actual' && typeof usage.actualTokens === 'number' && Number.isFinite(usage.actualTokens);
+    const known = actual || (typeof usage?.currentTokens === 'number' && Number.isFinite(usage.currentTokens));
+    const count = actual ? usage!.actualTokens! : known ? usage!.currentTokens! : 0;
+    const untilCompact = usage?.tokensUntilCompaction;
+    let description = actual
+      ? `Actual context: ${count.toLocaleString('en-US')} tokens (includes system prompt, tools and images)`
+      : known
+        ? `Visible transcript estimate: ~${count.toLocaleString('en-US')} tokens`
+        : 'Context usage unavailable';
+    if (limit)
+      description += ` / ${limit.toLocaleString('en-US')} context limit (${
+        usage?.limitSource === 'configured'
+          ? 'configured'
+          : usage?.limitSource === 'native-catalog'
+            ? 'model catalog'
+            : 'public catalog'
+      })`;
+    if (typeof untilCompact === 'number') {
+      description += ` · ${untilCompact.toLocaleString('en-US')} tokens remaining before compact`;
+    }
+    if (actual) {
+      if (typeof usage?.overheadTokens === 'number')
+        description += ` · ${usage.overheadTokens.toLocaleString('en-US')} tokens for system prompt, tools and images`;
+      if (typeof usage?.actualCachedTokens === 'number')
+        description += ` · ${usage.actualCachedTokens.toLocaleString('en-US')} of the last prompt was cached`;
+    } else if (known) {
+      description += '. Hidden prompts, tool definitions and images are not included; actual usage can be higher.';
+    }
+    const speed = formatSpeed(usage?.tokensPerSecond);
+    if (speed) description += ` · last generation ${speed}${typeof usage?.ttftMs === 'number' ? ` (first token ${formatLatency(usage.ttftMs)})` : ''}`;
     if (!target.conversationId) description += ' The open conversation could not be identified.';
     if (!limit) description += ' Click to look up the model limit in the public catalog.';
     if (ring.title !== description) {
       ring.title = description;
       ring.setAttribute('aria-label', description);
     }
-    // This is visibly marked as an estimate; no fabricated measured percentage or safe/unsafe color.
-    const fraction = estimated && limit ? Math.max(0, Math.min(1, count / limit)) : 0;
-    const svg = `<svg width="20" height="20" viewBox="0 0 20 20" aria-hidden="true"><circle cx="10" cy="10" r="7" fill="none" stroke="currentColor" opacity=".25" stroke-width="2"/><circle cx="10" cy="10" r="7" fill="none" stroke="currentColor" stroke-width="2" stroke-dasharray="44" stroke-dashoffset="${(44 * (1 - fraction)).toFixed(2)}"/><text x="10" y="14" text-anchor="middle" font-size="12" fill="currentColor">${estimated ? '~' : '?'}</text></svg>`;
-    if (ring.innerHTML !== svg) ring.innerHTML = svg;
+    if (ring.dataset.agyContextSource !== String(usage?.source || 'unavailable'))
+      ring.dataset.agyContextSource = String(usage?.source || 'unavailable');
+    const fraction = known && limit ? Math.max(0, Math.min(1, count / limit)) : 0;
+    const strokeColor = known && limit ? usageAccent(fraction, typeof untilCompact === 'number' && untilCompact <= 0) : 'currentColor';
+    const circ = 37.7; // 2 * pi * 6
+    const pillLabel = known
+      ? `${actual ? '' : '~'}${formatCompactTokens(count)}${limit ? ` / ${formatCompactTokens(limit)}` : ''}${speed ? ` · ${speed}` : ''}`
+      : '?';
+    const html =
+      `<svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true">` +
+      `<circle cx="8" cy="8" r="6" fill="none" stroke="currentColor" opacity=".2" stroke-width="2"/>` +
+      `<circle cx="8" cy="8" r="6" fill="none" stroke="${strokeColor}" stroke-width="2" stroke-linecap="round" transform="rotate(-90 8 8)" stroke-dasharray="${circ}" stroke-dashoffset="${(circ * (1 - fraction)).toFixed(2)}"/>` +
+      `</svg><span>${pillLabel}</span>`;
+    if (ring.innerHTML !== html) ring.innerHTML = html;
     const parent = target.trigger.parentElement;
     if (parent) {
       if (!parent.hasAttribute('data-agy-context-toolbar')) parent.setAttribute('data-agy-context-toolbar', '');
@@ -195,11 +353,13 @@ window.addEventListener('DOMContentLoaded', () => {
       }
       state.usage = usage;
       render(state);
+      if (activePopover && activePopoverState === state && state.ring.isConnected) showPopover(state);
     } catch {
       const current = readTarget(state.composer);
       if (states.get(state.composer) === state && current && current.key === requested.key) {
         state.usage = undefined;
         render(state);
+        if (activePopover && activePopoverState === state && state.ring.isConnected) showPopover(state);
       }
     } finally {
       state.inFlight = false;
@@ -232,8 +392,12 @@ window.addEventListener('DOMContentLoaded', () => {
         triggers.add(target.trigger);
       }
     }
+    for (const parent of toolbarParents) {
+      if (!parent.isConnected) toolbarParents.delete(parent);
+    }
     for (const [composer, state] of states) {
       if (!targets.has(composer)) {
+        if (activePopoverState === state) hidePopover();
         state.ring.remove();
         states.delete(composer);
       }
@@ -246,7 +410,7 @@ window.addEventListener('DOMContentLoaded', () => {
         ring.type = 'button';
         ring.dataset.agyContextRing = '';
         ring.className = 'agy-context-usage';
-        ring.style.cssText = 'display:inline-flex;align-items:center;justify-content:center;flex:none;background:transparent;border:0;color:inherit;opacity:.75;padding:3px;cursor:help;';
+        ring.style.flex = '0 0 auto';
         state = { composer, target, ring, inFlight: false, queued: false, discover: false, lastRequest: 0 };
         const ownState = state;
         ring.addEventListener('click', (event) => {
@@ -255,6 +419,10 @@ window.addEventListener('DOMContentLoaded', () => {
           ownState.discover = !ownState.usage?.maxTokens;
           void request(ownState, true);
         });
+        ring.addEventListener('pointerenter', () => showPopover(ownState));
+        ring.addEventListener('pointerleave', () => hidePopover());
+        ring.addEventListener('focus', () => showPopover(ownState));
+        ring.addEventListener('blur', () => hidePopover());
         ring.addEventListener('mousedown', (event) => event.stopPropagation());
         states.set(composer, state);
         changed = true;
@@ -274,7 +442,7 @@ window.addEventListener('DOMContentLoaded', () => {
     debounce = setTimeout(() => { debounce = undefined; refresh(); }, 100);
   }
   const observer = new MutationObserver((records) => {
-    if (records.some((record) => !(record.target instanceof Element && record.target.closest('[data-agy-context-ring]')))) schedule();
+    if (records.some((record) => !(record.target instanceof Element && record.target.closest('[data-agy-context-ring], .agy-ctx-popover')))) schedule();
   });
   observer.observe(document.body, { childList: true, subtree: true, characterData: true, attributes: true,
     attributeFilter: ['class', 'hidden', 'aria-hidden', 'data-conversation-id', 'data-cascade-id'] });
@@ -293,6 +461,7 @@ window.addEventListener('DOMContentLoaded', () => {
     window.removeEventListener('focus', focus);
     window.removeEventListener('popstate', route);
     window.removeEventListener('hashchange', route);
+    hidePopover();
     for (const state of states.values()) state.ring.remove();
     states.clear();
     for (const parent of toolbarParents) parent.removeAttribute('data-agy-context-toolbar');

@@ -3,9 +3,12 @@ import * as loopbackSecurity from '../proxy/loopbackSecurity';
 import * as subagentRoutingModule from '../proxy/subagentRouting';
 import * as subagentModels from '../proxy/subagentModels';
 import * as nativeSubagentResponse from '../proxy/nativeSubagentResponse';
+import * as nativeLimits from '../proxy/nativeLimits';
+import * as conversationUsage from '../proxy/conversationUsage';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import * as url from 'node:url';
 import * as http from 'node:http';
 import { tmpdir } from 'node:os';
 import { pathToFileURL } from 'node:url';
@@ -71,6 +74,7 @@ async function fixture(models: CustomModel[]) {
     https: { request: remoteDownload },
     fs,
     path,
+    url,
     electron: { app: { getPath: () => directory, getAppPath: () => directory } },
     'electron-log': { info: vi.fn(), error: vi.fn(), warn: vi.fn() },
     './proxy/shared': shared,
@@ -80,6 +84,10 @@ async function fixture(models: CustomModel[]) {
     './proxy/subagentModels': subagentModels,
     './proxy/googlePoolFailover': googlePoolFailover,
     './proxy/nativeSubagentResponse': nativeSubagentResponse,
+
+    './proxy/nativeLimits': nativeLimits,
+
+    './proxy/conversationUsage': conversationUsage,
     './proxy/cloudCodeRouting': {},
     './modelIdentity': modelIdentity,
     './proxy/customRequest': customRequest,

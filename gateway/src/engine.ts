@@ -1,4 +1,5 @@
 import { getEffortForModel } from './reasoning-effort.js';
+
 import { config } from './config.js';
 import { providerRegistry } from './provider-registry.js';
 import { logger } from './logger.js';
@@ -20,15 +21,128 @@ export function extractConvId(requestId: string): string {
   return parts.length >= 2 ? parts.slice(0, 2).join('/') : requestId;
 }
 
+interface ReasoningTurnRecord {
+  thought: string;
+  asstIndex?: number;
+  fingerprint?: string;
+}
+
 interface ReasoningEntry {
   data: string[];
+  turns: ReasoningTurnRecord[];
+  lastSeenAsstCount?: number;
   timestamp: number;
 }
 
 const REASONING_TTL_MS = 30 * 60 * 1000; // 30 minutes
 const REASONING_MAX_SIZE = 1000;
 
+/**
+ * Anchor observations must survive the gap between injectReasoning() and
+ * saveReasoning(): server.ts calls both synchronously but awaits a stream in
+ * between, so a shared lastSeenAsstCount alone is rewritten by any concurrent
+ * request on the same conversation. Snapshot the count observed by inject into
+ * a pending per-conversation anchor and consume it in saveReasoning.
+ *
+ * A request id from server.ts scopes each anchor to one in-flight request, so
+ * concurrent requests on the same conversation cannot consume each other's
+ * anchor. Callers without a request id keep the legacy conversation-scoped
+ * behaviour for compatibility.
+ */
+interface PendingAnchor {
+  count: number;
+  at: number;
+}
+const pendingAnchors = new Map<string, PendingAnchor>();
+
+function anchorKey(convId: string, requestId?: string): string {
+  return requestId ? `${convId}\0${requestId}` : convId;
+}
+function recordAnchor(key: string, count: number): void {
+  const now = Date.now();
+  // Drop anchors of aborted requests so the map cannot grow without bound.
+  for (const [id, entry] of pendingAnchors) if (now - entry.at > 30_000) pendingAnchors.delete(id);
+  const pending = pendingAnchors.get(key);
+  if (!pending || pending.count < count || now - pending.at > 30_000) {
+    pendingAnchors.set(key, { count, at: now });
+  }
+}
+function peekAnchor(key: string): number | undefined {
+  return pendingAnchors.get(key)?.count;
+}
+function consumeAnchor(key: string): number | undefined {
+  const pending = pendingAnchors.get(key);
+  if (!pending) return undefined;
+  pendingAnchors.delete(key);
+  return pending.count;
+}
+
+/** Test-only: drop state recorded between cases. */
+export function resetReasoningRequestAnchors(): void {
+  pendingAnchors.clear();
+}
+
+// Marks reasoning_content written by applyFallbackReasoning (answer text used as
+// a placeholder). A real stored thought must be allowed to overwrite it.
+const FALLBACK_REASONING = Symbol.for('antigravity.gateway.fallbackReasoning');
+type MessageWithFallback = OpenAIMessage & { [FALLBACK_REASONING]?: boolean };
+
+function isFallbackReasoning(msg: OpenAIMessage): boolean {
+  if ((msg as MessageWithFallback)[FALLBACK_REASONING] === true) return true;
+  // Clients echo reasoning_content through JSON, which drops symbol props.
+  // Fallback values are literally the assistant's answer text, so compare too.
+  const current = msg.reasoning_content;
+  return typeof current === 'string' && current.length > 0 && current === fallbackReasoning(msg);
+}
+
 export const reasoningStore = new Map<string, ReasoningEntry>();
+
+function fingerprintAssistantMessage(msg: OpenAIMessage): string {
+  const contentPart = typeof msg.content === 'string'
+    ? msg.content
+    : msg.content == null
+      ? ''
+      : JSON.stringify(msg.content);
+  const toolsPart = msg.tool_calls ? JSON.stringify(msg.tool_calls) : '';
+  return `${contentPart}\0${toolsPart}`;
+}
+
+function fallbackReasoning(msg: OpenAIMessage): string | undefined {
+  const c = msg.content;
+  if (typeof c === 'string') {
+    if (c.trim().length > 0) return c;
+    return msg.tool_calls && msg.tool_calls.length > 0 ? ' ' : undefined;
+  }
+  if (Array.isArray(c)) {
+    const text = c
+      .map(part => (part && part.type === 'text' && typeof part.text === 'string' ? part.text : ''))
+      .join('')
+      .trim();
+    if (text.length > 0) return text;
+    return ' ';
+  }
+  return msg.tool_calls && msg.tool_calls.length > 0 ? ' ' : undefined;
+}
+
+function applyFallbackReasoning(msg: OpenAIMessage): void {
+  const existing = msg.reasoning_content;
+  if (existing && existing.length > 0 && !isFallbackReasoning(msg)) return;
+  const fallback = fallbackReasoning(msg);
+  if (fallback !== undefined) {
+    msg.reasoning_content = fallback;
+    (msg as MessageWithFallback)[FALLBACK_REASONING] = true;
+  } else if (msg.reasoning_content === '') {
+    delete msg.reasoning_content;
+    delete (msg as MessageWithFallback)[FALLBACK_REASONING];
+  }
+}
+
+/** A matched stored thought always replaces a fallback answer-text placeholder. */
+function applyStoredReasoning(msg: OpenAIMessage, thought: string): void {
+  if (msg.reasoning_content && msg.reasoning_content.length > 0 && !isFallbackReasoning(msg)) return;
+  msg.reasoning_content = thought;
+  delete (msg as MessageWithFallback)[FALLBACK_REASONING];
+}
 
 export function cleanupReasoningStore(): void {
   const now = Date.now();
@@ -49,54 +163,140 @@ export function cleanupReasoningStore(): void {
   }
 }
 
-export function saveReasoning(convId: string, thoughtText: string): void {
+export function saveReasoning(convId: string, thoughtText: string, requestId?: string): void {
   cleanupReasoningStore();
+  // Consume this request's own anchor snapshot, never a value another
+  // concurrent request may have written to the shared store in the meantime.
+  const key = anchorKey(convId, requestId);
+  const asstIndex = consumeAnchor(key) ?? reasoningStore.get(convId)?.lastSeenAsstCount;
   const existing = reasoningStore.get(convId);
   if (existing) {
     existing.data.push(thoughtText);
+    existing.turns.push({ thought: thoughtText, asstIndex });
     existing.timestamp = Date.now();
   } else {
-    reasoningStore.set(convId, { data: [thoughtText], timestamp: Date.now() });
+    reasoningStore.set(convId, {
+      data: [thoughtText],
+      turns: [{ thought: thoughtText }],
+      timestamp: Date.now(),
+    });
   }
 }
 
-export function injectReasoning(messages: OpenAIMessage[], convId: string): void {
-  const entry = reasoningStore.get(convId);
-  if (!entry) {
-    // Ensure all assistant messages have reasoning_content even when no store
-    for (const msg of messages) {
-      if (msg.role === 'assistant' && !msg.reasoning_content) {
-        const c = msg.content;
-        msg.reasoning_content = typeof c === 'string' ? c : ' ';
-      }
-    }
-    return;
-  }
-  // Collect assistant message indices in chronological order
+export function injectReasoning(messages: OpenAIMessage[], convId: string, requestId?: string): void {
+  const key = anchorKey(convId, requestId);
   const asstIdxs: number[] = [];
   for (let i = 0; i < messages.length; i++) {
     if (messages[i].role === 'assistant') asstIdxs.push(i);
   }
-  // Inject store entries into the LAST N assistant messages
-  // The reasoning store grows in response order (oldest first).
-  // Assistant messages in the request are also chronological.
-  // Each response adds one assistant message, so store[N] corresponds
-  // to the (asstCount - storeLen + N)-th assistant message from the end.
-  const injectCount = Math.min(entry.data.length, asstIdxs.length);
-  const msgOffset = asstIdxs.length - injectCount;
-  const storeOffset = entry.data.length - injectCount;
-  for (let i = 0; i < injectCount; i++) {
-    const msg = messages[asstIdxs[msgOffset + i]];
-    msg.reasoning_content = entry.data[storeOffset + i];
+
+  const entry = reasoningStore.get(convId);
+  if (!entry || entry.turns.length === 0) {
+    for (const idx of asstIdxs) {
+      applyFallbackReasoning(messages[idx]);
+    }
+    if (entry) {
+      entry.lastSeenAsstCount = asstIdxs.length;
+      recordAnchor(key, asstIdxs.length);
+      entry.timestamp = Date.now();
+    } else {
+      cleanupReasoningStore();
+      reasoningStore.set(convId, {
+        data: [],
+        turns: [],
+        lastSeenAsstCount: asstIdxs.length,
+        timestamp: Date.now(),
+      });
+      recordAnchor(key, asstIdxs.length);
+    }
+    return;
   }
-  // Old assistant messages (before this session) need a fallback
-  for (let i = 0; i < msgOffset; i++) {
-    const msg = messages[asstIdxs[i]];
-    if (!msg.reasoning_content) {
-      const c = msg.content;
-      msg.reasoning_content = typeof c === 'string' ? c : ' ';
+
+  const fingerprints = asstIdxs.map(idx => fingerprintAssistantMessage(messages[idx]));
+  const assigned = new Set<number>(); // indices into asstIdxs (0..asstIdxs.length-1)
+  const matchedTurns = new Set<ReasoningTurnRecord>();
+
+  // 1. First align turns that already have a known fingerprint (survives compaction/trimming)
+  let searchFrom = 0;
+  let inferredShift: number | undefined;
+  for (const turn of entry.turns) {
+    if (!turn.fingerprint) continue;
+    for (let pos = searchFrom; pos < asstIdxs.length; pos++) {
+      if (!assigned.has(pos) && fingerprints[pos] === turn.fingerprint) {
+        if (turn.asstIndex !== undefined) {
+          inferredShift = turn.asstIndex - pos;
+        }
+        const msg = messages[asstIdxs[pos]];
+        applyStoredReasoning(msg, turn.thought);
+        turn.asstIndex = pos;
+        assigned.add(pos);
+        matchedTurns.add(turn);
+        searchFrom = pos + 1;
+        break;
+      }
     }
   }
+
+  // 2. Align anchored turns by their recorded assistant index (adjusted for any compaction shift)
+  const anchoredUnmatched = entry.turns.filter(t => !matchedTurns.has(t) && t.asstIndex !== undefined);
+  if (anchoredUnmatched.length > 0) {
+    let shift = inferredShift ?? 0;
+    if (inferredShift === undefined) {
+      const prevTotal = peekAnchor(key) ?? entry.lastSeenAsstCount;
+      const priorCount = prevTotal !== undefined
+        ? prevTotal + 1
+        : Math.max(...anchoredUnmatched.map(t => t.asstIndex!)) + 1;
+      if (asstIdxs.length < priorCount) {
+        shift = priorCount - asstIdxs.length;
+      }
+    }
+    for (const turn of anchoredUnmatched) {
+      const pos = turn.asstIndex! - shift;
+      if (pos >= 0 && pos < asstIdxs.length && !assigned.has(pos)) {
+        if (turn.fingerprint && turn.fingerprint !== fingerprints[pos]) continue;
+        const msg = messages[asstIdxs[pos]];
+        applyStoredReasoning(msg, turn.thought);
+        turn.asstIndex = pos;
+        turn.fingerprint = fingerprints[pos];
+        assigned.add(pos);
+        matchedTurns.add(turn);
+      }
+    }
+  }
+
+  // 3. Align unanchored turns (e.g. saveReasoning called before any injectReasoning)
+  //    to the trailing unmatched assistant messages in chronological order.
+  const unanchored = entry.turns.filter(t => !matchedTurns.has(t) && t.asstIndex === undefined);
+  if (unanchored.length > 0) {
+    const freePositions: number[] = [];
+    for (let pos = 0; pos < asstIdxs.length; pos++) {
+      if (!assigned.has(pos)) freePositions.push(pos);
+    }
+    const injectCount = Math.min(unanchored.length, freePositions.length);
+    const posOffset = freePositions.length - injectCount;
+    const turnOffset = unanchored.length - injectCount;
+    for (let i = 0; i < injectCount; i++) {
+      const pos = freePositions[posOffset + i];
+      const turn = unanchored[turnOffset + i];
+      const msg = messages[asstIdxs[pos]];
+      applyStoredReasoning(msg, turn.thought);
+      turn.asstIndex = pos;
+      turn.fingerprint = fingerprints[pos];
+      assigned.add(pos);
+      matchedTurns.add(turn);
+    }
+  }
+
+  // 4. Fill non-empty fallback reasoning on unmatched assistant turns (never leaving "")
+  for (let pos = 0; pos < asstIdxs.length; pos++) {
+    if (!assigned.has(pos)) {
+      applyFallbackReasoning(messages[asstIdxs[pos]]);
+    }
+  }
+
+  recordAnchor(key, asstIdxs.length);
+  entry.lastSeenAsstCount = asstIdxs.length;
+  entry.timestamp = Date.now();
 }
 
 let router: Router;

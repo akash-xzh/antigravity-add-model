@@ -3,9 +3,12 @@ import * as loopbackSecurity from '../proxy/loopbackSecurity';
 import * as subagentRoutingModule from '../proxy/subagentRouting';
 import * as subagentModels from '../proxy/subagentModels';
 import * as nativeSubagentResponse from '../proxy/nativeSubagentResponse';
+import * as nativeLimits from '../proxy/nativeLimits';
+import * as conversationUsage from '../proxy/conversationUsage';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import * as url from 'node:url';
 import * as http from 'node:http';
 import * as zlib from 'node:zlib';
 import { tmpdir } from 'node:os';
@@ -77,6 +80,7 @@ async function fixture(
     },
     fs,
     path,
+    url,
     zlib,
     electron: { app: { getAppPath: () => path.resolve('scratch/forwarding-fixture') } },
     'electron-log': log,
@@ -88,6 +92,10 @@ async function fixture(
     './proxy/subagentModels': subagentModels,
     './proxy/googlePoolFailover': googlePoolFailover,
     './proxy/nativeSubagentResponse': nativeSubagentResponse,
+
+    './proxy/nativeLimits': nativeLimits,
+
+    './proxy/conversationUsage': conversationUsage,
     './proxy/cloudCodeRouting': {
       CloudCodeRouting: class extends CloudCodeRouting {
         constructor() {

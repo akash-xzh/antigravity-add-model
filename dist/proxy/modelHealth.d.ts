@@ -18,7 +18,7 @@ export interface ModelHealthResult {
     error?: string;
     checkedAt: number;
 }
-export declare function recordRecentModel(modelName: string): void;
+export declare function recordRecentModel(modelName: string, persist?: boolean): void;
 export declare function isRecentModel(modelName: string): boolean;
 export declare function getRecentModels(): string[];
 /**
@@ -32,35 +32,45 @@ export declare function getRecentModels(): string[];
 export declare function sortCustomModels<T extends {
     name: string;
 }>(models: T[]): T[];
+export interface ModelDisplaySettings {
+    showStatusEmoji: boolean;
+}
 export declare function setDataDirectory(dir: string | undefined): void;
+export declare function getDisplaySettingsPath(dataDir?: string): string;
+export declare function loadDisplaySettings(dataDir?: string): ModelDisplaySettings;
+export declare function saveDisplaySettings(settings: ModelDisplaySettings, dataDir?: string): void;
+export declare function isStatusEmojiEnabled(dataDir?: string): boolean;
+export declare function setStatusEmojiEnabled(enabled: boolean, dataDir?: string): void;
 export declare function getHealthCachePath(dataDir?: string): string;
-export declare function loadHealthCache(dataDir?: string): Map<string, ModelHealthResult>;
+export declare function reloadHealthCacheIfChanged(dataDir?: string): Map<string, ModelHealthResult>;
+export declare function loadHealthCache(dataDir?: string, replace?: boolean): Map<string, ModelHealthResult>;
 export declare function saveHealthCache(dataDir?: string): void;
 export declare function getCachedHealth(modelName: string): ModelHealthResult | undefined;
-export declare function getCachedHealthMap(): Map<string, ModelHealthResult>;
-export declare function setCachedHealth(modelName: string, result: ModelHealthResult, persist?: boolean): void;
-export declare function clearHealthCache(persist?: boolean): void;
-/** Record live chat success: immediately marks the model healthy and tracks as recent */
+export declare function getCachedHealthMap(dataDir?: string): Map<string, ModelHealthResult>;
+export declare function setCachedHealth(modelName: string, result: ModelHealthResult, persist?: boolean, dataDir?: string): void;
+export declare function clearHealthCache(persist?: boolean, dataDir?: string): void;
+/** Record live chat success: immediately marks the model healthy and tracks as recent (single batched disk write) */
 export declare function recordModelSuccess(modelName: string, latencyMs?: number): void;
-/** Record live chat failure: immediately marks the model unhealthy/cooldown and tracks as recent */
+/** Record live chat failure: immediately marks the model unhealthy/cooldown and tracks as recent (single batched disk write) */
 export declare function recordModelFailure(modelName: string, error?: string): void;
 /** Strip any status dots/emojis, stars, brackets, and bullets from display name */
 export declare function cleanModelDisplayName(name: string): string;
 /**
  * Formats a model's display name with star (⭐ for recent) and status circle (🟢 / 🟡 / 🔴) for the IDE dropdown.
  * Uses cached status so this executes in ~0ms with zero network calls.
+ * If showStatusEmoji is false, returns the clean model name without emoji dots or stars.
  */
-export declare function formatHealthDisplayName(baseName: string, health?: ModelHealthResult | null, isRecent?: boolean): string;
+export declare function formatHealthDisplayName(baseName: string, health?: ModelHealthResult | null, isRecent?: boolean, showStatusEmoji?: boolean): string;
 /**
  * Pings a single model endpoint with a lightweight HTTP/HTTPS GET, aborting
  * immediately on headers to avoid downloading content or burning usage.
  */
-export declare function pingCustomModel(model: CustomModel): Promise<ModelHealthResult>;
+export declare function pingCustomModel(model: CustomModel, dataDir?: string): Promise<ModelHealthResult>;
 /**
  * Smart batch health check:
  * - Deduplicates endpoints so multiple models using 1 API key/host only trigger 1 ping.
  * - Paces requests (concurrency limit = 3, 150ms delay) to prevent burst rate limits.
  * - Reuses fresh cache unless force=true.
  */
-export declare function checkAllModelsHealth(models: CustomModel[], force?: boolean): Promise<Map<string, ModelHealthResult>>;
+export declare function checkAllModelsHealth(models: CustomModel[], force?: boolean, dataDir?: string): Promise<Map<string, ModelHealthResult>>;
 //# sourceMappingURL=modelHealth.d.ts.map

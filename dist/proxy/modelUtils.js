@@ -4,7 +4,7 @@
  * Replaces ~9 duplicate regex blocks across proxy.js.
  */
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.NATIVE_DEFAULT_CHECKPOINT_THRESHOLD = exports.COMPACTION_TOKEN_RESERVE = void 0;
+exports.DEFAULT_COMPACTION_THRESHOLD_PERCENT = exports.NATIVE_DEFAULT_CHECKPOINT_THRESHOLD = exports.COMPACTION_TOKEN_RESERVE = void 0;
 exports.nativeCheckpointConfig = nativeCheckpointConfig;
 exports.nativeModelExperiments = nativeModelExperiments;
 exports.nativeCatalogCapabilities = nativeCatalogCapabilities;
@@ -13,6 +13,8 @@ exports.detectModelCapabilitiesByName = detectModelCapabilitiesByName;
 /** Extra room for the native checkpoint prompt and a final tool result. */
 exports.COMPACTION_TOKEN_RESERVE = 1024;
 exports.NATIVE_DEFAULT_CHECKPOINT_THRESHOLD = 50000;
+/** Share of a declared context window used before the IDE checkpoints, unless configured. */
+exports.DEFAULT_COMPACTION_THRESHOLD_PERCENT = 80;
 /** Keep the provider's real context/output limits; only change the IDE checkpoint policy. */
 function nativeCheckpointConfig(model) {
     const config = {};
@@ -28,14 +30,23 @@ function nativeCheckpointConfig(model) {
         // checkpoint config if the selected custom model cannot emit that much.
         config.maxOutputTokens = Math.min(8192, cap.maxOutputTokens);
     }
-    const percent = model.compactionThresholdPercent;
+    // A declared context window is the only trustworthy capacity. Without one the IDE keeps its own
+    // 50k new-token default, because a guessed 1M window must never raise the trigger past the real
+    // provider limit. With one, 80% of the window applies unless the model overrides the percentage.
+    const percent = Number.isSafeInteger(model.contextWindow)
+        ? model.compactionThresholdPercent ?? exports.DEFAULT_COMPACTION_THRESHOLD_PERCENT
+        : undefined;
     if (percent !== undefined) {
         const maxTokenLimit = cap.maxTokens - cap.maxOutputTokens - exports.COMPACTION_TOKEN_RESERVE;
         const tokenThreshold = Math.min(Math.floor(cap.maxTokens * percent / 100), maxTokenLimit);
         // Validation rejects unusable limits. Older hand-edited files fail closed.
+        // A model whose usable input budget is below the IDE's historical 50k default
+        // needs an override *more*, not less: without one the IDE checkpoints at 50k
+        // new tokens, which is larger than the entire window. Any limit that leaves
+        // at least 1024 input tokens is safe to publish.
         if (Number.isSafeInteger(percent) && percent >= 10 && percent <= 90 &&
-            Number.isSafeInteger(model.contextWindow) && Number.isSafeInteger(tokenThreshold) && tokenThreshold >= 1024 &&
-            maxTokenLimit >= exports.NATIVE_DEFAULT_CHECKPOINT_THRESHOLD) {
+            Number.isSafeInteger(tokenThreshold) && tokenThreshold >= 1024 &&
+            maxTokenLimit >= tokenThreshold) {
             config.maxTokenLimit = maxTokenLimit;
             // Native IDE independently checks new tokens since the last checkpoint
             // and total input against these fields. Leaving the old 50k threshold

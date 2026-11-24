@@ -11,7 +11,7 @@ const source = ts.transpileModule(readFileSync(path.resolve('src/languageServer.
   compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020, esModuleInterop: true },
 }).outputText;
 
-function createFixture() {
+function createFixture(timers?: { setTimeout: typeof setTimeout; clearTimeout: typeof clearTimeout }) {
   const startProxy = vi.fn<() => Promise<number>>();
   const stopProxy = vi.fn<() => Promise<void>>().mockResolvedValue(undefined);
   const setLanguageServerPortResolver = vi.fn<(getPort: () => number) => void>();
@@ -25,6 +25,7 @@ function createFixture() {
     stdin: new PassThrough(),
     stdout: new PassThrough(),
     stderr: new PassThrough(),
+    kill: vi.fn(() => true),
   });
   const spawn = vi.fn((_binary: string, _args: string[], _options: unknown) => child);
   const shellEnvSync = vi.fn(() => ({}));
@@ -47,7 +48,13 @@ function createFixture() {
   };
   const module = {
     exports: {} as {
-      startLanguageServer: (port: number, csrf: string) => Promise<{ port: number; exitPromise: Promise<unknown> }>;
+      startLanguageServer: (port: number, csrf: string, headless?: boolean) => Promise<{ port: number; exitPromise: Promise<unknown> }>;
+      startAndMonitorLanguageServer: (
+        port: number,
+        csrf: string,
+        options?: { headless?: boolean; onPortChanged?: (newPort: number) => void },
+      ) => Promise<{ port: number; exitPromise: Promise<unknown> }>;
+      getLsProcess: () => unknown;
       killLanguageServer: () => Promise<void>;
       setIntentionalTermination: (value: boolean) => void;
     },
@@ -61,13 +68,24 @@ function createFixture() {
     },
     __dirname: path.resolve('src'),
     process: { platform: process.platform, env: {} },
-    console: { error: vi.fn(), log: vi.fn() },
-    setTimeout,
-    clearTimeout,
+    console: { error: vi.fn(), log: vi.fn(), warn: vi.fn() },
+    setTimeout: timers?.setTimeout ?? setTimeout,
+    clearTimeout: timers?.clearTimeout ?? clearTimeout,
   });
-  return { startProxy, stopProxy, setLanguageServerPortResolver, spawn, shellEnvSync, logStreams, child,
-    start: module.exports.startLanguageServer, stop: module.exports.killLanguageServer,
-    resetTermination: () => module.exports.setIntentionalTermination(false) };
+  return {
+    startProxy,
+    stopProxy,
+    setLanguageServerPortResolver,
+    spawn,
+    shellEnvSync,
+    logStreams,
+    child,
+    start: module.exports.startLanguageServer,
+    startAndMonitor: module.exports.startAndMonitorLanguageServer,
+    getLsProcess: module.exports.getLsProcess,
+    stop: module.exports.killLanguageServer,
+    resetTermination: () => module.exports.setIntentionalTermination(false),
+  };
 }
 
 describe('language-server proxy startup dependency', () => {
@@ -206,5 +224,94 @@ describe('language-server proxy startup dependency', () => {
     expect(livePort()).toBe(0);
     fixture.child.stdout.end(); fixture.child.stderr.end();
     second.stdout.end(); second.stderr.end();
+  });
+
+  it('rejects cleanly and closes logStream on async child spawn error (ENOENT)', async () => {
+    const fixture = createFixture();
+    fixture.startProxy.mockResolvedValue(61002);
+    const starting = fixture.start(0, 'fixture-token');
+    await new Promise((resolve) => setImmediate(resolve));
+    fixture.child.emit('error', Object.assign(new Error('spawn ENOENT'), { code: 'ENOENT' }));
+    await expect(starting).rejects.toThrow('Failed to spawn language server: spawn ENOENT');
+    expect(fixture.getLsProcess()).toBeNull();
+    expect(fixture.logStreams[0].end).toHaveBeenCalledOnce();
+  });
+
+  it('rejects cleanly and closes logStream when sync setup throws before spawn', async () => {
+    const fixture = createFixture();
+    fixture.startProxy.mockResolvedValue(61002);
+    fixture.shellEnvSync.mockImplementation(() => {
+      throw new Error('shell env failed');
+    });
+    await expect(fixture.start(0, 'fixture-token')).rejects.toThrow('shell env failed');
+    expect(fixture.spawn).not.toHaveBeenCalled();
+    expect(fixture.logStreams[0].end).toHaveBeenCalledOnce();
+  });
+
+  it('kills the orphan child, clears _lsProcess, and closes logStream on startup timeout', async () => {
+    const scheduled: Array<() => void> = [];
+    const fixture = createFixture({
+      setTimeout: ((fn: () => void) => {
+        scheduled.push(fn);
+        return scheduled.length as unknown as ReturnType<typeof setTimeout>;
+      }) as unknown as typeof setTimeout,
+      clearTimeout: vi.fn() as unknown as typeof clearTimeout,
+    });
+    fixture.startProxy.mockResolvedValue(61002);
+    const starting = fixture.start(0, 'fixture-token');
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(scheduled.length).toBe(1);
+    scheduled[0]();
+    await expect(starting).rejects.toThrow('Timeout: language server did not report its port');
+    expect(fixture.child.kill).toHaveBeenCalledWith('SIGTERM');
+    expect(fixture.getLsProcess()).toBeNull();
+    expect(fixture.logStreams[0].end).toHaveBeenCalledOnce();
+  });
+
+  it('preserves headless option and retries crash-restart after a transient startup failure', async () => {
+    const fixture = createFixture({
+      setTimeout: ((fn: () => void, ms?: number) => {
+        // Run restart cooldown timers quickly while leaving the 60s startup timeout pending.
+        if (ms && ms < 30000) return setTimeout(fn, 0);
+        return setTimeout(fn, ms);
+      }) as unknown as typeof setTimeout,
+      clearTimeout,
+    });
+    const makeChild = () =>
+      Object.assign(new EventEmitter(), {
+        stdin: new PassThrough(),
+        stdout: new PassThrough(),
+        stderr: new PassThrough(),
+        kill: vi.fn(() => true),
+      });
+    const firstChild = makeChild();
+    const recoveredChild = makeChild();
+    fixture.spawn.mockReturnValueOnce(firstChild).mockReturnValueOnce(recoveredChild);
+    fixture.startProxy
+      .mockResolvedValueOnce(61002)
+      .mockRejectedValueOnce(new Error('transient proxy error'))
+      .mockResolvedValueOnce(61002);
+
+    const portChanges: number[] = [];
+    const starting = fixture.startAndMonitor(0, 'fixture-token', {
+      headless: true,
+      onPortChanged: (p) => portChanges.push(p),
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+    firstChild.stdout.write('listening on HTTP port at 60001 for HTTP\n');
+    await starting;
+    expect(portChanges).toEqual([60001]);
+
+    // Simulate crash; attempt 1 fails with transient error, attempt 2 succeeds with --headless preserved
+    firstChild.emit('exit', 1, null);
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    expect(fixture.spawn).toHaveBeenCalledTimes(2);
+    expect((fixture.spawn.mock.calls[1][1] as string[])).toContain('--headless');
+    recoveredChild.stdout.write('listening on HTTP port at 60005 for HTTP\n');
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(portChanges).toEqual([60001, 60005]);
+
+    await fixture.stop();
+    recoveredChild.emit('exit', 0, null);
   });
 });

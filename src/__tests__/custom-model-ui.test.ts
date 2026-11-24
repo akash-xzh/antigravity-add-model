@@ -319,7 +319,8 @@ describe('custom model settings in the preserved vendor preload', () => {
     expect(documentScroll.scrollTop).toBe(120);
     const active = f.document.activeElement as HTMLElement;
     expect(active.closest<HTMLElement>('[data-model-name]')?.dataset.modelName).toBe('models/next');
-    expect(active.textContent).toBe('Delete');
+    expect(active.textContent).toBe('Disable');
+    expect(active.closest('.agy-menu')).toBeNull();
     expect(focus.mock.calls.at(-1)).toEqual([{ preventScroll: true }]);
   });
 
@@ -666,6 +667,47 @@ describe('custom model settings in the preserved vendor preload', () => {
     expect(f.getModels().map((value) => value.name)).toEqual(['models/primary', 'models/primary-copy']);
   });
 
+  it('keeps one inline toggle per row and hides the remaining actions in an overflow menu', async () => {
+    const f = await fixture();
+    const row = f.document.querySelector<HTMLElement>('.agy-row')!;
+    const actions = row.querySelector('.agy-row-actions')!;
+    const inline = [...actions.children].filter((node) => node.tagName === 'BUTTON');
+    expect(inline.map((node) => node.textContent)).toEqual(['Disable']);
+    const menu = actions.querySelector<HTMLDetailsElement>('details.agy-menu')!;
+    expect(menu.open).toBe(false);
+    expect(menu.querySelector('summary')!.getAttribute('aria-label')).toBe('More actions for Primary');
+    expect([...menu.querySelectorAll('button')].map((node) => node.textContent)).toEqual(
+      ['Check', 'Test', 'Test generation', 'Edit', 'Duplicate', 'Effort variants', 'Delete'],
+    );
+    expect(row.querySelector('.agy-row-title strong')!.textContent).toContain('Primary');
+    expect(row.querySelector('.agy-row-meta')!.textContent).toContain('model-a');
+    expect(row.querySelectorAll('.agy-row-title strong')).toHaveLength(1);
+  });
+
+  it('closes row overflow menus on opening another menu, outside click, or Escape', async () => {
+    const f = await fixture(undefined, [
+      model,
+      { ...model, name: 'models/second', displayName: 'Second', externalModelName: 'model-b' },
+    ]);
+    const menus = [...f.document.querySelectorAll<HTMLDetailsElement>('#agy-custom-models-content details.agy-menu')];
+    expect(menus).toHaveLength(2);
+    menus[0].open = true;
+    menus[0].dispatchEvent(new f.dom.window.Event('toggle'));
+    menus[1].open = true;
+    menus[1].dispatchEvent(new f.dom.window.Event('toggle'));
+    expect(menus[0].open).toBe(false);
+    expect(menus[1].open).toBe(true);
+
+    f.document.body.dispatchEvent(new f.dom.window.MouseEvent('click', { bubbles: true }));
+    expect(menus[1].open).toBe(false);
+
+    menus[1].open = true;
+    menus[1].querySelector('button')!.focus();
+    f.document.dispatchEvent(new f.dom.window.KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+    expect(menus[1].open).toBe(false);
+    expect(f.document.activeElement).toBe(menus[1].querySelector('summary'));
+  });
+
   it('enables and disables a provider group while preserving each saved key', async () => {
     const f = await fixture(undefined, [
       model,
@@ -820,15 +862,16 @@ describe('custom model settings in the preserved vendor preload', () => {
     expect(f.document.querySelector('[role="dialog"]')!.textContent).toContain('HTTP 401');
   });
 
-  it('filters disabled models from response injection and honors model limits', async () => {
+  it('does not intercept GetAvailableModels from the isolated preload world (the proxy MITM owns injection)', async () => {
     const f = await fixture(undefined, [
       { ...model, contextWindow: 32000, maxOutputTokens: 2048 },
       { ...model, name: 'models/disabled', externalModelName: 'disabled', enabled: false },
     ]);
     const response = await f.dom.window.fetch('http://127.0.0.1:50999/fetchAvailableModels');
     const result = await response.json();
-    expect(result.models['custom-model-a']).toMatchObject({ maxTokens: 32000, maxOutputTokens: 2048 });
-    expect(result.models['custom-disabled']).toBeUndefined();
+    // contextIsolation prevents preload fetch/XHR patches from seeing renderer
+    // traffic; /_ui/main.js in the proxy is the single injection point.
+    expect(result.models).toEqual({});
   });
 
   it('edits a Google account pool without revealing persisted secrets', async () => {
@@ -1231,11 +1274,41 @@ describe('Google fleet and native picker search', () => {
       expect(progress.value).toBe(index === 0 ? 0.8 : 0);
       expect(progress.hidden).toBe(false);
       expect(progress.style.display).not.toBe('none');
-      expect(scope.textContent).toContain(index === 0 ? '80% remaining' : '0% remaining');
+      expect(scope.textContent).toContain(index === 0 ? '80% left' : 'Exhausted');
       expect(scope.textContent).toContain(`project-${index === 0 ? 'one' : 'two'}`);
       expect(scope.textContent).toContain('Resets in');
     }
     expect(member(f.document, entries[1].name).textContent).not.toContain('Free');
+  });
+
+  it('shows only the weekly quota for a Free plan and both windows for Pro', async () => {
+    const entries = ['free', 'pro'].map((name) => pool(`models/${name}`, 'shared'));
+    const f = await fixture(undefined, entries);
+    f.invoke.mockClear();
+    f.handlers['storage:google-test-account'] = ({ modelName }: { modelName: string }) => ({
+      success: true,
+      quota: {
+        email: 'shared@example.com',
+        planTier: modelName === 'models/free' ? 'Free' : 'Pro',
+        groups: [
+          {
+            name: 'Gemini Models',
+            displayName: 'Gemini Models',
+            buckets: [
+              { id: 'gemini-weekly', window: 'weekly', groupName: 'Gemini Models', remainingFraction: 0.65 },
+              { id: 'gemini-5h', window: '5h', groupName: 'Gemini Models', remainingFraction: 0.61 },
+            ],
+          },
+        ],
+      },
+    });
+    await f.click('Refresh quotas');
+    const free = member(f.document, 'models/free', 'shared');
+    const pro = member(f.document, 'models/pro', 'shared');
+    expect(free.textContent).toContain('Weekly limit');
+    expect(free.textContent).not.toContain('5-hour limit');
+    expect(pro.textContent).toContain('Weekly limit');
+    expect(pro.textContent).toContain('5-hour limit');
   });
 
   it('never changes a known account identity using another pool quota response', async () => {
@@ -1561,5 +1634,198 @@ describe('Google fleet and native picker search', () => {
     submenu.innerHTML='<span>Model</span><button>Gemini</button><button>View Usage</button>';
     f.document.body.append(submenu); await new Promise(done=>setTimeout(done,250));
     expect(submenu.querySelector('.agy-model-search-input')).toBeNull();
+  });
+
+  it('groups custom models by provider in the picker, opens sidepanel, and filters across providers on search', async () => {
+    const customModels = [
+      {
+        name: 'models/nim-1',
+        displayName: 'nvidia/nemotron-3-ultra',
+        provider: 'openai',
+        providerName: 'NVIDIA NIM',
+        apiUrl: 'https://integrate.api.nvidia.com/v1',
+        apiKey: '********',
+        externalModelName: 'nvidia/nemotron-3-ultra',
+        enabled: true,
+      },
+      {
+        name: 'models/agnes-1',
+        displayName: 'Agnes 2 5 Flash',
+        provider: 'openai',
+        providerName: 'Agnes AI',
+        apiUrl: 'https://agnes.example/v1',
+        apiKey: '********',
+        externalModelName: 'agnes-2.5-flash',
+        enabled: true,
+      },
+    ];
+    const f = await fixture(undefined, customModels);
+    const menu = f.document.createElement('div');
+    menu.setAttribute('role', 'menu');
+    menu.setAttribute('data-state', 'open');
+    menu.innerHTML =
+      '<div>Model</div>' +
+      '<button role="menuitem" data-model="gemini">Gemini 4 Neon Medium</button>' +
+      '<button role="menuitem" data-model="nim">🟢 • nvidia/nemotron-3-ultraMedium</button>' +
+      '<button role="menuitem" data-model="agnes">🟢 • Agnes 2 5 Flash</button>' +
+      '<button role="menuitem">View Usage</button>';
+    f.document.body.append(menu);
+
+    await vi.waitFor(() => expect(menu.querySelectorAll('.agy-provider-row').length).toBe(2));
+    // Official model remains visible, flat custom models are hidden
+    expect(menu.querySelector<HTMLElement>('[data-model="gemini"]')?.style.display).not.toBe('none');
+    expect(menu.querySelector<HTMLElement>('[data-model="nim"]')?.style.display).toBe('none');
+    expect(menu.querySelector<HTMLElement>('[data-model="agnes"]')?.style.display).toBe('none');
+
+    const rows = Array.from(menu.querySelectorAll<HTMLElement>('.agy-provider-row'));
+    expect(rows.map((r) => r.querySelector('.agy-provider-row-name')?.textContent)).toEqual(['NVIDIA NIM', 'Agnes AI']);
+
+    // Hover/click NVIDIA NIM row opens sidepanel with its model
+    rows[0].click();
+    await vi.waitFor(() => expect(f.document.querySelector('.agy-provider-sidepanel')).toBeTruthy());
+    const sideItem = f.document.querySelector<HTMLElement>('.agy-provider-sidepanel .agy-sidepanel-item')!;
+    expect(sideItem.textContent).toContain('nvidia/nemotron-3-ultra');
+
+    let clickedNim = false;
+    menu.querySelector('[data-model="nim"]')!.addEventListener('click', () => {
+      clickedNim = true;
+    });
+    sideItem.click();
+    expect(clickedNim).toBe(true);
+    expect(f.document.querySelector('.agy-provider-sidepanel')).toBeNull();
+
+    // Searching shows flat matching custom models and hides provider rows
+    const input = menu.querySelector<HTMLInputElement>('.agy-model-search-input')!;
+    input.value = 'agnes';
+    input.dispatchEvent(new f.dom.window.Event('input'));
+    expect(menu.querySelectorAll('.agy-provider-row').length).toBe(0);
+    expect(menu.querySelector<HTMLElement>('[data-model="agnes"]')?.style.display).not.toBe('none');
+    expect(menu.querySelector<HTMLElement>('[data-model="gemini"]')?.style.display).toBe('none');
+
+    // Clearing search restores provider grouping
+    input.value = '';
+    input.dispatchEvent(new f.dom.window.Event('input'));
+    expect(menu.querySelectorAll('.agy-provider-row').length).toBe(2);
+    expect(menu.querySelector<HTMLElement>('[data-model="agnes"]')?.style.display).toBe('none');
+  });
+
+  it('allows setting and renaming providerName group in dashboard', async () => {
+    const customModels = [
+      {
+        name: 'models/one',
+        displayName: 'One',
+        provider: 'custom',
+        apiUrl: 'https://provider.example/v1',
+        apiKey: '********',
+        externalModelName: 'model-1',
+        enabled: true,
+      },
+    ];
+    const f = await fixture(undefined, customModels);
+    await f.click('Rename provider');
+    const renameInput = f.document.querySelector<HTMLInputElement>('#agy-rename-provider')!;
+    renameInput.value = 'My Custom Group';
+    await f.click('Save');
+    expect(f.invoke).toHaveBeenCalledWith(
+      'storage:save-custom-model',
+      expect.objectContaining({ name: 'models/one', providerName: 'My Custom Group' }),
+    );
+  });
+
+  it('applies Rename provider and Disable group to all models in the group even when search-filtered', async () => {
+    const customModels = [
+      {
+        name: 'models/alpha',
+        displayName: 'Alpha',
+        provider: 'custom',
+        providerName: 'Shared Group',
+        apiUrl: 'https://shared.example/v1',
+        apiKey: '********',
+        externalModelName: 'alpha',
+        enabled: true,
+      },
+      {
+        name: 'models/beta',
+        displayName: 'Beta',
+        provider: 'custom',
+        providerName: 'Shared Group',
+        apiUrl: 'https://shared.example/v1',
+        apiKey: '********',
+        externalModelName: 'beta',
+        enabled: true,
+      },
+    ];
+    const f = await fixture(undefined, customModels);
+    const search = f.input('agy-model-search', 'alpha');
+    search.dispatchEvent(new f.dom.window.Event('input'));
+    await settle();
+    expect(f.document.querySelectorAll('.agy-row')).toHaveLength(1);
+
+    await f.click('Rename provider');
+    const renameInput = f.document.querySelector<HTMLInputElement>('#agy-rename-provider')!;
+    renameInput.value = 'Renamed Group';
+    await f.click('Save');
+    expect(f.getModels().map((m) => m.providerName)).toEqual(['Renamed Group', 'Renamed Group']);
+
+    await f.click('Disable group');
+    expect(f.getModels().map((m) => m.enabled)).toEqual([false, false]);
+  });
+
+  it('excludes never-checked and healthy models from the Unhealthy filter while showing degraded ones', async () => {
+    const customModels = [
+      { ...model, name: 'models/unchecked', displayName: 'Unchecked' },
+      { ...model, name: 'models/healthy', displayName: 'Healthy' },
+      { ...model, name: 'models/unhealthy', displayName: 'Broken' },
+      { ...model, name: 'models/slow', displayName: 'Slow' },
+      { ...model, name: 'models/cooldown', displayName: 'RateLimited' },
+    ];
+    const f = await fixture(undefined, customModels);
+    f.handlers['storage:get-model-health'] = () => ({
+      'models/healthy': { status: 'healthy', latencyMs: 120, checkedAt: Date.now() },
+      'models/unhealthy': { status: 'unhealthy', error: 'HTTP 500', checkedAt: Date.now() },
+      'models/slow': { status: 'slow', latencyMs: 4500, checkedAt: Date.now() },
+      'models/cooldown': { status: 'cooldown', checkedAt: Date.now() },
+    });
+    await f.click('Unhealthy');
+    const visibleNames = Array.from(f.document.querySelectorAll<HTMLElement>('.agy-row')).map(
+      (row) => row.dataset.modelName,
+    );
+    expect(visibleNames).toEqual(['models/unhealthy', 'models/slow', 'models/cooldown']);
+  });
+
+  it('does not wipe DOM on background focus refresh when unchanged, menu is open, or row has status', async () => {
+    const f = await fixture(undefined, [model]);
+    const content = f.document.getElementById('agy-custom-models-content')!;
+    const replaceSpy = vi.spyOn(content, 'replaceChildren');
+
+    // Unchanged data on background focus refresh must not call replaceChildren
+    f.dom.window.dispatchEvent(new f.dom.window.Event('focus'));
+    await settle();
+    expect(replaceSpy).not.toHaveBeenCalled();
+
+    // Even when data changes, an open row overflow menu prevents destructive background wipe
+    const menu = content.querySelector<HTMLDetailsElement>('details.agy-menu')!;
+    menu.open = true;
+    f.getModels()[0].displayName = 'Changed Externally';
+    f.dom.window.dispatchEvent(new f.dom.window.Event('focus'));
+    await settle();
+    expect(menu.open).toBe(true);
+    expect(replaceSpy).not.toHaveBeenCalled();
+
+    // Closing the menu while row status is visible still skips background wipe
+    menu.open = false;
+    const rowStatus = content.querySelector<HTMLElement>('.agy-row .agy-status')!;
+    rowStatus.textContent = 'Testing…';
+    f.dom.window.dispatchEvent(new f.dom.window.Event('focus'));
+    await settle();
+    expect(rowStatus.textContent).toBe('Testing…');
+    expect(replaceSpy).not.toHaveBeenCalled();
+
+    // Once idle and status cleared, changed data refreshes cleanly
+    rowStatus.textContent = '';
+    f.dom.window.dispatchEvent(new f.dom.window.Event('focus'));
+    await settle();
+    expect(replaceSpy).toHaveBeenCalledTimes(1);
+    expect(content.textContent).toContain('Changed Externally');
   });
 });

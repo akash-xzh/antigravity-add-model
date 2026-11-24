@@ -53,7 +53,14 @@ describe('reactive context ring', () => {
     expect(f.ring().title).toContain('Visible transcript estimate: ~1,234 tokens');
     expect(f.ring().title).toContain('85,000 context limit (configured)');
     expect(f.ring().title).toContain('actual usage can be higher');
-    expect(f.ring().textContent).toBe('~');
+    expect(f.ring().textContent).toBe('~1.2K / 85.0K');
+  });
+
+  it('uses the page-world conversation attribute instead of a stale single-composer route', async () => {
+    const html = `<div data-agy-conversation-id="${idB}">` + composer + '</div>';
+    const f = await fixture(html, `/c/${idA}`);
+    expect(f.requests).toHaveLength(1);
+    expect(f.requests[0].payload.conversationId).toBe(idB);
   });
 
   it('discards an old chat response and immediately requests the queued new chat', async () => {
@@ -108,8 +115,8 @@ describe('reactive context ring', () => {
   it('uses named native composer conversation properties in multiple panes', async () => {
     const f = await fixture(composer + composer, '/');
     const boxes = [...f.dom.window.document.querySelectorAll('[data-testid="agent-input-box"]')] as any[];
-    boxes[0].__reactFiberFixture = { memoizedProps: { conversationId: idA } };
-    boxes[1].__reactFiberFixture = { memoizedProps: { cascadeId: idB } };
+    boxes[0].setAttribute('data-agy-conversation-id', idA);
+    boxes[1].setAttribute('data-agy-conversation-id', idB);
     f.dom.window.dispatchEvent(new f.dom.window.Event('focus'));
     f.requests[0].resolve({ conversationId: '', source: 'unavailable' });
     f.requests[1].resolve({ conversationId: '', source: 'unavailable' });
@@ -145,7 +152,7 @@ describe('reactive context ring', () => {
     expect(f.dom.window.getComputedStyle(f.ring().parentElement!).display).toBe('inline-flex');
     expect(f.dom.window.getComputedStyle(f.ring().parentElement!).alignItems).toBe('center');
     const input = f.dom.window.document.querySelector('[role="combobox"]') as any;
-    input.__reactFiberFixture = { memoizedProps: { conversationId: idB } };
+    input.setAttribute('data-agy-conversation-id', idB);
     f.dom.window.dispatchEvent(new f.dom.window.Event('focus'));
     f.requests[0].resolve({ conversationId: idA, source: 'estimated', currentTokens: 100 });
     await settle();
@@ -169,5 +176,115 @@ describe('reactive context ring', () => {
     expect(f.dom.window.document.querySelectorAll('[data-agy-context-ring]')).toHaveLength(1);
     expect(f.ring().title).toContain('~200 tokens');
     expect(f.ring().title).not.toContain('90,000');
+  });
+
+  it('shows real usage, overhead, compaction countdown and cache hits in the popover', async () => {
+    const f = await fixture();
+    expect(f.requests).toHaveLength(1);
+    f.requests[0].resolve({
+      conversationId: idA,
+      source: 'actual',
+      actualTokens: 94466,
+      actualInputTokens: 4042,
+      actualCachedTokens: 90424,
+      actualOutputTokens: 440,
+      currentTokens: 4042,
+      overheadTokens: 90424,
+      sessionInputTokens: 1200000,
+      sessionCachedTokens: 84000,
+      sessionOutputTokens: 41338,
+      turns: 18,
+      compactions: 2,
+      turnsUntilCompaction: 6,
+      maxTokens: 200000,
+      limitSource: 'configured',
+      compactionThresholdPercent: 80,
+      compactionAtTokens: 160000,
+      tokensUntilCompaction: 65534,
+    });
+    await settle();
+    expect(f.ring().textContent).toBe('94.5K / 200K');
+    expect(f.ring().dataset.agyContextSource).toBe('actual');
+    expect(f.ring().title).toContain('Actual context: 94,466 tokens');
+    expect(f.ring().title).toContain('90,424 tokens for system prompt, tools and images');
+    f.ring().dispatchEvent(new f.dom.window.Event('pointerenter'));
+    const pop = f.dom.window.document.querySelector('.agy-ctx-popover');
+    expect(pop?.textContent).toContain('94,466 / 200,000 (47.2%)');
+    expect(pop?.textContent).toContain('Before compact (80%)');
+    expect(pop?.textContent).toContain('65,534 left · ~6 turns');
+    expect(pop?.textContent).toContain('System prompt, tools & images90.4K');
+    expect(pop?.textContent).toContain('90.4K cached (96% hit)');
+    expect(pop?.textContent).toContain('1.3M in · 41.3K out');
+    expect(pop?.textContent).not.toContain('Real provider usage');
+    f.ring().dispatchEvent(new f.dom.window.Event('pointerleave'));
+    expect(f.dom.window.document.querySelector('.agy-ctx-popover')).toBeNull();
+  });
+
+  it('labels the IDE-managed checkpoint default instead of a window percentage', async () => {
+    const f = await fixture();
+    f.requests[0].resolve({
+      conversationId: idA, source: 'actual', actualTokens: 94466, currentTokens: 4042,
+      actualInputTokens: 4042, actualCachedTokens: 90424, actualOutputTokens: 440,
+      maxTokens: 1000000, limitSource: 'native-catalog', compactionSource: 'ide',
+    });
+    await settle();
+    f.ring().dispatchEvent(new f.dom.window.Event('pointerenter'));
+    const pop = f.dom.window.document.querySelector('.agy-ctx-popover');
+    expect(pop?.textContent).toContain('Before compactIDE default · ~50K new tokens');
+    expect(pop?.textContent).not.toContain('Before compact (');
+    f.ring().dispatchEvent(new f.dom.window.Event('pointerleave'));
+  });
+
+  it('shows the measured generation speed beside the pill and in the popover', async () => {
+    const f = await fixture();
+    f.requests[0].resolve({
+      conversationId: idA,
+      source: 'actual',
+      actualTokens: 94466,
+      actualInputTokens: 4042,
+      actualCachedTokens: 90424,
+      actualOutputTokens: 440,
+      currentTokens: 4042,
+      overheadTokens: 90424,
+      maxTokens: 1000000,
+      limitSource: 'native-catalog',
+      tokensPerSecond: 47.8,
+      ttftMs: 1200,
+    });
+    await settle();
+    expect(f.ring().textContent).toBe('94.5K / 1.0M · 48 t/s');
+    expect(f.ring().title).toContain('model catalog');
+    expect(f.ring().title).toContain('last generation 48 t/s (first token 1.20s)');
+    f.ring().dispatchEvent(new f.dom.window.Event('pointerenter'));
+    const pop = f.dom.window.document.querySelector('.agy-ctx-popover');
+    expect(pop?.textContent).toContain('Last generation48 t/s · 1.20s first token');
+    f.ring().dispatchEvent(new f.dom.window.Event('pointerleave'));
+    expect(f.dom.window.document.querySelector('.agy-ctx-popover')).toBeNull();
+  });
+
+  it('shows unclamped overflow percentages while clamping the bar width and refreshes an open popover in place', async () => {
+    const f = await fixture();
+    // Open popover before usage resolves, then verify live in-place refresh.
+    f.ring().dispatchEvent(new f.dom.window.Event('pointerenter'));
+    const pop = f.dom.window.document.querySelector('.agy-ctx-popover');
+    expect(pop?.textContent).toContain('Unavailable');
+    f.requests[0].resolve({
+      conversationId: idA,
+      source: 'actual',
+      actualTokens: 500_000,
+      actualInputTokens: 50_000,
+      actualCachedTokens: 450_000,
+      actualOutputTokens: 400,
+      currentTokens: 50_000,
+      overheadTokens: 450_000,
+      maxTokens: 200_000,
+      limitSource: 'configured',
+    });
+    await settle();
+    expect(f.dom.window.document.querySelector('.agy-ctx-popover')).toBe(pop);
+    expect(pop?.textContent).toContain('500,000 / 200,000 (250.0%)');
+    const fill = pop?.querySelector<HTMLElement>('.agy-ctx-pop-fill');
+    expect(fill?.style.width).toMatch(/^100(\.0)?%$/);
+    f.ring().dispatchEvent(new f.dom.window.Event('pointerleave'));
   });
 });

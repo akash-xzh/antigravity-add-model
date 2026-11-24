@@ -12,19 +12,28 @@ async function fixture(proxyPort = 50999, lsPort = 54321) {
   let intercept: (details: { url: string }, callback: ReturnType<typeof vi.fn>) => void;
   const register = vi.fn();
   const stop = vi.fn().mockResolvedValue(undefined);
+  const quit = vi.fn();
   const setLanguageServerPortResolver = vi.fn();
   const showErrorBox = vi.fn();
+  const webRequest = { onBeforeRequest: (fn: typeof intercept) => (intercept = fn) };
   const exported: { install?: (getPort: () => number) => void } = {};
   const dependencies = {
     electron: {
-      app: { whenReady: () => Promise.resolve(), on: (name, fn) => events.set(name, fn) },
-      session: { defaultSession: { webRequest: { onBeforeRequest: (fn) => (intercept = fn) } } },
+      app: { whenReady: () => Promise.resolve(), on: (name, fn) => events.set(name, fn), quit },
+      session: { defaultSession: { webRequest } },
       dialog: { showErrorBox },
     },
     './customIpc': { registerCustomModelHandlers: register },
     './proxy': { getProxyPort: () => proxyPort, stopProxy: stop, setLanguageServerPortResolver },
   };
-  runInNewContext(compiled, { exports: exported, require: (name) => dependencies[name], URL, console });
+  runInNewContext(compiled, {
+    exports: exported,
+    require: (name) => dependencies[name],
+    URL,
+    console,
+    setTimeout,
+    clearTimeout,
+  });
   exported.install!(() => lsPort);
   exported.install!(() => lsPort);
   await Promise.resolve();
@@ -32,6 +41,8 @@ async function fixture(proxyPort = 50999, lsPort = 54321) {
     events,
     register,
     stop,
+    quit,
+    webRequest,
     setLanguageServerPortResolver,
     showErrorBox,
     request(url: string) {
@@ -103,5 +114,56 @@ describe('additive desktop integration', () => {
       'Antigravity could not load',
       expect.stringContaining('ERR_CERT_AUTHORITY_INVALID'),
     );
+  });
+
+  it('invokes callback({}) safely on malformed URLs without throwing', async () => {
+    const f = await fixture();
+    expect(f.request('not a valid url ://')).toEqual({});
+    expect(f.request('')).toEqual({});
+  });
+
+  it('preserves addon interception and chains a later vendor onBeforeRequest listener', async () => {
+    const f = await fixture();
+    const vendorListener = vi.fn((_details: { url: string }, cb: (res: unknown) => void) => cb({ cancel: true }));
+    (f.webRequest.onBeforeRequest as unknown as (filter: { urls: string[] }, fn: typeof vendorListener) => void)(
+      { urls: ['https://vendor.example/*'] },
+      vendorListener,
+    );
+
+    // Addon MITM / LS routes remain intercepted
+    expect(f.request('https://127.0.0.1:54321/main.js')).toEqual({
+      redirectURL: 'http://127.0.0.1:50999/_ui/main.js',
+    });
+    expect(f.request(`https://127.0.0.1:54321${route}SetCloudCodeURL`)).toEqual({ cancel: true });
+    expect(vendorListener).not.toHaveBeenCalled();
+
+    // Non-matching vendor URL chains through to vendor listener
+    expect(f.request('https://vendor.example/telemetry')).toEqual({ cancel: true });
+    expect(vendorListener).toHaveBeenCalledTimes(1);
+
+    // Non-matching URL outside vendor filter passes through cleanly
+    expect(f.request('https://other.example/ok')).toEqual({});
+    expect(vendorListener).toHaveBeenCalledTimes(1);
+  });
+
+  it('awaits stopProxy on will-quit and re-triggers app.quit once finished', async () => {
+    const f = await fixture();
+    let release!: () => void;
+    f.stop.mockImplementation(() => new Promise<void>((resolve) => { release = resolve; }));
+    const firstEvent = { preventDefault: vi.fn() };
+    f.events.get('will-quit')!(firstEvent);
+    expect(firstEvent.preventDefault).toHaveBeenCalledTimes(1);
+    expect(f.stop).toHaveBeenCalledTimes(1);
+    expect(f.quit).not.toHaveBeenCalled();
+
+    release();
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(f.quit).toHaveBeenCalledTimes(1);
+
+    // Re-triggered will-quit lets Electron exit without calling preventDefault again
+    const secondEvent = { preventDefault: vi.fn() };
+    f.events.get('will-quit')!(secondEvent);
+    expect(secondEvent.preventDefault).not.toHaveBeenCalled();
+    expect(f.stop).toHaveBeenCalledTimes(1);
   });
 });

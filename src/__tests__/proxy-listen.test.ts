@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it } from 'vitest';
+import { EventEmitter } from 'node:events';
 import { createServer, type Server } from 'http';
 import { mkdtempSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
@@ -44,6 +45,41 @@ describe('proxy listener used by the language server', () => {
     expect(getRequiredProxyPort(directory)).toBeUndefined();
     writeFileSync(join(directory, 'antigravity-proxy.json'), JSON.stringify({ requiredPort: 50999 }));
     expect(getRequiredProxyPort(directory)).toBe(50999);
+  });
+
+  it('falls back to dynamic port 0 on EACCES (e.g. Windows excluded port range) when allowed', async () => {
+    const attempts: number[] = [];
+    const fakeServer = Object.assign(new EventEmitter(), {
+      listen(port: number) {
+        attempts.push(port);
+        if (port === 50999) {
+          process.nextTick(() => fakeServer.emit('error', Object.assign(new Error('permission denied'), { code: 'EACCES' })));
+        } else {
+          process.nextTick(() => fakeServer.emit('listening'));
+        }
+        return fakeServer;
+      },
+      address: () => ({ port: 54321 }),
+    }) as unknown as Server;
+
+    const bound = await listenProxy(fakeServer, 50999, true);
+    expect(bound).toBe(54321);
+    expect(attempts).toEqual([50999, 0]);
+  });
+
+  it('fails explicitly on EACCES when the fixed binary port is required', async () => {
+    const fakeServer = Object.assign(new EventEmitter(), {
+      listen() {
+        process.nextTick(() => fakeServer.emit('error', Object.assign(new Error('permission denied'), { code: 'EACCES' })));
+        return fakeServer;
+      },
+      address: () => null,
+    }) as unknown as Server;
+
+    await expect(listenProxy(fakeServer, 50999, false)).rejects.toMatchObject({
+      code: 'EACCES',
+      message: expect.stringContaining('requires this exact port'),
+    });
   });
 
   it.each(['{', '{"requiredPort":80}', '{}'])('rejects invalid marker %s rather than choosing another port', (value) => {

@@ -41,16 +41,46 @@ const modelUtils_1 = require("./proxy/modelUtils");
 const chatContext_1 = require("./chatContext");
 const promptSections_1 = require("./proxy/promptSections");
 const modelHealth_1 = require("./proxy/modelHealth");
+const ENCRYPTED_SECRET_RE = /^(enc:|local-gcm:|fallback:)/;
+function decryptModelForHealth(model, codec) {
+    const copy = { ...model };
+    if (typeof model.apiKey === 'string' && model.apiKey && model.apiKey !== 'none') {
+        if (model.encrypted || ENCRYPTED_SECRET_RE.test(model.apiKey)) {
+            copy.apiKey = codec.decryptString(model.apiKey);
+            copy.encrypted = false;
+        }
+    }
+    if (model.customHeaders && typeof model.customHeaders === 'object' && !Array.isArray(model.customHeaders)) {
+        const rawHeaders = model.customHeaders;
+        const decryptedHeaders = {};
+        for (const [k, v] of Object.entries(rawHeaders)) {
+            if (typeof v !== 'string')
+                continue;
+            decryptedHeaders[k] = model.encryptedHeaders || ENCRYPTED_SECRET_RE.test(v) ? codec.decryptString(v) : v;
+        }
+        copy.customHeaders = decryptedHeaders;
+        copy.encryptedHeaders = false;
+    }
+    return copy;
+}
 function createModelActions(manager) {
     return {
         'storage:get-custom-models': () => {
             const models = manager.store.list();
+            const uniqueModels = [];
+            const seenNames = new Set();
+            for (const model of models) {
+                if (typeof model.name === 'string' && model.name && !seenNames.has(model.name)) {
+                    seenNames.add(model.name);
+                    uniqueModels.push(model);
+                }
+            }
             // The proxy and both management transports share the same persistent
             // native identity registry. Do not regenerate enum IDs in the renderer.
             let identities = [];
             let identityError;
             try {
-                identities = (0, modelIdentity_1.allocateModelIdentities)(path.dirname(manager.store.filename), models);
+                identities = (0, modelIdentity_1.allocateModelIdentities)(path.dirname(manager.store.filename), uniqueModels);
             }
             catch (error) {
                 // Listing/editing saved providers remains possible when the identity
@@ -65,12 +95,17 @@ function createModelActions(manager) {
                 const index = recent.indexOf(name);
                 return index < 0 ? recent.length : index;
             };
+            const assignedNames = new Set();
             return models
-                .map((model) => {
-                const identity = byName.get(model.name);
+                .map((model, configIndex) => {
+                const isFirstOccurrence = typeof model.name === 'string' && model.name.length > 0 && !assignedNames.has(model.name);
+                if (isFirstOccurrence)
+                    assignedNames.add(model.name);
+                const identity = isFirstOccurrence ? byName.get(model.name) : undefined;
                 const capabilities = (0, modelUtils_1.nativeCatalogCapabilities)(model);
                 return {
                     ...model,
+                    configIndex,
                     isRecent: (0, modelHealth_1.isRecentModel)(model.name) || recent.slice(0, 3).includes(model.name),
                     nativeCatalogId: identity?.catalogId,
                     nativeModelId: identity?.placeholderId,
@@ -80,8 +115,10 @@ function createModelActions(manager) {
                     nativeModelExperiments: (0, modelUtils_1.nativeModelExperiments)(model),
                     nativePickerError: identity?.placeholderId
                         ? undefined
-                        : identityError ||
-                            'Native model picker capacity reached; direct API alias remains available. 651 supported slots include native reservations and retained deleted models.',
+                        : !isFirstOccurrence
+                            ? 'Duplicate model name in configuration; only the first entry is active in the native picker.'
+                            : identityError ||
+                                'Native model picker capacity reached; direct API alias remains available. 651 supported slots include native reservations and retained deleted models.',
                 };
             })
                 .sort((a, b) => rank(a.name) - rank(b.name));
@@ -117,8 +154,8 @@ function createModelActions(manager) {
         'storage:get-chat-context-usage': (payload) => (0, chatContext_1.getContextInformation)(payload, path.dirname(manager.store.filename), manager.store.list()),
         'storage:get-prompt-sections': () => ({
             success: true,
-            tags: promptSections_1.STATIC_TAGS,
-            defaults: promptSections_1.DEFAULT_PROMPT_SECTIONS,
+            tags: (0, promptSections_1.getAvailableTags)(),
+            defaults: (0, promptSections_1.getEffectivePromptDefaults)(),
             config: (0, promptSections_1.loadPromptSectionsConfig)(),
         }),
         'storage:save-prompt-sections': (config) => {
@@ -129,25 +166,40 @@ function createModelActions(manager) {
             (0, promptSections_1.savePromptSectionsConfig)({ overrides: {}, enabled: {} });
             return {
                 success: true,
-                tags: promptSections_1.STATIC_TAGS,
-                defaults: promptSections_1.DEFAULT_PROMPT_SECTIONS,
+                tags: (0, promptSections_1.getAvailableTags)(),
+                defaults: (0, promptSections_1.getEffectivePromptDefaults)(),
                 config: { overrides: {}, enabled: {} },
             };
         },
         'storage:get-model-health': () => {
-            return Object.fromEntries((0, modelHealth_1.getCachedHealthMap)());
+            return Object.fromEntries((0, modelHealth_1.getCachedHealthMap)(path.dirname(manager.store.filename)));
         },
         'storage:check-model-health': async (name) => {
-            const models = manager.store.list();
+            const dataDir = path.dirname(manager.store.filename);
+            const rawModels = manager.store.read();
             if (typeof name === 'string' && name.trim()) {
-                const target = models.find((m) => m.name === name.trim());
-                if (target) {
-                    const res = await (0, modelHealth_1.pingCustomModel)(target);
-                    return { [target.name]: res };
+                const trimmed = name.trim();
+                const target = rawModels.find((m) => m.name === trimmed);
+                if (!target) {
+                    return {};
                 }
+                const decryptedTarget = decryptModelForHealth(target, manager.store.codec);
+                const res = await (0, modelHealth_1.pingCustomModel)(decryptedTarget, dataDir);
+                return { [target.name]: res };
             }
-            const healthMap = await (0, modelHealth_1.checkAllModelsHealth)(models, true);
+            const decryptedModels = rawModels.map((m) => decryptModelForHealth(m, manager.store.codec));
+            const healthMap = await (0, modelHealth_1.checkAllModelsHealth)(decryptedModels, true, dataDir);
             return Object.fromEntries(healthMap);
+        },
+        'storage:get-display-settings': () => {
+            return (0, modelHealth_1.loadDisplaySettings)(path.dirname(manager.store.filename));
+        },
+        'storage:save-display-settings': (settings) => {
+            const showStatusEmoji = typeof settings?.showStatusEmoji === 'boolean'
+                ? settings.showStatusEmoji
+                : true;
+            (0, modelHealth_1.saveDisplaySettings)({ showStatusEmoji }, path.dirname(manager.store.filename));
+            return { success: true, showStatusEmoji };
         },
     };
 }

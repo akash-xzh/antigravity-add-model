@@ -1,6 +1,7 @@
 export interface ModelEntry {
     name: string;
     provider: string;
+    providerName?: string;
     apiUrl: string;
     apiKey?: string;
     externalModelName: string;

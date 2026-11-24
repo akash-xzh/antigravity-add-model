@@ -3,6 +3,7 @@ import * as loopbackSecurity from '../proxy/loopbackSecurity';
 import { afterAll, afterEach, describe, expect, it, vi } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import * as url from 'node:url';
 import * as http from 'node:http';
 import * as zlib from 'node:zlib';
 import { tmpdir } from 'node:os';
@@ -19,6 +20,8 @@ import * as shared from '../proxy/shared';
 import * as subagentRouting from '../proxy/subagentRouting';
 import * as subagentModels from '../proxy/subagentModels';
 import * as nativeSubagentResponse from '../proxy/nativeSubagentResponse';
+import * as nativeLimits from '../proxy/nativeLimits';
+import * as conversationUsage from '../proxy/conversationUsage';
 import { validateCustomModel } from '../schemaValidator';
 
 vi.mock('electron-log', () => ({ default: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() } }));
@@ -83,6 +86,7 @@ async function fixture(models: CustomModel[], fallback: string) {
     },
     fs,
     path,
+    url,
     zlib,
     electron: { app: { getAppPath: () => directory } },
     'electron-log': { info: vi.fn(), error: vi.fn(), warn: vi.fn() },
@@ -95,6 +99,10 @@ async function fixture(models: CustomModel[], fallback: string) {
     './proxy/subagentModels': subagentModels,
     './proxy/googlePoolFailover': googlePoolFailover,
     './proxy/nativeSubagentResponse': nativeSubagentResponse,
+
+    './proxy/nativeLimits': nativeLimits,
+
+    './proxy/conversationUsage': conversationUsage,
     './proxy/customRequest': customRequest,
     './modelStore': { readModelConfig: () => models.map((model) => ({ ...model })) },
     './schemaValidator': { validateCustomModel },
@@ -1107,4 +1115,21 @@ describe('built-in parent to custom subagent through native Google HTTP forwardi
       expect(upstream.requests).toHaveLength(0);
     },
   );
+  it('records native stream timing even when invoke_subagent routes through forwardNativeGeneration', async () => {
+    const conversationId = '33333333-4444-5555-6666-777777777777';
+    const builtin = await serve((_req, res) => {
+      res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+      const payload = nativePayload('cloud-code');
+      res.write(`data: ${JSON.stringify(payload)}\n\n`);
+      setTimeout(() => res.end(`data: ${JSON.stringify(payload)}\n\ndata: [DONE]\n\n`), 70);
+    });
+    const upstream = await providerFixture(() => undefined);
+    const proxy = await fixture([model(upstream.url, 'openai', 'child')], builtin);
+    const response = await nativeRequest(proxy, 'cloud-code', true, conversationId);
+    expect(response.status).toBe(200);
+    expect(await response.text()).toContain('NATIVE OK');
+    const timing = conversationUsage.getConversationUsage(conversationId);
+    expect(timing).toBeDefined();
+    expect(timing!.decodeMs).toBeGreaterThanOrEqual(50);
+  });
 });

@@ -235,6 +235,31 @@ test('empty completions and SSE errors fail over before output; all-empty and pa
   } finally { responseMode = 'normal'; await api('/api/models', setup); }
 });
 
+test('DISABLE_GLOBAL_FALLBACK=1 blocks the unwhitelisted second-pass provider', async () => {
+  const saved = process.env.DISABLE_GLOBAL_FALLBACK;
+  process.env.DISABLE_GLOBAL_FALLBACK = '1';
+  await api('/api/models', {
+    ...setup,
+    _routing_mode: 'per-model-per-provider',
+    _provider_models: { demo: { openai: 'model-primary' } },
+  });
+  responseMode = 'empty-primary-sse';
+  const before = requested.length;
+  try {
+    const response = await generate();
+    assert.equal(response.status, 502, 'strict whitelist must fail rather than fall back');
+    assert.equal(requested.length - before, 1, 'nvidia (not whitelisted) must not be attempted');
+    await api('/api/models', setup);
+    responseMode = 'normal';
+    assert.equal((await generate()).status, 200, 'the whitelisted provider still works');
+  } finally {
+    responseMode = 'normal';
+    await api('/api/models', setup);
+    if (saved === undefined) delete process.env.DISABLE_GLOBAL_FALLBACK;
+    else process.env.DISABLE_GLOBAL_FALLBACK = saved;
+  }
+});
+
 test('model matrix hot reload changes routing and authenticated model discovery', async () => {
   const update = { ...setup, _provider_models: { demo: { openai: 'renamed-model' }, additional: { openai: 'extra-model' } } };
   assert.equal((await api('/api/models', update)).status, 200);
@@ -346,11 +371,11 @@ test('reasoning options and opt-in context compaction affect upstream payloads',
   await api('/api/reasoning-effort', { model: 'demo', effort: 'low' });
   await generate(); assert.equal(requested.at(-1)?.body.reasoning_effort, 'low');
   await api('/api/reasoning-effort', { model: 'demo', effort: 'default' });
-  const compact = { ...setup, _compaction_enabled: true, _compaction_threshold: 0.5, _compaction_tail_turns: 1, _context_windows: { demo: 256 } };
+  const compact = { ...setup, _compaction_enabled: true, _compaction_threshold: 0.5, _compaction_tail_turns: 1, _context_windows: { demo: 5000 } };
   assert.equal((await api('/api/models', compact)).status, 200);
   const start = requested.length;
   const contents = [
-    { role: 'user', parts: [{ text: 'earlier context '.repeat(500) }] },
+    { role: 'user', parts: [{ text: 'earlier context '.repeat(650) }] },
     { role: 'model', parts: [{ text: 'old answer' }] },
     { role: 'user', parts: [{ text: 'recent question' }] },
     { role: 'model', parts: [{ text: 'recent answer' }] },
@@ -363,9 +388,9 @@ test('reasoning options and opt-in context compaction affect upstream payloads',
 });
 
 test('compaction effort overrides only the summary request and settings reload restores inheritance', async () => {
-  const compact = { ...setup, _compaction_enabled: true, _compaction_threshold: 0.5, _compaction_tail_turns: 1, _context_windows: { demo: 256 } };
+  const compact = { ...setup, _compaction_enabled: true, _compaction_threshold: 0.5, _compaction_tail_turns: 1, _context_windows: { demo: 5000 } };
   const contents = [
-    { role: 'user', parts: [{ text: 'earlier context '.repeat(500) }] },
+    { role: 'user', parts: [{ text: 'earlier context '.repeat(650) }] },
     { role: 'model', parts: [{ text: 'old answer' }] },
     { role: 'user', parts: [{ text: 'recent question' }] },
     { role: 'model', parts: [{ text: 'recent answer' }] },

@@ -19,7 +19,13 @@ exports.isRecentModel = isRecentModel;
 exports.getRecentModels = getRecentModels;
 exports.sortCustomModels = sortCustomModels;
 exports.setDataDirectory = setDataDirectory;
+exports.getDisplaySettingsPath = getDisplaySettingsPath;
+exports.loadDisplaySettings = loadDisplaySettings;
+exports.saveDisplaySettings = saveDisplaySettings;
+exports.isStatusEmojiEnabled = isStatusEmojiEnabled;
+exports.setStatusEmojiEnabled = setStatusEmojiEnabled;
 exports.getHealthCachePath = getHealthCachePath;
+exports.reloadHealthCacheIfChanged = reloadHealthCacheIfChanged;
 exports.loadHealthCache = loadHealthCache;
 exports.saveHealthCache = saveHealthCache;
 exports.getCachedHealth = getCachedHealth;
@@ -39,6 +45,7 @@ const node_path_1 = __importDefault(require("node:path"));
 const node_os_1 = __importDefault(require("node:os"));
 const node_crypto_1 = require("node:crypto");
 const electron_log_1 = __importDefault(require("electron-log"));
+const registry_1 = require("./registry");
 const HEALTH_CHECK_TIMEOUT_MS = 5000;
 const FRESHNESS_TTL_MS = 15 * 60 * 1000; // 15 minutes before background refresh is eligible
 const CONCURRENCY_LIMIT = 3;
@@ -48,7 +55,56 @@ let currentDataDirectory;
 const memoryCache = new Map();
 const inflightPings = new Map();
 const recentModelsList = [];
-function recordRecentModel(modelName) {
+let loadedHealthCacheFilePath;
+let loadedHealthCacheMtime = -1;
+let loadedHealthCacheSize = -1;
+let healthCacheInitializedForPath;
+const RENAME_RETRY_CODES = new Set(['EPERM', 'EBUSY']);
+const RENAME_MAX_ATTEMPTS = 5;
+function sleepSync(ms) {
+    if (ms <= 0)
+        return;
+    try {
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+    }
+    catch {
+        const end = Date.now() + ms;
+        while (Date.now() < end) {
+            /* fallback pause */
+        }
+    }
+}
+function writeJsonFileAtomicSync(filePath, payload) {
+    node_fs_1.default.mkdirSync(node_path_1.default.dirname(filePath), { recursive: true, mode: 0o700 });
+    const tmp = `${filePath}.${(0, node_crypto_1.randomUUID)()}.tmp`;
+    try {
+        node_fs_1.default.writeFileSync(tmp, JSON.stringify(payload, null, 2), { encoding: 'utf8', mode: 0o600 });
+        for (let attempt = 0; attempt < RENAME_MAX_ATTEMPTS; attempt++) {
+            try {
+                node_fs_1.default.renameSync(tmp, filePath);
+                return;
+            }
+            catch (err) {
+                const code = err.code;
+                if (code && RENAME_RETRY_CODES.has(code) && attempt < RENAME_MAX_ATTEMPTS - 1) {
+                    sleepSync(10 * (attempt + 1));
+                    continue;
+                }
+                throw err;
+            }
+        }
+    }
+    finally {
+        try {
+            if (node_fs_1.default.existsSync(tmp))
+                node_fs_1.default.unlinkSync(tmp);
+        }
+        catch {
+            /* ignore cleanup error */
+        }
+    }
+}
+function updateRecentModelInMemory(modelName) {
     if (!modelName)
         return;
     const filtered = recentModelsList.filter((m) => m !== modelName);
@@ -57,12 +113,21 @@ function recordRecentModel(modelName) {
     if (recentModelsList.length > MAX_RECENT_MODELS) {
         recentModelsList.length = MAX_RECENT_MODELS;
     }
-    saveHealthCache();
+}
+function recordRecentModel(modelName, persist = true) {
+    if (!modelName)
+        return;
+    updateRecentModelInMemory(modelName);
+    if (persist) {
+        saveHealthCache();
+    }
 }
 function isRecentModel(modelName) {
+    ensureHealthCacheLoaded();
     return recentModelsList.includes(modelName);
 }
 function getRecentModels() {
+    ensureHealthCacheLoaded();
     return [...recentModelsList];
 }
 function getHealthRank(health) {
@@ -110,18 +175,136 @@ function sortCustomModels(models) {
         return 0;
     });
 }
+let cachedDisplaySettings;
+let cachedDisplaySettingsFilePath;
+let cachedDisplaySettingsMtime = -1;
+let cachedDisplaySettingsSize = -1;
 function setDataDirectory(dir) {
     currentDataDirectory = dir ? node_path_1.default.resolve(dir) : undefined;
+    cachedDisplaySettings = undefined;
+    cachedDisplaySettingsFilePath = undefined;
+    cachedDisplaySettingsMtime = -1;
+    cachedDisplaySettingsSize = -1;
+    loadedHealthCacheFilePath = undefined;
+    loadedHealthCacheMtime = -1;
+    loadedHealthCacheSize = -1;
+    healthCacheInitializedForPath = undefined;
+}
+function getDisplaySettingsPath(dataDir) {
+    const base = dataDir || currentDataDirectory || node_path_1.default.join(node_os_1.default.homedir(), '.gemini', 'antigravity');
+    return node_path_1.default.join(base, 'model_display_settings.json');
+}
+function loadDisplaySettings(dataDir) {
+    const filePath = getDisplaySettingsPath(dataDir);
+    try {
+        if (!node_fs_1.default.existsSync(filePath)) {
+            cachedDisplaySettings = { showStatusEmoji: true };
+            cachedDisplaySettingsFilePath = filePath;
+            cachedDisplaySettingsMtime = -1;
+            cachedDisplaySettingsSize = -1;
+            return cachedDisplaySettings;
+        }
+        const stat = node_fs_1.default.statSync(filePath);
+        if (cachedDisplaySettings !== undefined &&
+            cachedDisplaySettingsFilePath === filePath &&
+            stat.mtimeMs === cachedDisplaySettingsMtime &&
+            stat.size === cachedDisplaySettingsSize) {
+            return cachedDisplaySettings;
+        }
+        const raw = node_fs_1.default.readFileSync(filePath, 'utf8');
+        const parsed = JSON.parse(raw);
+        cachedDisplaySettings = {
+            showStatusEmoji: typeof parsed.showStatusEmoji === 'boolean' ? parsed.showStatusEmoji : true,
+        };
+        cachedDisplaySettingsFilePath = filePath;
+        cachedDisplaySettingsMtime = stat.mtimeMs;
+        cachedDisplaySettingsSize = stat.size;
+        return cachedDisplaySettings;
+    }
+    catch (err) {
+        cachedDisplaySettings = { showStatusEmoji: true };
+        cachedDisplaySettingsFilePath = filePath;
+        cachedDisplaySettingsMtime = -1;
+        cachedDisplaySettingsSize = -1;
+        return cachedDisplaySettings;
+    }
+}
+function saveDisplaySettings(settings, dataDir) {
+    const filePath = getDisplaySettingsPath(dataDir);
+    try {
+        const payload = {
+            showStatusEmoji: settings.showStatusEmoji !== false,
+        };
+        writeJsonFileAtomicSync(filePath, payload);
+        cachedDisplaySettings = payload;
+        cachedDisplaySettingsFilePath = filePath;
+        try {
+            const stat = node_fs_1.default.statSync(filePath);
+            cachedDisplaySettingsMtime = stat.mtimeMs;
+            cachedDisplaySettingsSize = stat.size;
+        }
+        catch {
+            cachedDisplaySettingsMtime = -1;
+            cachedDisplaySettingsSize = -1;
+        }
+    }
+    catch (err) {
+        electron_log_1.default.debug('[ModelHealth] Could not save display settings to disk:', err);
+    }
+}
+function isStatusEmojiEnabled(dataDir) {
+    return loadDisplaySettings(dataDir).showStatusEmoji;
+}
+function setStatusEmojiEnabled(enabled, dataDir) {
+    saveDisplaySettings({ showStatusEmoji: enabled }, dataDir);
 }
 function getHealthCachePath(dataDir) {
     const base = dataDir || currentDataDirectory || node_path_1.default.join(node_os_1.default.homedir(), '.gemini', 'antigravity');
     return node_path_1.default.join(base, 'model_health_cache.json');
 }
-function loadHealthCache(dataDir) {
+function ensureHealthCacheLoaded(dataDir) {
+    const filePath = getHealthCachePath(dataDir);
+    if (healthCacheInitializedForPath !== filePath) {
+        loadHealthCache(dataDir);
+    }
+}
+function reloadHealthCacheIfChanged(dataDir) {
     const filePath = getHealthCachePath(dataDir);
     try {
-        if (!node_fs_1.default.existsSync(filePath))
+        if (!node_fs_1.default.existsSync(filePath)) {
+            if (loadedHealthCacheFilePath === filePath && loadedHealthCacheMtime !== -1) {
+                memoryCache.clear();
+                recentModelsList.length = 0;
+                loadedHealthCacheMtime = -1;
+                loadedHealthCacheSize = -1;
+            }
+            healthCacheInitializedForPath = filePath;
             return memoryCache;
+        }
+        const stat = node_fs_1.default.statSync(filePath);
+        if (loadedHealthCacheFilePath === filePath &&
+            loadedHealthCacheMtime === stat.mtimeMs &&
+            loadedHealthCacheSize === stat.size) {
+            return memoryCache;
+        }
+        return loadHealthCache(dataDir, true);
+    }
+    catch (err) {
+        electron_log_1.default.debug('[ModelHealth] Could not stat health cache on disk:', err);
+        return memoryCache;
+    }
+}
+function loadHealthCache(dataDir, replace = false) {
+    const filePath = getHealthCachePath(dataDir);
+    healthCacheInitializedForPath = filePath;
+    try {
+        if (!node_fs_1.default.existsSync(filePath)) {
+            loadedHealthCacheFilePath = filePath;
+            loadedHealthCacheMtime = -1;
+            loadedHealthCacheSize = -1;
+            return memoryCache;
+        }
+        const stat = node_fs_1.default.statSync(filePath);
         const raw = node_fs_1.default.readFileSync(filePath, 'utf8');
         const parsed = JSON.parse(raw);
         if (parsed && typeof parsed === 'object') {
@@ -137,6 +320,9 @@ function loadHealthCache(dataDir) {
                     recentModelsList.length = MAX_RECENT_MODELS;
                 }
             }
+            if (replace) {
+                memoryCache.clear();
+            }
             for (const [key, val] of Object.entries(modelsObj)) {
                 if (val &&
                     typeof val === 'object' &&
@@ -145,6 +331,9 @@ function loadHealthCache(dataDir) {
                 }
             }
         }
+        loadedHealthCacheFilePath = filePath;
+        loadedHealthCacheMtime = stat.mtimeMs;
+        loadedHealthCacheSize = stat.size;
     }
     catch (err) {
         electron_log_1.default.debug('[ModelHealth] Could not read health cache from disk:', err);
@@ -154,7 +343,6 @@ function loadHealthCache(dataDir) {
 function saveHealthCache(dataDir) {
     const filePath = getHealthCachePath(dataDir);
     try {
-        node_fs_1.default.mkdirSync(node_path_1.default.dirname(filePath), { recursive: true, mode: 0o700 });
         const modelsObj = {};
         for (const [key, val] of memoryCache.entries()) {
             modelsObj[key] = val;
@@ -163,39 +351,60 @@ function saveHealthCache(dataDir) {
             models: modelsObj,
             recent: [...recentModelsList],
         };
-        const tmp = `${filePath}.${(0, node_crypto_1.randomUUID)()}.tmp`;
-        node_fs_1.default.writeFileSync(tmp, JSON.stringify(payload, null, 2), { encoding: 'utf8', mode: 0o600 });
-        node_fs_1.default.renameSync(tmp, filePath);
+        writeJsonFileAtomicSync(filePath, payload);
+        healthCacheInitializedForPath = filePath;
+        loadedHealthCacheFilePath = filePath;
+        try {
+            const stat = node_fs_1.default.statSync(filePath);
+            loadedHealthCacheMtime = stat.mtimeMs;
+            loadedHealthCacheSize = stat.size;
+        }
+        catch {
+            loadedHealthCacheMtime = -1;
+            loadedHealthCacheSize = -1;
+        }
     }
     catch (err) {
         electron_log_1.default.debug('[ModelHealth] Could not save health cache to disk:', err);
     }
 }
 function getCachedHealth(modelName) {
+    ensureHealthCacheLoaded();
     return memoryCache.get(modelName);
 }
-function getCachedHealthMap() {
+function getCachedHealthMap(dataDir) {
+    if (dataDir) {
+        reloadHealthCacheIfChanged(dataDir);
+    }
+    else {
+        ensureHealthCacheLoaded();
+    }
     return new Map(memoryCache);
 }
-function setCachedHealth(modelName, result, persist = true) {
+function setCachedHealth(modelName, result, persist = true, dataDir) {
     memoryCache.set(modelName, result);
     if (persist) {
-        saveHealthCache();
+        saveHealthCache(dataDir);
     }
 }
-function clearHealthCache(persist = false) {
+function clearHealthCache(persist = false, dataDir) {
     memoryCache.clear();
     inflightPings.clear();
     recentModelsList.length = 0;
+    const filePath = getHealthCachePath(dataDir);
+    healthCacheInitializedForPath = filePath;
+    loadedHealthCacheFilePath = filePath;
+    loadedHealthCacheMtime = -1;
+    loadedHealthCacheSize = -1;
     if (persist) {
-        saveHealthCache();
+        saveHealthCache(dataDir);
     }
 }
-/** Record live chat success: immediately marks the model healthy and tracks as recent */
+/** Record live chat success: immediately marks the model healthy and tracks as recent (single batched disk write) */
 function recordModelSuccess(modelName, latencyMs) {
     if (!modelName)
         return;
-    recordRecentModel(modelName);
+    updateRecentModelInMemory(modelName);
     const roundedLat = typeof latencyMs === 'number' && latencyMs > 0 ? Math.round(latencyMs) : undefined;
     const isSlow = roundedLat !== undefined && roundedLat > 2000;
     setCachedHealth(modelName, {
@@ -204,11 +413,11 @@ function recordModelSuccess(modelName, latencyMs) {
         checkedAt: Date.now(),
     });
 }
-/** Record live chat failure: immediately marks the model unhealthy/cooldown and tracks as recent */
+/** Record live chat failure: immediately marks the model unhealthy/cooldown and tracks as recent (single batched disk write) */
 function recordModelFailure(modelName, error) {
     if (!modelName)
         return;
-    recordRecentModel(modelName);
+    updateRecentModelInMemory(modelName);
     let cleanError = error ? String(error).replace(/^Error:\s*/i, '').trim() : 'Chat error';
     if (cleanError.length > 40)
         cleanError = cleanError.slice(0, 37) + '…';
@@ -231,9 +440,14 @@ function cleanModelDisplayName(name) {
 /**
  * Formats a model's display name with star (⭐ for recent) and status circle (🟢 / 🟡 / 🔴) for the IDE dropdown.
  * Uses cached status so this executes in ~0ms with zero network calls.
+ * If showStatusEmoji is false, returns the clean model name without emoji dots or stars.
  */
-function formatHealthDisplayName(baseName, health, isRecent = false) {
+function formatHealthDisplayName(baseName, health, isRecent = false, showStatusEmoji) {
     const clean = cleanModelDisplayName(baseName);
+    const enabled = showStatusEmoji !== undefined ? showStatusEmoji : isStatusEmojiEnabled();
+    if (!enabled) {
+        return clean;
+    }
     const star = isRecent ? '⭐ ' : '';
     if (!health || health.status === 'healthy') {
         return `${star}🟢 • ${clean}`;
@@ -248,27 +462,27 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
  * Pings a single model endpoint with a lightweight HTTP/HTTPS GET, aborting
  * immediately on headers to avoid downloading content or burning usage.
  */
-function pingCustomModel(model) {
+function pingCustomModel(model, dataDir) {
     // If provider is Google Cloud Code, check accounts without making external requests
     if (model.provider === 'google-cloudcode') {
         const hasAccount = Array.isArray(model.googleAccounts) && model.googleAccounts.some((a) => a.enabled !== false);
         const result = hasAccount
             ? { status: 'healthy', latencyMs: 5, checkedAt: Date.now() }
             : { status: 'unhealthy', error: 'No account', checkedAt: Date.now() };
-        setCachedHealth(model.name, result);
+        setCachedHealth(model.name, result, true, dataDir);
         return Promise.resolve(result);
     }
     if (!model.apiUrl) {
         const result = { status: 'unhealthy', error: 'No URL', checkedAt: Date.now() };
-        setCachedHealth(model.name, result);
+        setCachedHealth(model.name, result, true, dataDir);
         return Promise.resolve(result);
     }
     // Deduplicate concurrent in-flight pings to the exact same endpoint
-    const endpointKey = `${model.apiUrl}::${model.apiKey || ''}::${model.provider || ''}`;
+    const endpointKey = `${model.apiUrl}::${model.apiKey || ''}::${model.provider || ''}::${model.apiFormat || ''}`;
     const existingInflight = inflightPings.get(endpointKey);
     if (existingInflight) {
         return existingInflight.then((res) => {
-            setCachedHealth(model.name, res);
+            setCachedHealth(model.name, res, true, dataDir);
             return res;
         });
     }
@@ -280,7 +494,7 @@ function pingCustomModel(model) {
             if (settled)
                 return;
             settled = true;
-            setCachedHealth(model.name, result);
+            setCachedHealth(model.name, result, true, dataDir);
             resolve(result);
         };
         const timer = setTimeout(() => {
@@ -303,12 +517,15 @@ function pingCustomModel(model) {
             const parsedUrl = new URL(model.apiUrl);
             const isHttps = parsedUrl.protocol === 'https:';
             const client = isHttps ? node_https_1.default : node_http_1.default;
+            const providerHeaders = (0, registry_1.getProviderHeaders)(model.provider || 'custom', model.apiKey || '', model.apiFormat, model.apiUrl);
             const headers = {
                 'User-Agent': 'Antigravity-HealthCheck/1.0',
                 Accept: 'application/json, text/plain, */*',
             };
-            if (model.apiKey && model.apiKey !== 'none') {
-                headers['Authorization'] = `Bearer ${model.apiKey}`;
+            for (const [k, v] of Object.entries(providerHeaders)) {
+                if (v !== undefined && k.toLowerCase() !== 'content-type') {
+                    headers[k] = v;
+                }
             }
             if (model.customHeaders) {
                 for (const [k, v] of Object.entries(model.customHeaders)) {
@@ -397,9 +614,9 @@ function pingCustomModel(model) {
  * - Paces requests (concurrency limit = 3, 150ms delay) to prevent burst rate limits.
  * - Reuses fresh cache unless force=true.
  */
-async function checkAllModelsHealth(models, force = false) {
+async function checkAllModelsHealth(models, force = false, dataDir) {
     if (!models || models.length === 0)
-        return getCachedHealthMap();
+        return getCachedHealthMap(dataDir);
     // Deduplicate by endpoint
     const endpointGroups = new Map();
     for (const m of models) {
@@ -409,13 +626,13 @@ async function checkAllModelsHealth(models, force = false) {
         if (!force && existing && Date.now() - existing.checkedAt < FRESHNESS_TTL_MS) {
             continue; // Cache is still fresh
         }
-        const key = `${m.apiUrl || ''}::${m.apiKey || ''}::${m.provider || ''}`;
+        const key = `${m.apiUrl || ''}::${m.apiKey || ''}::${m.provider || ''}::${m.apiFormat || ''}`;
         const list = endpointGroups.get(key) || [];
         list.push(m);
         endpointGroups.set(key, list);
     }
     if (endpointGroups.size === 0) {
-        return getCachedHealthMap();
+        return getCachedHealthMap(dataDir);
     }
     electron_log_1.default.debug(`[ModelHealth] Smart health check: ${models.length} models across ${endpointGroups.size} unique endpoints (force=${force})`);
     const entries = Array.from(endpointGroups.entries());
@@ -427,9 +644,9 @@ async function checkAllModelsHealth(models, force = false) {
                 break;
             const [, groupModels] = current;
             const primary = groupModels[0];
-            const res = await pingCustomModel(primary);
+            const res = await pingCustomModel(primary, dataDir);
             for (const m of groupModels) {
-                setCachedHealth(m.name, res, false);
+                setCachedHealth(m.name, res, false, dataDir);
             }
             if (PACING_DELAY_MS > 0) {
                 await sleep(PACING_DELAY_MS);
@@ -437,9 +654,7 @@ async function checkAllModelsHealth(models, force = false) {
         }
     });
     await Promise.allSettled(workers);
-    saveHealthCache();
-    return getCachedHealthMap();
+    saveHealthCache(dataDir);
+    return getCachedHealthMap(dataDir);
 }
-// Initial cache load from default location
-loadHealthCache();
 //# sourceMappingURL=modelHealth.js.map

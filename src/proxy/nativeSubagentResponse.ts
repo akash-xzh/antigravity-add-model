@@ -15,6 +15,17 @@ export interface NativeSubagentRouting {
   resolve: SubagentModelResolver;
 }
 
+/** Outcome of a native generation forward. Errors are written to the client but never thrown. */
+export interface NativeForwardResult {
+  /** True only when a 2xx native generation was fully delivered without error or disconnect. */
+  ok: boolean;
+}
+
+/** Gate telemetry/account-success bookkeeping on a real successful generation. */
+export function wasForwardedSuccessfully(result: NativeForwardResult | undefined): boolean {
+  return result?.ok === true;
+}
+
 const JSON_LIMIT = 16 * 1024 * 1024;
 const EVENT_LIMIT = 4 * 1024 * 1024;
 const HOP_HEADERS = new Set([
@@ -153,8 +164,9 @@ export async function forwardNativeGeneration(
   downstream: http.ServerResponse,
   routing: NativeSubagentRouting,
   streamHint: boolean,
-): Promise<void> {
+): Promise<NativeForwardResult> {
   const successful = (upstream.statusCode || 200) >= 200 && (upstream.statusCode || 200) < 300;
+  let succeeded = successful;
   const contentType = upstream.headers['content-type'];
   const streaming = contentType ? contentType.split(';')[0].trim().toLowerCase() === 'text/event-stream' : streamHint;
   let source: Readable = upstream;
@@ -209,7 +221,7 @@ export async function forwardNativeGeneration(
   try {
     if (disconnected) {
       onClose();
-      return;
+      return { ok: false };
     }
     if (successful) {
       const transforms = decoders(upstream.headers['content-encoding']);
@@ -270,6 +282,7 @@ export async function forwardNativeGeneration(
     begin();
     downstream.end();
   } catch (error) {
+    succeeded = false;
     upstream.destroy();
     if (source !== upstream) source.destroy();
     if (!disconnected && !downstream.destroyed) {
@@ -297,4 +310,5 @@ export async function forwardNativeGeneration(
     downstream.off('close', onClose);
     downstream.off('error', onDownstreamError);
   }
+  return { ok: succeeded };
 }

@@ -866,4 +866,73 @@ describe('mapOpenAIChunkToGemini', () => {
         .parts,
     ).toEqual([{ text: ' <DS' }]);
   });
+
+  it.each(['stop', 'length', 'tool_calls'] as const)(
+    'emits zero-argument streaming tool calls with empty arguments string on finish_reason %s',
+    (finishReason) => {
+      const key = `zero-arg-${finishReason}`;
+      expect(
+        mapOpenAIChunkToGemini(
+          {
+            choices: [
+              {
+                delta: {
+                  tool_calls: [{ index: 0, id: 'call_zero_arg', function: { name: 'list_plugin_accounts', arguments: '' } }],
+                },
+              },
+            ],
+          },
+          'gpt-4o',
+          key,
+        ),
+      ).toBeNull();
+
+      const result = mapOpenAIChunkToGemini(
+        { choices: [{ delta: {}, finish_reason: finishReason }] },
+        'gpt-4o',
+        key,
+      );
+      expect(result).toEqual({
+        content: {
+          parts: [{ functionCall: { name: 'list_plugin_accounts', args: {}, id: 'call_zero_arg' } }],
+          role: 'model',
+        },
+        finishReason: 'STOP',
+        index: 0,
+      });
+      expect(shared.activeStreamContexts.has(key)).toBe(false);
+    },
+  );
+
+  it('treats content_filter as terminal, maps finishReason to SAFETY, and cleans up stream context', () => {
+    const key = 'stream-content-filter';
+    expect(
+      mapOpenAIChunkToGemini({ choices: [{ delta: { content: 'Partial ' } }] }, 'gpt-4o', key)?.content.parts,
+    ).toEqual([{ text: 'Partial ' }]);
+    expect(shared.activeStreamContexts.has(key)).toBe(true);
+
+    const terminal = mapOpenAIChunkToGemini(
+      { choices: [{ delta: { content: 'output' }, finish_reason: 'content_filter' }] },
+      'gpt-4o',
+      key,
+    );
+    expect(terminal).toEqual({
+      content: { parts: [{ text: 'output' }], role: 'model' },
+      finishReason: 'SAFETY',
+      index: 0,
+    });
+    expect(shared.activeStreamContexts.has(key)).toBe(false);
+  });
+
+  it('maps streaming length finish_reason without tool calls to MAX_TOKENS and cleans up stream context', () => {
+    const key = 'stream-length';
+    mapOpenAIChunkToGemini({ choices: [{ delta: { content: 'Truncated' } }] }, 'gpt-4o', key);
+    const terminal = mapOpenAIChunkToGemini({ choices: [{ delta: {}, finish_reason: 'length' }] }, 'gpt-4o', key);
+    expect(terminal).toEqual({
+      content: { parts: [], role: 'model' },
+      finishReason: 'MAX_TOKENS',
+      index: 0,
+    });
+    expect(shared.activeStreamContexts.has(key)).toBe(false);
+  });
 });

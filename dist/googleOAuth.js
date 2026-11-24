@@ -279,14 +279,21 @@ async function loginGoogleAccount(options, openExternal, dependencies = {}) {
         const onAbort = () => finish(cancellation());
         const server = http.createServer((req, res) => {
             const reply = (status, text) => {
-                res.writeHead(status, {
-                    'Content-Type': 'text/plain; charset=utf-8',
-                    'Cache-Control': 'no-store',
-                    'Content-Security-Policy': "default-src 'none'",
-                    'Referrer-Policy': 'no-referrer',
-                    Connection: 'close',
-                });
-                res.end(text);
+                if (res.headersSent || res.writableEnded || res.destroyed)
+                    return;
+                try {
+                    res.writeHead(status, {
+                        'Content-Type': 'text/plain; charset=utf-8',
+                        'Cache-Control': 'no-store',
+                        'Content-Security-Policy': "default-src 'none'",
+                        'Referrer-Policy': 'no-referrer',
+                        Connection: 'close',
+                    });
+                    res.end(text);
+                }
+                catch {
+                    /* Callback socket may have closed while token exchange was in flight. */
+                }
             };
             if (finished || !redirectUri) {
                 reply(410, 'This login attempt has ended.');
@@ -334,6 +341,9 @@ async function loginGoogleAccount(options, openExternal, dependencies = {}) {
                 return;
             }
             exchanging = true;
+            // Token exchange (30s) + userinfo lookup (5s) can exceed the initial 10s socket timeout.
+            req.socket?.setTimeout(45000, () => req.socket?.destroy());
+            res.setTimeout(45000);
             const parameters = new URLSearchParams({
                 client_id: clientId,
                 code,
@@ -392,7 +402,7 @@ async function loginGoogleAccount(options, openExternal, dependencies = {}) {
             });
         });
         server.headersTimeout = 10000;
-        server.requestTimeout = 10000;
+        server.requestTimeout = 45000;
         server.keepAliveTimeout = 1000;
         server.maxConnections = 8;
         server.on('connection', (socket) => socket.setTimeout(10000, () => socket.destroy()));

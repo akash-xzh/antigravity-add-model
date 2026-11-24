@@ -117,6 +117,7 @@ interface OpenAIRequestBody {
   max_completion_tokens?: number;
   tools?: OpenAITool[];
   stream?: boolean;
+  reasoning_effort?: string;
 }
 
 interface OpenAIResponse {
@@ -399,6 +400,19 @@ export function mapGeminiToOpenAI(
     ...(needsCompletionTokens ? { max_completion_tokens: maxTokens } : { max_tokens: maxTokens }),
   };
 
+  const thinkingConfig = (geminiBody.generationConfig as Record<string, unknown> | undefined)
+    ?.thinkingConfig as Record<string, unknown> | undefined;
+  if (thinkingConfig) {
+    const level = (thinkingConfig.thinkingLevel || thinkingConfig.thinking_level) as string | undefined;
+    if (typeof level === 'string') {
+      const lower = level.toLowerCase();
+      if (lower === 'low') payload.reasoning_effort = 'low';
+      else if (lower === 'medium') payload.reasoning_effort = 'medium';
+      else if (lower === 'high') payload.reasoning_effort = 'high';
+      else if (lower === 'extra' || lower === 'max' || lower === 'xhigh') payload.reasoning_effort = 'xhigh';
+    }
+  }
+
   if (geminiBody.tools && Array.isArray(geminiBody.tools)) {
     const openaiTools = mapGeminiToolsToOpenAI(geminiBody.tools);
     if (openaiTools.length > 0) payload.tools = openaiTools;
@@ -587,7 +601,7 @@ export function mapOpenAIChunkToGemini(
   }
 
   const finishReason = choice.finish_reason;
-  const completed = finishReason === 'stop' || finishReason === 'length' || finishReason === 'tool_calls';
+  const completed = Boolean(finishReason);
   if (delta?.content) context.accumulatedText += delta.content;
   const reasoning = delta?.reasoning_content || delta?.reasoning || '';
   if (reasoning) {
@@ -602,7 +616,7 @@ export function mapOpenAIChunkToGemini(
   const completionParts: GeminiPart[] = reasoning ? [{ text: reasoning, thought: true }] : [];
   // A complete invoke can precede a fragmented parallel invoke. Keep both until
   // the provider finishes, including providers that finish DSML with tool_calls.
-  if (completed && Object.keys(context.toolCalls).length === 0) {
+  if (completed && finishReason !== 'content_filter' && Object.keys(context.toolCalls).length === 0) {
     const remaining = context.accumulatedText.slice(streamedTextPositions.get(context) || 0);
     const dsml = parseDSMLToolCalls(remaining);
     if (dsml && dsml.functionCalls.length > 0) {
@@ -623,15 +637,19 @@ export function mapOpenAIChunkToGemini(
     if (text) completionParts.push({ text });
   }
 
-  if (finishReason === 'stop' || finishReason === 'length') {
-    // Check for pending native tool_calls before closing stream
-    const pendingToolCalls = Object.values(context.toolCalls).filter((tc) => tc.name && tc.arguments);
+  if (completed) {
+    // Emit pending native tool_calls on completion (including zero-arg calls where arguments === "").
+    const pendingToolCalls =
+      finishReason === 'content_filter'
+        ? []
+        : Object.values(context.toolCalls).filter((tc) => Boolean(tc.name));
     if (pendingToolCalls.length > 0) {
       const parts: GeminiPart[] = pendingToolCalls.map((tc) => {
         let args: ToolCallArgs = {};
         try {
-          args = JSON.parse(tc.arguments);
-        } catch (_e) {
+          args = JSON.parse(tc.arguments || '{}');
+        } catch (e) {
+          log.debug('[OpenAI] Stream tool args parse fallback:', (e as Error).message);
           args = {};
         }
         args = normalizeToolArgs(tc.name, args, toolSchemas) as ToolCallArgs;
@@ -641,6 +659,7 @@ export function mapOpenAIChunkToGemini(
         touchStateTimestamp(stateTimestamps.toolCallIds, modelName);
         const translated = translateToolCallToNative(tc.name, args, toolSchemas);
         if (translated.name !== tc.name) {
+          translated.args = normalizeToolArgs(translated.name, translated.args, toolSchemas) as Record<string, unknown>;
           translatedToolCalls.set(tc.id, {
             originalName: tc.name,
             translatedName: translated.name,
@@ -655,39 +674,9 @@ export function mapOpenAIChunkToGemini(
       return { content: { parts: [...completionParts, ...parts], role: 'model' }, finishReason: 'STOP', index: 0 };
     }
     activeStreamContexts.delete(streamId);
-    return { content: { parts: completionParts, role: 'model' }, finishReason: 'STOP', index: 0 };
-  }
-
-  // Only emit tool calls when finishReason signals completion (args are fully accumulated)
-  if (finishReason === 'tool_calls') {
-    const parts: GeminiPart[] = Object.values(context.toolCalls).map((tc) => {
-      let args: ToolCallArgs = {};
-      try {
-        args = JSON.parse(tc.arguments);
-      } catch (e) {
-        log.debug('[OpenAI] Stream tool args parse fallback:', (e as Error).message);
-        args = {};
-      }
-      args = normalizeToolArgs(tc.name, args, toolSchemas) as ToolCallArgs;
-      const modelTCIds = modelToolCallIds.get(modelName) || {};
-      modelTCIds[tc.name] = tc.id;
-      modelToolCallIds.set(modelName, modelTCIds);
-      touchStateTimestamp(stateTimestamps.toolCallIds, modelName);
-      const translated = translateToolCallToNative(tc.name, args, toolSchemas);
-      if (translated.name !== tc.name) {
-        translated.args = normalizeToolArgs(translated.name, translated.args, toolSchemas) as Record<string, unknown>;
-        translatedToolCalls.set(tc.id, {
-          originalName: tc.name,
-          translatedName: translated.name,
-          cmd: args.CommandLine || '',
-          cwd: args.Cwd || '',
-        });
-        touchStateTimestamp(stateTimestamps.translatedCalls, tc.id);
-      }
-      return { functionCall: { name: translated.name, args: translated.args as Record<string, unknown>, id: tc.id } };
-    });
-    activeStreamContexts.delete(streamId);
-    return { content: { parts: [...completionParts, ...parts], role: 'model' }, finishReason: 'STOP', index: 0 };
+    const mappedFinishReason =
+      finishReason === 'content_filter' ? 'SAFETY' : finishReason === 'length' ? 'MAX_TOKENS' : 'STOP';
+    return { content: { parts: completionParts, role: 'model' }, finishReason: mappedFinishReason, index: 0 };
   }
 
   const text = takeStreamText(context);

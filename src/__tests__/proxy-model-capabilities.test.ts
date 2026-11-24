@@ -3,9 +3,12 @@ import * as loopbackSecurity from '../proxy/loopbackSecurity';
 import * as subagentRoutingModule from '../proxy/subagentRouting';
 import * as subagentModels from '../proxy/subagentModels';
 import * as nativeSubagentResponse from '../proxy/nativeSubagentResponse';
+import * as nativeLimits from '../proxy/nativeLimits';
+import * as conversationUsage from '../proxy/conversationUsage';
 import { afterAll, describe, expect, it, vi } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import * as url from 'node:url';
 import * as http from 'node:http';
 import { tmpdir } from 'node:os';
 import { EventEmitter } from 'node:events';
@@ -90,6 +93,7 @@ function requestModels(
     https: { request },
     fs: { existsSync: () => true },
     path,
+    url,
     electron: { app: { getPath: () => '/fixture' } },
     'electron-log': { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
     './proxy/shared': {},
@@ -99,6 +103,10 @@ function requestModels(
     './proxy/subagentModels': subagentModels,
     './proxy/googlePoolFailover': googlePoolFailover,
     './proxy/nativeSubagentResponse': nativeSubagentResponse,
+
+    './proxy/nativeLimits': nativeLimits,
+
+    './proxy/conversationUsage': conversationUsage,
     './proxy/cloudCodeRouting': {},
     './modelIdentity': {
       allocateModelIdentities: (_directory: string, models: IdentityModel[], upstream?: unknown) =>

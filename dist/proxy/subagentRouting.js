@@ -1,6 +1,7 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.subagentRouting = exports.SubagentRoutingBridge = exports.SubagentRoutingError = void 0;
+exports.nativeConversationId = nativeConversationId;
 const crypto_1 = require("crypto");
 class SubagentRoutingError extends Error {
     constructor(message, status = 409) {
@@ -20,6 +21,27 @@ function identifier(value) {
     return typeof value === 'string' && value.length > 0 && value.length <= 256 && value.trim() === value
         ? value
         : undefined;
+}
+/**
+ * Native conversation identity of a generation request. Cloud Code wraps the Gemini body, so the
+ * labels can sit on either envelope. Only stream telemetry reads this; no content is retained.
+ */
+function nativeConversationId(reqBody) {
+    try {
+        const parsed = object(typeof reqBody === 'string' ? JSON.parse(reqBody) : JSON.parse(reqBody.toString('utf8')));
+        const inner = parsed ? object(parsed.request) : undefined;
+        for (const envelope of [parsed, inner]) {
+            if (!envelope)
+                continue;
+            const id = identifier(object(envelope.labels)?.cascade_id) ?? identifier(envelope.conversationId);
+            if (id)
+                return id;
+        }
+    }
+    catch {
+        /* Not a JSON generation body. */
+    }
+    return undefined;
 }
 function clone(value) {
     return structuredClone(value);
@@ -123,6 +145,45 @@ function subagents(call) {
 }
 function callKey(scope, id) {
     return JSON.stringify([scope, id]);
+}
+function readEntryPrompt(entry) {
+    if (typeof entry.Prompt === 'string')
+        return entry.Prompt;
+    if (typeof entry.prompt === 'string')
+        return entry.prompt;
+    return undefined;
+}
+function setEntryModel(entry, value) {
+    if (value === undefined) {
+        delete entry.Model;
+        delete entry.model;
+        return;
+    }
+    const hasUpper = 'Model' in entry;
+    const hasLower = 'model' in entry;
+    if (hasUpper)
+        entry.Model = value;
+    if (hasLower)
+        entry.model = value;
+    if (!hasUpper && !hasLower) {
+        if ('prompt' in entry && !('Prompt' in entry))
+            entry.model = value;
+        else
+            entry.Model = value;
+    }
+}
+function appendMarkerToPrompt(entry, token) {
+    const suffix = `\n\n[antigravity-subagent-route:${token}]`;
+    if (typeof entry.Prompt === 'string')
+        entry.Prompt += suffix;
+    if (typeof entry.prompt === 'string')
+        entry.prompt += suffix;
+}
+function stripMarkerFromPrompt(entry, token) {
+    if (typeof entry.Prompt === 'string')
+        entry.Prompt = stripMarker(entry.Prompt, token);
+    if (typeof entry.prompt === 'string')
+        entry.prompt = stripMarker(entry.prompt, token);
 }
 /** Parse only structured tool output, never conversation IDs mentioned in arbitrary prose. */
 function childIds(value, depth = 0) {
@@ -229,14 +290,20 @@ class SubagentRoutingBridge {
             throw new SubagentRoutingError('Ambiguous subagent model routing for this conversation.');
         return intent;
     }
-    bind(scope, token) {
+    bind(scope, token, httpModelName) {
         const intent = this.validateBinding(scope, token);
         intent.childScope = scope;
         intent.touched = this.now();
         this.expiredScopes.delete(scope);
-        this.bindings.set(scope, { token, modelName: intent.modelName, touched: this.now() });
+        const prevHttpModel = this.bindings.get(scope)?.httpModelName;
+        this.bindings.set(scope, {
+            token,
+            modelName: intent.modelName,
+            httpModelName: httpModelName ?? prevHttpModel,
+            touched: this.now(),
+        });
     }
-    prepareRequest(body, resolve) {
+    prepareRequest(body, resolve, requestModelName) {
         this.prune();
         const prepared = clone(body);
         const conversation = identifier(object(prepared.labels)?.cascade_id) ?? identifier(prepared.conversationId);
@@ -244,6 +311,8 @@ class SubagentRoutingBridge {
             scope: conversation ? `conversation:${conversation}` : `request:${(0, crypto_1.randomUUID)()}`,
             stable: Boolean(conversation),
             requestId: (0, crypto_1.randomUUID)(),
+            conversationId: conversation,
+            httpModelName: requestModelName,
         };
         const contents = prepared.contents || [];
         const firstUser = contents.findIndex((content) => content.role === 'user' &&
@@ -275,9 +344,15 @@ class SubagentRoutingBridge {
             const intent = this.requireMarker(token);
             if (intent.scope === context.scope)
                 throw new SubagentRoutingError('A subagent route cannot replace its parent conversation model.');
+            if (intent.inherited &&
+                requestModelName &&
+                requestModelName !== intent.modelName &&
+                requestModelName !== intent.parentHttpModelName) {
+                intent.modelName = this.requireBoundModel(requestModelName, resolve);
+            }
             modelName = this.requireBoundModel(intent.modelName, resolve);
             if (context.stable)
-                this.bind(context.scope, token);
+                this.bind(context.scope, token, requestModelName);
             intent.touched = this.now();
         }
         if (!modelName && context.stable) {
@@ -287,6 +362,8 @@ class SubagentRoutingBridge {
             if (binding) {
                 this.requireMarker(binding.token).touched = this.now();
                 modelName = this.requireBoundModel(binding.modelName, resolve);
+                if (binding.httpModelName)
+                    context.httpModelName = binding.httpModelName;
                 binding.touched = this.now();
             }
         }
@@ -352,18 +429,14 @@ class SubagentRoutingBridge {
                         const entry = entries[index];
                         if (!entry)
                             continue;
-                        if (typeof entry.Prompt !== 'string' && typeof entry.prompt === 'string') {
-                            entry.Prompt = entry.prompt;
-                        }
-                        if (typeof entry.Prompt !== 'string')
+                        const entryPrompt = readEntryPrompt(entry);
+                        if (typeof entryPrompt !== 'string')
                             continue;
-                        const entryTokens = tokens(entry.Prompt);
+                        const entryTokens = tokens(entryPrompt);
                         if (entryTokens.length > 1)
                             throw new SubagentRoutingError('Ambiguous subagent routing in conversation history.');
                         for (const token of entryTokens) {
-                            entry.Prompt = stripMarker(entry.Prompt, token);
-                            if (typeof entry.prompt === 'string')
-                                entry.prompt = stripMarker(entry.prompt, token);
+                            stripMarkerFromPrompt(entry, token);
                             const state = this.markers.get(token);
                             // Restarted/expired history must not lock the parent out of
                             // starting a fresh child. Only current child ingress fails closed.
@@ -375,15 +448,7 @@ class SubagentRoutingBridge {
                                 throw new SubagentRoutingError('Subagent tool history belongs to another parent conversation.');
                             markerStates.push(state);
                             entryMarkers.set(index, token);
-                            if (state.selector === undefined) {
-                                delete entry.Model;
-                                delete entry.model;
-                            }
-                            else {
-                                entry.Model = state.selector;
-                                if ('model' in entry)
-                                    entry.model = state.selector;
-                            }
+                            setEntryModel(entry, state.selector);
                             state.touched = this.now();
                         }
                     }
@@ -418,20 +483,8 @@ class SubagentRoutingBridge {
                         if (!entry || !intent.token)
                             continue;
                         const state = this.requireMarker(intent.token);
-                        if (intent.selector === undefined) {
-                            delete entry.Model;
-                            delete entry.model;
-                        }
-                        else {
-                            entry.Model = intent.selector;
-                            if ('model' in entry)
-                                entry.model = intent.selector;
-                        }
-                        if (typeof entry.Prompt === 'string')
-                            entry.Prompt = stripMarker(entry.Prompt, intent.token);
-                        if (typeof entry.prompt === 'string' && entry.prompt !== entry.Prompt) {
-                            entry.prompt = stripMarker(entry.prompt, intent.token);
-                        }
+                        setEntryModel(entry, intent.selector);
+                        stripMarkerFromPrompt(entry, intent.token);
                         state.touched = this.now();
                     }
                     saved.touched = this.now();
@@ -505,6 +558,7 @@ class SubagentRoutingBridge {
             return {
                 selector: rawModel,
                 modelName: inherited ? this.requireBoundModel(inherited, resolve) : this.requireModel(selector, resolve),
+                inherited: Boolean(inherited),
             };
         });
         if (intents.filter((intent) => intent.modelName).length > Math.min(128, this.maxEntries))
@@ -520,15 +574,8 @@ class SubagentRoutingBridge {
                     continue;
                 const state = this.requireMarker(intent.token);
                 this.requireBoundModel(state.modelName, resolve);
-                entries[index].Model = 'inherit';
-                if ('model' in entries[index])
-                    entries[index].model = 'inherit';
-                if (typeof entries[index].Prompt === 'string') {
-                    entries[index].Prompt += `\n\n[antigravity-subagent-route:${intent.token}]`;
-                }
-                if (typeof entries[index].prompt === 'string' && entries[index].prompt !== entries[index].Prompt) {
-                    entries[index].prompt += `\n\n[antigravity-subagent-route:${intent.token}]`;
-                }
+                setEntryModel(entries[index], 'inherit');
+                appendMarkerToPrompt(entries[index], intent.token);
             }
             call.id = previous.toolId;
             return;
@@ -547,17 +594,12 @@ class SubagentRoutingBridge {
                 toolId: id,
                 selector: intent.selector,
                 modelName: intent.modelName,
+                inherited: intent.inherited,
+                parentHttpModelName: context.httpModelName ?? context.modelName,
                 touched: this.now(),
             });
-            entries[index].Model = 'inherit';
-            if ('model' in entries[index])
-                entries[index].model = 'inherit';
-            if (typeof entries[index].Prompt === 'string') {
-                entries[index].Prompt += `\n\n[antigravity-subagent-route:${token}]`;
-            }
-            if (typeof entries[index].prompt === 'string' && entries[index].prompt !== entries[index].Prompt) {
-                entries[index].prompt += `\n\n[antigravity-subagent-route:${token}]`;
-            }
+            setEntryModel(entries[index], 'inherit');
+            appendMarkerToPrompt(entries[index], token);
         }
         this.calls.set(callKey(context.scope, id), {
             scope: context.scope,

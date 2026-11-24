@@ -9,6 +9,7 @@ export interface DiagnosticRequest {
     outcome: DiagnosticOutcome;
     status?: number;
     latencyMs: number;
+    /** Total prompt tokens (already includes cachedTokens across OpenAI, Anthropic and Google). */
     inputTokens?: number;
     outputTokens?: number;
     cachedTokens?: number;
@@ -21,6 +22,12 @@ export declare function beginDiagnosticRequest(input: {
 }): {
     /** Usage belongs to the final attempted provider/model, not a sum of retry billing. */
     resetUsage(): void;
+    /** Actual provider usage for the winning attempt; undefined until a provider reports it. */
+    usage(): {
+        inputTokens?: number;
+        outputTokens?: number;
+        cachedTokens?: number;
+    };
     observe(value: unknown, format: "openai" | "anthropic" | "google"): void;
     finish(result: {
         outcome: DiagnosticOutcome;
@@ -58,6 +65,7 @@ export declare function getDiagnostics(): {
         outcome: DiagnosticOutcome;
         status?: number;
         latencyMs: number;
+        /** Total prompt tokens (already includes cachedTokens across OpenAI, Anthropic and Google). */
         inputTokens?: number;
         outputTokens?: number;
         cachedTokens?: number;

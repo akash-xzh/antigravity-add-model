@@ -83,17 +83,21 @@ function withGlobalSystemPrompt(body) {
     let workingBody = body;
     const rawInstruction = (body.systemInstruction ?? {});
     if (Array.isArray(rawInstruction.parts) && rawInstruction.parts.length > 0) {
+        let sectionsChanged = false;
         const updatedParts = rawInstruction.parts.map((p) => {
             const partObj = p;
             if (typeof partObj?.text === 'string') {
                 const rewritten = (0, promptSections_1.rewritePromptSections)(partObj.text);
                 if (rewritten !== partObj.text) {
+                    sectionsChanged = true;
                     return { ...partObj, text: rewritten };
                 }
             }
             return p;
         });
-        workingBody = { ...body, systemInstruction: { ...rawInstruction, parts: updatedParts } };
+        if (sectionsChanged) {
+            workingBody = { ...body, systemInstruction: { ...rawInstruction, parts: updatedParts } };
+        }
     }
     const text = globalSystemPrompt();
     if (!text)
@@ -145,9 +149,8 @@ function injectGlobalSystemPrompt(raw) {
     const isEnvelope = !!envelope && typeof envelope === 'object' && !Array.isArray(envelope);
     const target = (isEnvelope ? envelope : parsed);
     captureSystemPrompt(target);
-    if (!globalSystemPrompt())
-        return raw;
-    // In replace mode the captured body is left alone only if it already matches.
+    // Always run withGlobalSystemPrompt so prompt-section rewrites apply even when
+    // global-system-prompt.txt is empty or absent; returns `target` unchanged if nothing modified it.
     const updated = withGlobalSystemPrompt(target);
     if (updated === target)
         return raw;

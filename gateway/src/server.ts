@@ -98,12 +98,15 @@ async function generate(req: http.IncomingMessage, res: http.ServerResponse, mod
   // Never share reasoning or sessions across unrelated clients/conversations.
   const suppliedId = req.headers['x-antigravity-conversation-id'] || body.conversationId || input.conversationId || body.requestId;
   const conversation = typeof suppliedId === 'string' && suppliedId ? extractConvId(suppliedId) : randomUUID();
-  injectReasoning(mapped.messages, conversation);
+  // Request-scoped reasoning anchors prevent two in-flight requests on the same
+  // conversation from consuming each other's turn alignment.
+  const id = randomUUID();
+  injectReasoning(mapped.messages, conversation, id);
   const session = getSessionId(conversation) || randomUUID();
   setSessionId(conversation, session);
   (mapped.providerOptions ||= {} as any as NonNullable<typeof mapped.providerOptions>);
   (mapped.providerOptions as any).sessionId = session;
-  const id = randomUUID(), start = Date.now(), now = new Date().toISOString();
+  const start = Date.now(), now = new Date().toISOString();
   const promptTokens = estimateTokens(JSON.stringify(mapped));
   const fullPrompt = JSON.stringify(input.contents);
   db.upsertSession(conversation, { startedAt: now });
@@ -131,7 +134,7 @@ async function generate(req: http.IncomingMessage, res: http.ServerResponse, mod
       if (chunk.type === 'thought') { thought += chunk.content; if (streaming) await emit([{ thought: true, text: chunk.content }]); }
     }
     if (controller.signal.aborted) return;
-    if (thought) saveReasoning(conversation, thought);
+    if (thought) saveReasoning(conversation, thought, id);
     const parts: unknown[] = [];
     if (!streaming && text) parts.push({ text });
     if (!streaming && thought) parts.push({ thought: true, text: thought });

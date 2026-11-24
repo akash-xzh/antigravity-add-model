@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 
-import { formatHealthDisplayName, type ModelHealthResult } from './modelHealth';
+import { cleanModelDisplayName, formatHealthDisplayName, isStatusEmojiEnabled, type ModelHealthResult } from './modelHealth';
 
 export interface CatalogIdentity {
   name: string;
@@ -32,12 +32,21 @@ export function matchesModelSlug(model: CatalogIdentity, value: string, models: 
   return id === localModelSlug(model) || id === catalogModelSlug(model, models);
 }
 
+export function fallbackModelDisplayName(model: CatalogIdentity): string {
+  const display = typeof model.displayName === 'string' ? model.displayName.trim() : '';
+  if (display) return display;
+  const external = typeof model.externalModelName === 'string' ? model.externalModelName.trim() : '';
+  if (external) return external;
+  return String(model.name || '').replace(/^models\//, '').trim() || String(model.name || '');
+}
+
 /** The native IDE resolves sorted options by label, so display labels must also be unique. */
 export function catalogDisplayNames(
   models: CatalogIdentity[],
   upstream: unknown = {},
   healthMap?: Map<string, ModelHealthResult>,
   recentModels?: string[] | Set<string>,
+  showStatusEmoji?: boolean,
 ): Map<string, string> {
   const used = new Set<string>();
   if (upstream && typeof upstream === 'object') {
@@ -45,20 +54,28 @@ export function catalogDisplayNames(
       const collection = (upstream as Record<string, unknown>)[key];
       if (!collection || typeof collection !== 'object') continue;
       for (const entry of Object.values(collection)) {
-        if (typeof entry?.displayName === 'string') used.add(entry.displayName);
+        if (typeof entry?.displayName === 'string') {
+          used.add(entry.displayName);
+          const cleaned = cleanModelDisplayName(entry.displayName);
+          if (cleaned) used.add(cleaned);
+        }
       }
     }
   }
   const counts = new Map<string, number>();
   for (const model of models) {
-    const label = model.displayName || model.name;
-    counts.set(label, (counts.get(label) || 0) + 1);
+    const raw = fallbackModelDisplayName(model);
+    const cleaned = cleanModelDisplayName(raw) || raw;
+    counts.set(cleaned, (counts.get(cleaned) || 0) + 1);
   }
+  const emojiEnabled = showStatusEmoji !== undefined ? showStatusEmoji : isStatusEmojiEnabled();
   const labels = new Map<string, string>();
+  const usedFinal = new Set<string>(used);
   for (const model of [...models].sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0))) {
-    const base = model.displayName || model.name;
+    const rawBase = fallbackModelDisplayName(model);
+    const base = cleanModelDisplayName(rawBase) || rawBase;
     let label = base;
-    if (counts.get(base)! > 1 || used.has(label)) label = `${base} (${model.name.replace(/^models\//, '')})`;
+    if ((counts.get(base) || 0) > 1 || used.has(label)) label = `${base} (${model.name.replace(/^models\//, '')})`;
     let suffix = 2;
     while (used.has(label)) label = `${base} (${model.name.replace(/^models\//, '')} #${suffix++})`;
     used.add(label);
@@ -67,11 +84,21 @@ export function catalogDisplayNames(
         ? recentModels.includes(model.name)
         : recentModels.has(model.name)
       : false;
-    const finalLabel = healthMap
-      ? formatHealthDisplayName(label, healthMap.get(model.name), isRecent)
-      : isRecent
+    let finalLabel = healthMap
+      ? formatHealthDisplayName(label, healthMap.get(model.name), isRecent, emojiEnabled)
+      : isRecent && emojiEnabled
         ? `⭐ ${label}`
         : label;
+    while (usedFinal.has(finalLabel)) {
+      const disambiguated = `${base} (${model.name.replace(/^models\//, '')} #${suffix++})`;
+      used.add(disambiguated);
+      finalLabel = healthMap
+        ? formatHealthDisplayName(disambiguated, healthMap.get(model.name), isRecent, emojiEnabled)
+        : isRecent && emojiEnabled
+          ? `⭐ ${disambiguated}`
+          : disambiguated;
+    }
+    usedFinal.add(finalLabel);
     labels.set(model.name, finalLabel);
   }
   return labels;

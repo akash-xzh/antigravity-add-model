@@ -35,6 +35,8 @@ export interface NativeCheckpointConfig {
 /** Extra room for the native checkpoint prompt and a final tool result. */
 export declare const COMPACTION_TOKEN_RESERVE = 1024;
 export declare const NATIVE_DEFAULT_CHECKPOINT_THRESHOLD = 50000;
+/** Share of a declared context window used before the IDE checkpoints, unless configured. */
+export declare const DEFAULT_COMPACTION_THRESHOLD_PERCENT = 80;
 /** Keep the provider's real context/output limits; only change the IDE checkpoint policy. */
 export declare function nativeCheckpointConfig(model: CustomModelConfig): NativeCheckpointConfig | undefined;
 /** Shared by the proxy catalog and the sandbox preload's IPC fallback. */

@@ -18,6 +18,7 @@ import os from 'node:os';
 import { randomUUID } from 'node:crypto';
 import log from 'electron-log';
 import type { CustomModel } from '../proxy';
+import { getProviderHeaders } from './registry';
 
 export type ModelHealthStatus = 'healthy' | 'slow' | 'unhealthy' | 'cooldown';
 
@@ -39,8 +40,54 @@ let currentDataDirectory: string | undefined;
 const memoryCache = new Map<string, ModelHealthResult>();
 const inflightPings = new Map<string, Promise<ModelHealthResult>>();
 const recentModelsList: string[] = [];
+let loadedHealthCacheFilePath: string | undefined;
+let loadedHealthCacheMtime = -1;
+let loadedHealthCacheSize = -1;
+let healthCacheInitializedForPath: string | undefined;
 
-export function recordRecentModel(modelName: string): void {
+const RENAME_RETRY_CODES = new Set(['EPERM', 'EBUSY']);
+const RENAME_MAX_ATTEMPTS = 5;
+
+function sleepSync(ms: number): void {
+  if (ms <= 0) return;
+  try {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+  } catch {
+    const end = Date.now() + ms;
+    while (Date.now() < end) {
+      /* fallback pause */
+    }
+  }
+}
+
+function writeJsonFileAtomicSync(filePath: string, payload: unknown): void {
+  fs.mkdirSync(path.dirname(filePath), { recursive: true, mode: 0o700 });
+  const tmp = `${filePath}.${randomUUID()}.tmp`;
+  try {
+    fs.writeFileSync(tmp, JSON.stringify(payload, null, 2), { encoding: 'utf8', mode: 0o600 });
+    for (let attempt = 0; attempt < RENAME_MAX_ATTEMPTS; attempt++) {
+      try {
+        fs.renameSync(tmp, filePath);
+        return;
+      } catch (err) {
+        const code = (err as NodeJS.ErrnoException).code;
+        if (code && RENAME_RETRY_CODES.has(code) && attempt < RENAME_MAX_ATTEMPTS - 1) {
+          sleepSync(10 * (attempt + 1));
+          continue;
+        }
+        throw err;
+      }
+    }
+  } finally {
+    try {
+      if (fs.existsSync(tmp)) fs.unlinkSync(tmp);
+    } catch {
+      /* ignore cleanup error */
+    }
+  }
+}
+
+function updateRecentModelInMemory(modelName: string): void {
   if (!modelName) return;
   const filtered = recentModelsList.filter((m) => m !== modelName);
   recentModelsList.length = 0;
@@ -48,14 +95,23 @@ export function recordRecentModel(modelName: string): void {
   if (recentModelsList.length > MAX_RECENT_MODELS) {
     recentModelsList.length = MAX_RECENT_MODELS;
   }
-  saveHealthCache();
+}
+
+export function recordRecentModel(modelName: string, persist = true): void {
+  if (!modelName) return;
+  updateRecentModelInMemory(modelName);
+  if (persist) {
+    saveHealthCache();
+  }
 }
 
 export function isRecentModel(modelName: string): boolean {
+  ensureHealthCacheLoaded();
   return recentModelsList.includes(modelName);
 }
 
 export function getRecentModels(): string[] {
+  ensureHealthCacheLoaded();
   return [...recentModelsList];
 }
 
@@ -104,8 +160,97 @@ export function sortCustomModels<T extends { name: string }>(models: T[]): T[] {
   });
 }
 
+export interface ModelDisplaySettings {
+  showStatusEmoji: boolean;
+}
+
+let cachedDisplaySettings: ModelDisplaySettings | undefined;
+let cachedDisplaySettingsFilePath: string | undefined;
+let cachedDisplaySettingsMtime = -1;
+let cachedDisplaySettingsSize = -1;
+
 export function setDataDirectory(dir: string | undefined): void {
   currentDataDirectory = dir ? path.resolve(dir) : undefined;
+  cachedDisplaySettings = undefined;
+  cachedDisplaySettingsFilePath = undefined;
+  cachedDisplaySettingsMtime = -1;
+  cachedDisplaySettingsSize = -1;
+  loadedHealthCacheFilePath = undefined;
+  loadedHealthCacheMtime = -1;
+  loadedHealthCacheSize = -1;
+  healthCacheInitializedForPath = undefined;
+}
+
+export function getDisplaySettingsPath(dataDir?: string): string {
+  const base = dataDir || currentDataDirectory || path.join(os.homedir(), '.gemini', 'antigravity');
+  return path.join(base, 'model_display_settings.json');
+}
+
+export function loadDisplaySettings(dataDir?: string): ModelDisplaySettings {
+  const filePath = getDisplaySettingsPath(dataDir);
+  try {
+    if (!fs.existsSync(filePath)) {
+      cachedDisplaySettings = { showStatusEmoji: true };
+      cachedDisplaySettingsFilePath = filePath;
+      cachedDisplaySettingsMtime = -1;
+      cachedDisplaySettingsSize = -1;
+      return cachedDisplaySettings;
+    }
+    const stat = fs.statSync(filePath);
+    if (
+      cachedDisplaySettings !== undefined &&
+      cachedDisplaySettingsFilePath === filePath &&
+      stat.mtimeMs === cachedDisplaySettingsMtime &&
+      stat.size === cachedDisplaySettingsSize
+    ) {
+      return cachedDisplaySettings;
+    }
+    const raw = fs.readFileSync(filePath, 'utf8');
+    const parsed = JSON.parse(raw);
+    cachedDisplaySettings = {
+      showStatusEmoji: typeof parsed.showStatusEmoji === 'boolean' ? parsed.showStatusEmoji : true,
+    };
+    cachedDisplaySettingsFilePath = filePath;
+    cachedDisplaySettingsMtime = stat.mtimeMs;
+    cachedDisplaySettingsSize = stat.size;
+    return cachedDisplaySettings;
+  } catch (err) {
+    cachedDisplaySettings = { showStatusEmoji: true };
+    cachedDisplaySettingsFilePath = filePath;
+    cachedDisplaySettingsMtime = -1;
+    cachedDisplaySettingsSize = -1;
+    return cachedDisplaySettings;
+  }
+}
+
+export function saveDisplaySettings(settings: ModelDisplaySettings, dataDir?: string): void {
+  const filePath = getDisplaySettingsPath(dataDir);
+  try {
+    const payload: ModelDisplaySettings = {
+      showStatusEmoji: settings.showStatusEmoji !== false,
+    };
+    writeJsonFileAtomicSync(filePath, payload);
+    cachedDisplaySettings = payload;
+    cachedDisplaySettingsFilePath = filePath;
+    try {
+      const stat = fs.statSync(filePath);
+      cachedDisplaySettingsMtime = stat.mtimeMs;
+      cachedDisplaySettingsSize = stat.size;
+    } catch {
+      cachedDisplaySettingsMtime = -1;
+      cachedDisplaySettingsSize = -1;
+    }
+  } catch (err) {
+    log.debug('[ModelHealth] Could not save display settings to disk:', err);
+  }
+}
+
+export function isStatusEmojiEnabled(dataDir?: string): boolean {
+  return loadDisplaySettings(dataDir).showStatusEmoji;
+}
+
+export function setStatusEmojiEnabled(enabled: boolean, dataDir?: string): void {
+  saveDisplaySettings({ showStatusEmoji: enabled }, dataDir);
 }
 
 export function getHealthCachePath(dataDir?: string): string {
@@ -113,10 +258,52 @@ export function getHealthCachePath(dataDir?: string): string {
   return path.join(base, 'model_health_cache.json');
 }
 
-export function loadHealthCache(dataDir?: string): Map<string, ModelHealthResult> {
+function ensureHealthCacheLoaded(dataDir?: string): void {
+  const filePath = getHealthCachePath(dataDir);
+  if (healthCacheInitializedForPath !== filePath) {
+    loadHealthCache(dataDir);
+  }
+}
+
+export function reloadHealthCacheIfChanged(dataDir?: string): Map<string, ModelHealthResult> {
   const filePath = getHealthCachePath(dataDir);
   try {
-    if (!fs.existsSync(filePath)) return memoryCache;
+    if (!fs.existsSync(filePath)) {
+      if (loadedHealthCacheFilePath === filePath && loadedHealthCacheMtime !== -1) {
+        memoryCache.clear();
+        recentModelsList.length = 0;
+        loadedHealthCacheMtime = -1;
+        loadedHealthCacheSize = -1;
+      }
+      healthCacheInitializedForPath = filePath;
+      return memoryCache;
+    }
+    const stat = fs.statSync(filePath);
+    if (
+      loadedHealthCacheFilePath === filePath &&
+      loadedHealthCacheMtime === stat.mtimeMs &&
+      loadedHealthCacheSize === stat.size
+    ) {
+      return memoryCache;
+    }
+    return loadHealthCache(dataDir, true);
+  } catch (err) {
+    log.debug('[ModelHealth] Could not stat health cache on disk:', err);
+    return memoryCache;
+  }
+}
+
+export function loadHealthCache(dataDir?: string, replace = false): Map<string, ModelHealthResult> {
+  const filePath = getHealthCachePath(dataDir);
+  healthCacheInitializedForPath = filePath;
+  try {
+    if (!fs.existsSync(filePath)) {
+      loadedHealthCacheFilePath = filePath;
+      loadedHealthCacheMtime = -1;
+      loadedHealthCacheSize = -1;
+      return memoryCache;
+    }
+    const stat = fs.statSync(filePath);
     const raw = fs.readFileSync(filePath, 'utf8');
     const parsed = JSON.parse(raw);
     if (parsed && typeof parsed === 'object') {
@@ -132,6 +319,9 @@ export function loadHealthCache(dataDir?: string): Map<string, ModelHealthResult
           recentModelsList.length = MAX_RECENT_MODELS;
         }
       }
+      if (replace) {
+        memoryCache.clear();
+      }
       for (const [key, val] of Object.entries(modelsObj)) {
         if (
           val &&
@@ -142,6 +332,9 @@ export function loadHealthCache(dataDir?: string): Map<string, ModelHealthResult
         }
       }
     }
+    loadedHealthCacheFilePath = filePath;
+    loadedHealthCacheMtime = stat.mtimeMs;
+    loadedHealthCacheSize = stat.size;
   } catch (err) {
     log.debug('[ModelHealth] Could not read health cache from disk:', err);
   }
@@ -151,7 +344,6 @@ export function loadHealthCache(dataDir?: string): Map<string, ModelHealthResult
 export function saveHealthCache(dataDir?: string): void {
   const filePath = getHealthCachePath(dataDir);
   try {
-    fs.mkdirSync(path.dirname(filePath), { recursive: true, mode: 0o700 });
     const modelsObj: Record<string, ModelHealthResult> = {};
     for (const [key, val] of memoryCache.entries()) {
       modelsObj[key] = val;
@@ -160,42 +352,61 @@ export function saveHealthCache(dataDir?: string): void {
       models: modelsObj,
       recent: [...recentModelsList],
     };
-    const tmp = `${filePath}.${randomUUID()}.tmp`;
-    fs.writeFileSync(tmp, JSON.stringify(payload, null, 2), { encoding: 'utf8', mode: 0o600 });
-    fs.renameSync(tmp, filePath);
+    writeJsonFileAtomicSync(filePath, payload);
+    healthCacheInitializedForPath = filePath;
+    loadedHealthCacheFilePath = filePath;
+    try {
+      const stat = fs.statSync(filePath);
+      loadedHealthCacheMtime = stat.mtimeMs;
+      loadedHealthCacheSize = stat.size;
+    } catch {
+      loadedHealthCacheMtime = -1;
+      loadedHealthCacheSize = -1;
+    }
   } catch (err) {
     log.debug('[ModelHealth] Could not save health cache to disk:', err);
   }
 }
 
 export function getCachedHealth(modelName: string): ModelHealthResult | undefined {
+  ensureHealthCacheLoaded();
   return memoryCache.get(modelName);
 }
 
-export function getCachedHealthMap(): Map<string, ModelHealthResult> {
+export function getCachedHealthMap(dataDir?: string): Map<string, ModelHealthResult> {
+  if (dataDir) {
+    reloadHealthCacheIfChanged(dataDir);
+  } else {
+    ensureHealthCacheLoaded();
+  }
   return new Map(memoryCache);
 }
 
-export function setCachedHealth(modelName: string, result: ModelHealthResult, persist = true): void {
+export function setCachedHealth(modelName: string, result: ModelHealthResult, persist = true, dataDir?: string): void {
   memoryCache.set(modelName, result);
   if (persist) {
-    saveHealthCache();
+    saveHealthCache(dataDir);
   }
 }
 
-export function clearHealthCache(persist = false): void {
+export function clearHealthCache(persist = false, dataDir?: string): void {
   memoryCache.clear();
   inflightPings.clear();
   recentModelsList.length = 0;
+  const filePath = getHealthCachePath(dataDir);
+  healthCacheInitializedForPath = filePath;
+  loadedHealthCacheFilePath = filePath;
+  loadedHealthCacheMtime = -1;
+  loadedHealthCacheSize = -1;
   if (persist) {
-    saveHealthCache();
+    saveHealthCache(dataDir);
   }
 }
 
-/** Record live chat success: immediately marks the model healthy and tracks as recent */
+/** Record live chat success: immediately marks the model healthy and tracks as recent (single batched disk write) */
 export function recordModelSuccess(modelName: string, latencyMs?: number): void {
   if (!modelName) return;
-  recordRecentModel(modelName);
+  updateRecentModelInMemory(modelName);
   const roundedLat = typeof latencyMs === 'number' && latencyMs > 0 ? Math.round(latencyMs) : undefined;
   const isSlow = roundedLat !== undefined && roundedLat > 2000;
   setCachedHealth(modelName, {
@@ -205,10 +416,10 @@ export function recordModelSuccess(modelName: string, latencyMs?: number): void 
   });
 }
 
-/** Record live chat failure: immediately marks the model unhealthy/cooldown and tracks as recent */
+/** Record live chat failure: immediately marks the model unhealthy/cooldown and tracks as recent (single batched disk write) */
 export function recordModelFailure(modelName: string, error?: string): void {
   if (!modelName) return;
-  recordRecentModel(modelName);
+  updateRecentModelInMemory(modelName);
   let cleanError = error ? String(error).replace(/^Error:\s*/i, '').trim() : 'Chat error';
   if (cleanError.length > 40) cleanError = cleanError.slice(0, 37) + '…';
   const isRateLimit = cleanError.includes('429') || /rate\s*limit/i.test(cleanError);
@@ -231,13 +442,19 @@ export function cleanModelDisplayName(name: string): string {
 /**
  * Formats a model's display name with star (⭐ for recent) and status circle (🟢 / 🟡 / 🔴) for the IDE dropdown.
  * Uses cached status so this executes in ~0ms with zero network calls.
+ * If showStatusEmoji is false, returns the clean model name without emoji dots or stars.
  */
 export function formatHealthDisplayName(
   baseName: string,
   health?: ModelHealthResult | null,
   isRecent = false,
+  showStatusEmoji?: boolean,
 ): string {
   const clean = cleanModelDisplayName(baseName);
+  const enabled = showStatusEmoji !== undefined ? showStatusEmoji : isStatusEmojiEnabled();
+  if (!enabled) {
+    return clean;
+  }
   const star = isRecent ? '⭐ ' : '';
 
   if (!health || health.status === 'healthy') {
@@ -255,29 +472,29 @@ const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
  * Pings a single model endpoint with a lightweight HTTP/HTTPS GET, aborting
  * immediately on headers to avoid downloading content or burning usage.
  */
-export function pingCustomModel(model: CustomModel): Promise<ModelHealthResult> {
+export function pingCustomModel(model: CustomModel, dataDir?: string): Promise<ModelHealthResult> {
   // If provider is Google Cloud Code, check accounts without making external requests
   if (model.provider === 'google-cloudcode') {
     const hasAccount = Array.isArray(model.googleAccounts) && model.googleAccounts.some((a) => a.enabled !== false);
     const result: ModelHealthResult = hasAccount
       ? { status: 'healthy', latencyMs: 5, checkedAt: Date.now() }
       : { status: 'unhealthy', error: 'No account', checkedAt: Date.now() };
-    setCachedHealth(model.name, result);
+    setCachedHealth(model.name, result, true, dataDir);
     return Promise.resolve(result);
   }
 
   if (!model.apiUrl) {
     const result: ModelHealthResult = { status: 'unhealthy', error: 'No URL', checkedAt: Date.now() };
-    setCachedHealth(model.name, result);
+    setCachedHealth(model.name, result, true, dataDir);
     return Promise.resolve(result);
   }
 
   // Deduplicate concurrent in-flight pings to the exact same endpoint
-  const endpointKey = `${model.apiUrl}::${model.apiKey || ''}::${model.provider || ''}`;
+  const endpointKey = `${model.apiUrl}::${model.apiKey || ''}::${model.provider || ''}::${model.apiFormat || ''}`;
   const existingInflight = inflightPings.get(endpointKey);
   if (existingInflight) {
     return existingInflight.then((res) => {
-      setCachedHealth(model.name, res);
+      setCachedHealth(model.name, res, true, dataDir);
       return res;
     });
   }
@@ -290,7 +507,7 @@ export function pingCustomModel(model: CustomModel): Promise<ModelHealthResult> 
     const finish = (result: ModelHealthResult) => {
       if (settled) return;
       settled = true;
-      setCachedHealth(model.name, result);
+      setCachedHealth(model.name, result, true, dataDir);
       resolve(result);
     };
 
@@ -315,12 +532,20 @@ export function pingCustomModel(model: CustomModel): Promise<ModelHealthResult> 
       const isHttps = parsedUrl.protocol === 'https:';
       const client = isHttps ? https : http;
 
+      const providerHeaders = getProviderHeaders(
+        model.provider || 'custom',
+        model.apiKey || '',
+        model.apiFormat,
+        model.apiUrl,
+      );
       const headers: Record<string, string> = {
         'User-Agent': 'Antigravity-HealthCheck/1.0',
         Accept: 'application/json, text/plain, */*',
       };
-      if (model.apiKey && model.apiKey !== 'none') {
-        headers['Authorization'] = `Bearer ${model.apiKey}`;
+      for (const [k, v] of Object.entries(providerHeaders)) {
+        if (v !== undefined && k.toLowerCase() !== 'content-type') {
+          headers[k] = v;
+        }
       }
       if (model.customHeaders) {
         for (const [k, v] of Object.entries(model.customHeaders)) {
@@ -417,8 +642,9 @@ export function pingCustomModel(model: CustomModel): Promise<ModelHealthResult> 
 export async function checkAllModelsHealth(
   models: CustomModel[],
   force = false,
+  dataDir?: string,
 ): Promise<Map<string, ModelHealthResult>> {
-  if (!models || models.length === 0) return getCachedHealthMap();
+  if (!models || models.length === 0) return getCachedHealthMap(dataDir);
 
   // Deduplicate by endpoint
   const endpointGroups = new Map<string, CustomModel[]>();
@@ -428,14 +654,14 @@ export async function checkAllModelsHealth(
     if (!force && existing && Date.now() - existing.checkedAt < FRESHNESS_TTL_MS) {
       continue; // Cache is still fresh
     }
-    const key = `${m.apiUrl || ''}::${m.apiKey || ''}::${m.provider || ''}`;
+    const key = `${m.apiUrl || ''}::${m.apiKey || ''}::${m.provider || ''}::${m.apiFormat || ''}`;
     const list = endpointGroups.get(key) || [];
     list.push(m);
     endpointGroups.set(key, list);
   }
 
   if (endpointGroups.size === 0) {
-    return getCachedHealthMap();
+    return getCachedHealthMap(dataDir);
   }
 
   log.debug(
@@ -452,9 +678,9 @@ export async function checkAllModelsHealth(
       const [, groupModels] = current;
       const primary = groupModels[0];
 
-      const res = await pingCustomModel(primary);
+      const res = await pingCustomModel(primary, dataDir);
       for (const m of groupModels) {
-        setCachedHealth(m.name, res, false);
+        setCachedHealth(m.name, res, false, dataDir);
       }
 
       if (PACING_DELAY_MS > 0) {
@@ -464,9 +690,6 @@ export async function checkAllModelsHealth(
   });
 
   await Promise.allSettled(workers);
-  saveHealthCache();
-  return getCachedHealthMap();
+  saveHealthCache(dataDir);
+  return getCachedHealthMap(dataDir);
 }
-
-// Initial cache load from default location
-loadHealthCache();

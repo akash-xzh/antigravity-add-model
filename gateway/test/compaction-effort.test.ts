@@ -42,7 +42,7 @@ test('model settings validate summary effort and reload restores inheritance whe
   assert.equal(resolver.compactionReasoningEffort, 'inherit');
 });
 
-test('environment summary effort takes precedence over the model file and rejects unknown values', () => {
+test('environment summary effort takes precedence over the model file and falls back to inherit on unknown values', () => {
   fs.writeFileSync(filename, JSON.stringify({ _compaction_reasoning_effort: 'low' }));
   modelResolver.reload();
   delete process.env.COMPACTION_REASONING_EFFORT;
@@ -52,7 +52,7 @@ test('environment summary effort takes precedence over the model file and reject
   process.env.COMPACTION_REASONING_EFFORT = 'inherit';
   assert.equal(getCompactionConfig().effort, 'inherit');
   process.env.COMPACTION_REASONING_EFFORT = 'turbo';
-  assert.throws(() => getCompactionConfig(), /compaction reasoning effort/);
+  assert.equal(getCompactionConfig().effort, 'inherit');
 });
 
 test('OpenAI chat and Responses preserve explicit compaction effort including none', () => {

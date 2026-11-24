@@ -9,6 +9,7 @@ export interface CustomModel {
     displayName: string;
     description: string;
     provider: string;
+    providerName?: string;
     apiKey: string;
     apiUrl: string;
     externalModelName: string;
@@ -56,6 +57,8 @@ export interface ProxyStartOptions {
     /** IDE account bootstrap uses PROD, then the account's declared Cloud Code tier. */
     ideCloudCodeRouting?: boolean;
 }
+import { getUiMitmToken } from './proxy/loopbackSecurity';
+export { getUiMitmToken };
 /** Registered by the desktop with its own live language-server port getter. */
 export declare function setLanguageServerPortResolver(resolve: () => number | undefined): void;
 export declare function loadCustomModels(): CustomModel[];

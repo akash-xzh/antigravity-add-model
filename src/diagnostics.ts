@@ -12,6 +12,7 @@ export interface DiagnosticRequest {
   outcome: DiagnosticOutcome;
   status?: number;
   latencyMs: number;
+  /** Total prompt tokens (already includes cachedTokens across OpenAI, Anthropic and Google). */
   inputTokens?: number;
   outputTokens?: number;
   cachedTokens?: number;
@@ -53,6 +54,10 @@ export function beginDiagnosticRequest(input: {
       delete usage.inputTokens;
       delete usage.outputTokens;
       delete usage.cachedTokens;
+    },
+    /** Actual provider usage for the winning attempt; undefined until a provider reports it. */
+    usage(): { inputTokens?: number; outputTokens?: number; cachedTokens?: number } {
+      return { ...usage };
     },
     observe(value: unknown, format: 'openai' | 'anthropic' | 'google'): void {
       if (finished || !value || typeof value !== 'object') return;

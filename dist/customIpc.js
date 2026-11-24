@@ -40,7 +40,13 @@ const path = __importStar(require("node:path"));
 const cryptoStore = __importStar(require("./cryptoStore"));
 const modelManagement_1 = require("./modelManagement");
 const modelActions_1 = require("./modelActions");
+let handlersRegistered = false;
 function registerCustomModelHandlers() {
+    // Both main.ts (via ipcHandlers) and desktop.ts can load this module in one
+    // process. ipcMain.handle throws on a duplicate channel registration.
+    if (handlersRegistered)
+        return;
+    handlersRegistered = true;
     const manager = (0, modelManagement_1.createModelManager)(path.join(electron_1.app.getPath('home'), '.gemini', 'antigravity'), cryptoStore, (url) => electron_1.shell.openExternal(url));
     const handle = (channel, action) => {
         electron_1.ipcMain.handle(channel, async (_event, ...args) => {
@@ -50,8 +56,15 @@ function registerCustomModelHandlers() {
             catch (error) {
                 if (channel === 'storage:get-custom-models' || channel === 'storage:export-custom-models')
                     throw error;
-                const status = error.status;
-                return { success: false, error: error.message, ...(status ? { status } : {}) };
+                const status = error && typeof error === 'object' && 'status' in error && typeof error.status === 'number'
+                    ? error.status
+                    : undefined;
+                const message = error instanceof Error
+                    ? error.message
+                    : error && typeof error === 'object' && 'message' in error && typeof error.message === 'string'
+                        ? error.message
+                        : String(error);
+                return { success: false, error: message, ...(status ? { status } : {}) };
             }
         });
     };

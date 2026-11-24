@@ -47,6 +47,43 @@ const customScheme_1 = require("./customScheme");
 const tray_1 = require("./tray");
 const constants_1 = require("./ideInstall/constants");
 const customIpc_1 = require("./customIpc");
+const LOOPBACK_AUTHORITY_RE = /^http:\/\/(?:127\.0\.0\.1|localhost):\d+\/?$/i;
+function parseLoopbackAuthorityOrigin(value) {
+    if (typeof value !== 'string')
+        return null;
+    const trimmed = value.trim();
+    if (!LOOPBACK_AUTHORITY_RE.test(trimmed))
+        return null;
+    let parsed;
+    try {
+        parsed = new URL(trimmed);
+    }
+    catch {
+        return null;
+    }
+    if (parsed.protocol !== 'http:')
+        return null;
+    if (parsed.hostname !== '127.0.0.1' && parsed.hostname !== 'localhost')
+        return null;
+    if (parsed.username || parsed.password)
+        return null;
+    if (parsed.pathname !== '/' || parsed.search || parsed.hash)
+        return null;
+    const port = Number(parsed.port || '80');
+    if (!Number.isInteger(port) || port < 1 || port > 65535)
+        return null;
+    return parsed.origin;
+}
+function getActiveWindow() {
+    const focused = electron_1.BrowserWindow.getFocusedWindow?.();
+    if (focused && !focused.isDestroyed?.())
+        return focused;
+    return electron_1.BrowserWindow.getAllWindows().find((win) => win && !win.isDestroyed?.());
+}
+function isWebContentsDestroyed(webContents) {
+    const wc = webContents;
+    return Boolean(wc?.isDestroyed?.());
+}
 /**
  * Registers all IPC handlers for the main process.
  */
@@ -83,20 +120,22 @@ function registerIpcHandlers(storageManager) {
     });
     // Notifications
     electron_1.ipcMain.handle('notification:send', (_event, options) => {
+        if (!options || typeof options !== 'object' || typeof options.title !== 'string' || typeof options.body !== 'string')
+            return;
         const notification = new electron_1.Notification({
             title: options.title,
             body: options.body,
             silent: options.silent ?? false,
         });
         notification.on('click', () => {
-            const win = electron_1.BrowserWindow.getAllWindows()[0];
-            if (win) {
+            const win = electron_1.BrowserWindow.getAllWindows().find((w) => w && !w.isDestroyed?.());
+            if (win && !win.isDestroyed?.()) {
                 if (win.isMinimized()) {
                     win.restore();
                 }
                 win.show();
                 win.focus();
-                if (options.payload) {
+                if (options.payload && !isWebContentsDestroyed(win.webContents)) {
                     win.webContents.send('notification:clicked', options.payload);
                 }
             }
@@ -107,28 +146,36 @@ function registerIpcHandlers(storageManager) {
     // vs/platform/nativeNotification/electron-main/electronNotificationService.ts
     electron_1.ipcMain.handle('notification:open-system-preferences', async () => {
         if (process.platform === 'darwin') {
-            void electron_1.shell.openExternal('x-apple.systempreferences:com.apple.preference.notifications');
+            await electron_1.shell.openExternal('x-apple.systempreferences:com.apple.preference.notifications').catch(() => { });
         }
         else if (process.platform === 'win32') {
-            void electron_1.shell.openExternal('ms-settings:notifications');
+            await electron_1.shell.openExternal('ms-settings:notifications').catch(() => { });
         }
         else if (process.platform === 'linux') {
-            const { exec } = await Promise.resolve().then(() => __importStar(require('child_process')));
+            const { spawn } = await Promise.resolve().then(() => __importStar(require('child_process')));
             const commands = [
-                'gnome-control-center notifications',
-                'systemsettings kcm_notifications',
-                'xfce4-notifyd-config',
-                'gnome-control-center',
-                'systemsettings',
+                ['gnome-control-center', ['notifications']],
+                ['systemsettings', ['kcm_notifications']],
+                ['xfce4-notifyd-config', []],
+                ['gnome-control-center', []],
+                ['systemsettings', []],
             ];
-            for (const command of commands) {
-                try {
-                    exec(command);
-                    return; // If one command executes without immediate error, assume success for now
-                }
-                catch {
-                    // Try next
-                }
+            for (const [cmd, args] of commands) {
+                const launched = await new Promise((resolve) => {
+                    try {
+                        const child = spawn(cmd, args, { detached: true, stdio: 'ignore' });
+                        child.once('spawn', () => {
+                            child.unref?.();
+                            resolve(true);
+                        });
+                        child.once('error', () => resolve(false));
+                    }
+                    catch {
+                        resolve(false);
+                    }
+                });
+                if (launched)
+                    return;
             }
         }
     });
@@ -153,8 +200,21 @@ function registerIpcHandlers(storageManager) {
     });
     // Sidecar extension custom scheme
     electron_1.ipcMain.handle('extensions:send-authorities', async (_event, authorities) => {
-        customScheme_1.extensionAuthorities.clear();
+        if (!authorities || typeof authorities !== 'object' || Array.isArray(authorities)) {
+            throw new Error('Expected an extension authorities map');
+        }
+        const validated = new Map();
         for (const [key, value] of Object.entries(authorities)) {
+            if (!key)
+                continue;
+            const origin = parseLoopbackAuthorityOrigin(value);
+            if (!origin) {
+                throw new Error(`Invalid extension authority URL for "${key}": must be http://127.0.0.1:<port> or http://localhost:<port>`);
+            }
+            validated.set(key, origin);
+        }
+        customScheme_1.extensionAuthorities.clear();
+        for (const [key, value] of validated) {
             customScheme_1.extensionAuthorities.set(key, value);
         }
     });
@@ -164,8 +224,10 @@ function registerIpcHandlers(storageManager) {
     });
     // Window
     electron_1.ipcMain.handle('window:set-title-bar-overlay', async (_event, options) => {
-        const win = electron_1.BrowserWindow.getFocusedWindow() || electron_1.BrowserWindow.getAllWindows()[0];
-        if (win && process.platform === 'win32') {
+        if (!options || typeof options !== 'object' || typeof options.color !== 'string' || typeof options.symbolColor !== 'string')
+            return;
+        const win = getActiveWindow();
+        if (win && !win.isDestroyed?.() && process.platform === 'win32') {
             win.setTitleBarOverlay({
                 color: options.color,
                 symbolColor: options.symbolColor,
@@ -174,36 +236,36 @@ function registerIpcHandlers(storageManager) {
         }
     });
     electron_1.ipcMain.handle('window:minimize', async () => {
-        const win = electron_1.BrowserWindow.getFocusedWindow() || electron_1.BrowserWindow.getAllWindows()[0];
-        if (win) {
+        const win = getActiveWindow();
+        if (win && !win.isDestroyed?.()) {
             win.minimize();
         }
     });
     electron_1.ipcMain.handle('window:maximize', async () => {
-        const win = electron_1.BrowserWindow.getFocusedWindow() || electron_1.BrowserWindow.getAllWindows()[0];
-        if (win) {
+        const win = getActiveWindow();
+        if (win && !win.isDestroyed?.()) {
             win.maximize();
         }
     });
     electron_1.ipcMain.handle('window:unmaximize', async () => {
-        const win = electron_1.BrowserWindow.getFocusedWindow() || electron_1.BrowserWindow.getAllWindows()[0];
-        if (win) {
+        const win = getActiveWindow();
+        if (win && !win.isDestroyed?.()) {
             win.unmaximize();
         }
     });
     electron_1.ipcMain.handle('window:is-maximized', async () => {
-        const win = electron_1.BrowserWindow.getFocusedWindow() || electron_1.BrowserWindow.getAllWindows()[0];
-        return win ? win.isMaximized() : false;
+        const win = getActiveWindow();
+        return win && !win.isDestroyed?.() ? win.isMaximized() : false;
     });
     electron_1.ipcMain.handle('window:close', async () => {
-        const win = electron_1.BrowserWindow.getFocusedWindow() || electron_1.BrowserWindow.getAllWindows()[0];
-        if (win) {
+        const win = getActiveWindow();
+        if (win && !win.isDestroyed?.()) {
             win.close();
         }
     });
     electron_1.ipcMain.handle('window:toggle-devtools', async () => {
-        const win = electron_1.BrowserWindow.getFocusedWindow() || electron_1.BrowserWindow.getAllWindows()[0];
-        if (win) {
+        const win = getActiveWindow();
+        if (win && !win.isDestroyed?.() && !isWebContentsDestroyed(win.webContents)) {
             win.webContents.toggleDevTools();
         }
     });
@@ -213,7 +275,16 @@ function registerIpcHandlers(storageManager) {
     });
     // Safe external shell launch
     electron_1.ipcMain.handle('shell:open-external', async (_event, url) => {
-        if (url.startsWith('https://') || url.startsWith('http://')) {
+        if (typeof url !== 'string')
+            return;
+        let parsed;
+        try {
+            parsed = new URL(url);
+        }
+        catch {
+            return;
+        }
+        if (parsed.protocol === 'https:' || parsed.protocol === 'http:') {
             await electron_1.shell.openExternal(url);
         }
     });

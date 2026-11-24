@@ -25,6 +25,7 @@ function mapGeminiToGoogle(geminiBody, _modelName) {
     delete body.stream;
     delete body.sessionId;
     delete body.conversationId;
+    delete body.labels;
     return body;
 }
 // ─── Response Translation (Passthrough) ───────────────────────────────────

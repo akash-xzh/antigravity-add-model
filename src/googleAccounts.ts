@@ -46,12 +46,19 @@ export interface GoogleQuotaBucket {
   groupName?: string;
   remainingFraction?: number;
   resetTime?: string;
+  /** Native window label, e.g. "weekly" or "5h". */
+  window?: string;
+  /** Provider explanation, e.g. "Models within this group: …" or why a bucket does not apply. */
+  description?: string;
+  /** The provider reports the window as not currently applicable (e.g. weekly already exhausted). */
+  disabled?: boolean;
   /** Project measurements and complementary user measurements remain distinguishable. */
   scope?: 'project' | 'user';
 }
 export interface GoogleQuotaGroup {
   name: string;
   displayName?: string;
+  description?: string;
   buckets: GoogleQuotaBucket[];
 }
 export interface GoogleQuotaSnapshot {
@@ -80,6 +87,9 @@ interface PoolState {
   lastStatus?: number;
   latency?: { average: number; measuredAt: number };
   authState?: 'unauthorized' | 'forbidden';
+  /** Trigger one forced OAuth refresh after an unexpected 401 before locking out the account. */
+  needsForceRefresh?: boolean;
+  forceRefreshAttempted?: boolean;
   quota?: GoogleQuotaSnapshot;
   quotas: Map<string, GoogleQuotaSnapshot>;
 }
@@ -105,14 +115,27 @@ export class GoogleAccountError extends Error {
 }
 
 const tokenCache = new Map<string, GoogleAccount>();
-const refreshing = new Map<string, Promise<GoogleAccount>>();
+const refreshing = new Map<string, { promise: Promise<GoogleAccount>; epoch: number; accountId: string }>();
 const poolStates = new Map<string, PoolState>();
 const sticky = new Map<string, { accountKey: string; accountId?: string; at: number }>();
+let globalResetEpoch = 0;
+const accountResetEpochs = new Map<string, number>();
 let selectionOrder = 0;
 const MEASUREMENT_TTL_MS = 10 * 60_000;
 let persistAccount:
   | ((modelName: string, account: GoogleAccount, previousAccount: GoogleAccount) => Promise<void> | void)
   | undefined;
+
+function resetEpochFor(id: string): number {
+  return Math.max(globalResetEpoch, accountResetEpochs.get(id) ?? 0);
+}
+function canRefreshAccount(account: GoogleAccount): boolean {
+  return (
+    Boolean(account.refreshToken) &&
+    Boolean(account.clientId) &&
+    !/^(enc:|fallback:|local-gcm:|DECRYPTION_FAILED)/.test(account.refreshToken!)
+  );
+}
 
 export function configureGoogleAccountPersistence(callback?: typeof persistAccount): void {
   persistAccount = callback;
@@ -344,31 +367,31 @@ async function postJson(
 export async function refreshGoogleAccount(
   account: GoogleAccount,
   tokenEndpointOverride = 'https://oauth2.googleapis.com/token',
+  options: { force?: boolean } = {},
 ): Promise<GoogleAccount> {
   for (const [key, cached] of tokenCache) if (cached.expiresAt && cached.expiresAt < Date.now()) tokenCache.delete(key);
   const key = accountKey(account);
-  const cached = tokenCache.get(key);
-  if (cached && validAccess(cached))
-    return {
-      ...account,
-      accessToken: cached.accessToken,
-      refreshToken: cached.refreshToken,
-      expiresAt: cached.expiresAt,
-    };
-  if (validAccess(account)) return { ...account };
-  if (
-    !account.refreshToken ||
-    !account.clientId ||
-    /^(enc:|fallback:|local-gcm:|DECRYPTION_FAILED)/.test(account.refreshToken)
-  ) {
+  const startEpoch = resetEpochFor(account.id);
+  if (!options.force) {
+    const cached = tokenCache.get(key);
+    if (cached && validAccess(cached))
+      return {
+        ...account,
+        accessToken: cached.accessToken,
+        refreshToken: cached.refreshToken,
+        expiresAt: cached.expiresAt,
+      };
+    if (validAccess(account)) return { ...account };
+  }
+  if (!canRefreshAccount(account)) {
     throw new GoogleAccountError(
       'This account requires a valid access token or a refresh token and your OAuth client ID.',
       401,
     );
   }
   const active = refreshing.get(key);
-  if (active) {
-    const updated = await active;
+  if (active && active.epoch === startEpoch && !options.force) {
+    const updated = await active.promise;
     // Sharing a token refresh must not replace this model's prepared project or service route.
     return {
       ...account,
@@ -377,6 +400,7 @@ export async function refreshGoogleAccount(
       expiresAt: updated.expiresAt,
     };
   }
+  let entry!: { promise: Promise<GoogleAccount>; epoch: number; accountId: string };
   const refresh = (async () => {
     const endpoint = checkedEndpoint(tokenEndpointOverride, ['oauth2.googleapis.com']);
     const body = new URLSearchParams({
@@ -402,11 +426,17 @@ export async function refreshGoogleAccount(
     const expiresIn = typeof data.expires_in === 'number' && data.expires_in > 0 ? data.expires_in : 3600;
     const updated = { ...account, accessToken: data.access_token, expiresAt: Date.now() + expiresIn * 1000 };
     if (typeof data.refresh_token === 'string' && data.refresh_token) updated.refreshToken = data.refresh_token;
-    tokenCache.set(key, updated);
-    tokenCache.set(accountKey(updated), updated);
+    // Ignore results from refreshes that started before resetGoogleAccountState().
+    if (resetEpochFor(account.id) === startEpoch) {
+      tokenCache.set(key, updated);
+      tokenCache.set(accountKey(updated), updated);
+    }
     return updated;
-  })().finally(() => refreshing.delete(key));
-  refreshing.set(key, refresh);
+  })().finally(() => {
+    if (refreshing.get(key) === entry) refreshing.delete(key);
+  });
+  entry = { promise: refresh, epoch: startEpoch, accountId: account.id };
+  refreshing.set(key, entry);
   return refresh;
 }
 
@@ -564,6 +594,11 @@ export async function fetchGoogleQuota(
         ...(groupName ? { groupName } : {}),
         remainingFraction: bFraction,
         resetTime: bReset,
+        ...(typeof bucket.window === 'string' && bucket.window.trim() ? { window: bucket.window.trim() } : {}),
+        ...(typeof bucket.description === 'string' && bucket.description.trim()
+          ? { description: bucket.description.trim() }
+          : {}),
+        ...(bucket.disabled === true ? { disabled: true } : {}),
         scope: group.quotaScope === 'user' || bucket.quotaScope === 'user' || !account.project ? 'user' : 'project',
       };
       const explicitId = typeof bucket.bucketId === 'string' ? bucket.bucketId : bucket.id;
@@ -589,6 +624,9 @@ export async function fetchGoogleQuota(
       groups.push({
         name: groupName || 'Models',
         displayName: groupName || 'Models',
+        ...(typeof group.description === 'string' && group.description.trim()
+          ? { description: group.description.trim() }
+          : {}),
         buckets: groupBuckets,
       });
     }
@@ -715,6 +753,7 @@ export async function acquireGoogleAccount(
   requestIdentity?: string,
   cooldownScope = modelName,
   endpoint?: string,
+  tokenEndpointOverride?: string,
 ): Promise<GoogleAccountLease> {
   const attempted = new Set<string>();
   const identityKey = requestIdentity
@@ -768,13 +807,19 @@ export async function acquireGoogleAccount(
     state.inFlight += 1;
     state.lastUsed = ++selectionOrder;
     try {
-      const updated = await refreshGoogleAccount(selected);
+      const force = Boolean(state.needsForceRefresh);
+      state.needsForceRefresh = false;
+      const updated = await refreshGoogleAccount(selected, tokenEndpointOverride, { force });
       if (
         updated.accessToken !== selected.accessToken ||
         updated.refreshToken !== selected.refreshToken ||
         updated.expiresAt !== selected.expiresAt
       ) {
-        await persistAccount?.(modelName, updated, selected);
+        try {
+          await persistAccount?.(modelName, updated, selected);
+        } catch {
+          // Transient disk persistence errors must not discard a valid refreshed token or poison the account.
+        }
       }
       if (identityKey) sticky.set(identityKey, { accountKey: key, accountId: selected.id, at: Date.now() });
       state.requests++;
@@ -790,6 +835,8 @@ export async function acquireGoogleAccount(
           if (result.status >= 200 && result.status < 400) {
             state.succeeded++;
             state.consecutiveFailures = 0;
+            state.forceRefreshAttempted = false;
+            state.needsForceRefresh = false;
             if (Number.isFinite(result.latencyMs) && result.latencyMs >= 0) {
               const previous = measuredLatency(state);
               state.latency = {
@@ -807,11 +854,17 @@ export async function acquireGoogleAccount(
             (result.status === 400 || result.status === 403) &&
             (result.cooldownReason === 'quota-exhausted' || result.cooldownReason === 'rate-limited');
           if (result.status === 401 || (result.status === 403 && !quotaDenial)) {
-            state.authState = result.status === 401 ? 'unauthorized' : 'forbidden';
             tokenCache.delete(accountKey(selected));
             tokenCache.delete(accountKey(updated));
             for (const [sKey, entry] of sticky) {
               if (entry.accountId === selected.id || entry.accountKey === key) sticky.delete(sKey);
+            }
+            if (result.status === 401 && canRefreshAccount(updated) && !state.forceRefreshAttempted) {
+              // Attempt one forced refresh on an unexpected 401 before permanently locking out the account.
+              state.needsForceRefresh = true;
+              state.forceRefreshAttempted = true;
+            } else {
+              state.authState = result.status === 401 ? 'unauthorized' : 'forbidden';
             }
           } else if (
             quotaDenial ||
@@ -869,8 +922,13 @@ export function recordGoogleAccountFailure(
   }
   const quotaDenial = (status === 400 || status === 403) && (reason === 'quota-exhausted' || reason === 'rate-limited');
   if (status === 401 || (status === 403 && !quotaDenial)) {
-    state.authState = status === 401 ? 'unauthorized' : 'forbidden';
     tokenCache.delete(accountKey(account));
+    if (status === 401 && canRefreshAccount(account) && !state.forceRefreshAttempted) {
+      state.needsForceRefresh = true;
+      state.forceRefreshAttempted = true;
+    } else {
+      state.authState = status === 401 ? 'unauthorized' : 'forbidden';
+    }
   } else if (quotaDenial || status === 408 || status === 429 || (status && status >= 500)) {
     const delay = Number.isFinite(retryAfterMs) && (retryAfterMs as number) >= 0 ? (retryAfterMs as number) : 60_000;
     const until = Date.now() + Math.min(delay, 31 * 24 * 60 * 60 * 1000);
@@ -932,9 +990,16 @@ export function resetGoogleAccountState(id?: string): void {
   for (const [key, state] of poolStates) if (!id || state.id === id) poolStates.delete(key);
   for (const [key, account] of tokenCache) if (!id || account.id === id) tokenCache.delete(key);
   if (!id) {
+    globalResetEpoch += 1;
+    accountResetEpochs.clear();
+    refreshing.clear();
     tokenCache.clear();
     sticky.clear();
   } else {
+    accountResetEpochs.set(id, resetEpochFor(id) + 1);
+    for (const [key, entry] of refreshing) {
+      if (entry.accountId === id) refreshing.delete(key);
+    }
     for (const [key, entry] of sticky) {
       if (entry.accountId === id || entry.accountKey === id) sticky.delete(key);
     }

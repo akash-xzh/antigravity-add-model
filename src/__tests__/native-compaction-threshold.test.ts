@@ -13,11 +13,12 @@ const model = {
 };
 
 describe('native IDE compaction thresholds', () => {
-  it('leaves native checkpoint defaults intact unless a setting is explicit', () => {
-    expect(nativeCheckpointConfig(model)).toBeUndefined();
-    expect(nativeModelExperiments(model)).toBeUndefined();
+  it('defaults to 80% of a declared context window and keeps the IDE default without one', () => {
+    expect(nativeCheckpointConfig(model)).toEqual({ tokenThreshold: 67592, maxTokenLimit: 67592 });
+    expect(nativeModelExperiments(model)).toBeDefined();
+    expect(nativeCheckpointConfig({ ...model, contextWindow: undefined })).toBeUndefined();
     expect(nativeCheckpointConfig({ ...model, compactionReasoningEffort: 'low' })).toEqual({
-      useLastPlannerModel: true, maxOutputTokens: 8192,
+      useLastPlannerModel: true, maxOutputTokens: 8192, tokenThreshold: 67592, maxTokenLimit: 67592,
     });
   });
 
@@ -44,17 +45,23 @@ describe('native IDE compaction thresholds', () => {
     })).toEqual({ useLastPlannerModel: true, maxOutputTokens: 8192, tokenThreshold: 75784, maxTokenLimit: 75784 });
   });
 
-  it('rejects a smaller real input budget that cannot safely fit the native defaults before overrides', () => {
+  it('applies a custom threshold to a small window the IDE 50k default would exceed', () => {
     const configured = { ...model, contextWindow: 16000, maxOutputTokens: 2048, compactionThresholdPercent: 80 };
-    expect(validateCustomModel(configured)).toMatchObject({ valid: false, error: expect.stringContaining('IDE 2.5.5 requires at least 50000') });
-    expect(nativeCheckpointConfig(configured)).toBeUndefined();
+    expect(validateCustomModel(configured)).toEqual({ valid: true });
+    expect(nativeCheckpointConfig(configured)).toEqual({ tokenThreshold: 12800, maxTokenLimit: 12928 });
     expect(nativeCatalogCapabilities(configured).maxTokens).toBe(16000);
+  });
+
+  it('emits a checkpoint threshold for a 64K model with realistic output tokens', () => {
+    const configured = { ...model, contextWindow: 65536, maxOutputTokens: 16384, compactionThresholdPercent: 80 };
+    expect(validateCustomModel(configured)).toEqual({ valid: true });
+    expect(nativeCheckpointConfig(configured)).toEqual({ tokenThreshold: 48128, maxTokenLimit: 48128 });
   });
 
   it('caps native summary output when routing checkpoints to a model with a smaller output limit', () => {
     expect(nativeCheckpointConfig({
       ...model, maxOutputTokens: 4096, compactionReasoningEffort: 'low',
-    })).toEqual({ useLastPlannerModel: true, maxOutputTokens: 4096 });
+    })).toEqual({ useLastPlannerModel: true, maxOutputTokens: 4096, tokenThreshold: 68000, maxTokenLimit: 79880 });
     // A threshold-only override preserves the native summary model and output.
     expect(nativeCheckpointConfig({
       ...model, maxOutputTokens: 4096, compactionThresholdPercent: 80,
@@ -86,7 +93,7 @@ describe('native IDE compaction thresholds', () => {
     { contextWindow: 4000, maxOutputTokens: 1024, compactionThresholdPercent: 10 },
   ])('rejects a nonusable input budget after reserving output and checkpoint overhead: %j', (limits) => {
     const configured = { ...model, compactionThresholdPercent: 80, ...limits };
-    expect(validateCustomModel(configured)).toMatchObject({ valid: false, error: expect.stringContaining('IDE 2.5.5 requires at least 50000') });
+    expect(validateCustomModel(configured)).toMatchObject({ valid: false });
     expect(nativeCheckpointConfig(configured)).toBeUndefined();
   });
 
@@ -118,23 +125,30 @@ describe('native IDE compaction thresholds', () => {
   it.each([
     {},
     { compactionReasoningEffort: 'low' },
+  ])('raises the native catalog floor for a declared window that fits the checkpoint defaults: %j', (fields) => {
+    expect(nativeCatalogCapabilities({ ...model, ...fields }).maxTokens).toBe(90000);
+  });
+
+  it.each([
     { compactionThresholdPercent: 9 },
     { compactionThresholdPercent: 91 },
     { compactionThresholdPercent: 80, maxOutputTokens: 40000 },
-  ])('does not raise native context without a valid threshold and safe real input budget: %j', (fields) => {
+    { maxOutputTokens: 40000 },
+  ])('does not raise native context without a usable real input budget: %j', (fields) => {
     const configured = { ...model, ...fields };
     expect(nativeCatalogCapabilities(configured).maxTokens).toBe(85000);
   });
 
-  it('accepts the minimum safe native budget and rejects one token below it', () => {
+  it('accepts a sub-50k native budget and still emits a usable threshold', () => {
     const configured = { ...model, contextWindow: 59216, maxOutputTokens: 8192, compactionThresholdPercent: 80 };
     expect(validateCustomModel(configured)).toEqual({ valid: true });
     expect(nativeCheckpointConfig(configured)).toEqual({ tokenThreshold: 47372, maxTokenLimit: 50000 });
     expect(nativeCatalogCapabilities(configured).maxTokens).toBe(90000);
-    const tooSmall = { ...configured, contextWindow: configured.contextWindow - 1 };
-    expect(validateCustomModel(tooSmall)).toMatchObject({ valid: false });
-    expect(nativeCheckpointConfig(tooSmall)).toBeUndefined();
-    expect(nativeCatalogCapabilities(tooSmall).maxTokens).toBe(59215);
+    const below = { ...configured, contextWindow: 59215 };
+    expect(validateCustomModel(below)).toEqual({ valid: true });
+    expect(nativeCheckpointConfig(below)).toEqual({ tokenThreshold: 47372, maxTokenLimit: 49999 });
+    // No catalog padding is needed once a smaller threshold is published explicitly.
+    expect(nativeCatalogCapabilities(below).maxTokens).toBe(59215);
   });
 
   it.each([

@@ -59,13 +59,20 @@ interface GeminiRequestBody {
  */
 export function mapGeminiToGoogle(geminiBody: GeminiRequestBody, _modelName: string): GeminiRequestBody {
   // Native Gemini identifies the model and streaming method in the URL.
-  const body = { ...geminiBody } as GeminiRequestBody & { stream?: boolean; model_id?: string; sessionId?: string; conversationId?: string };
+  const body = { ...geminiBody } as GeminiRequestBody & {
+    stream?: boolean;
+    model_id?: string;
+    sessionId?: string;
+    conversationId?: string;
+    labels?: unknown;
+  };
   delete body.model;
   delete body.modelId;
   delete body.model_id;
   delete body.stream;
   delete body.sessionId;
   delete body.conversationId;
+  delete body.labels;
   return body;
 }
 

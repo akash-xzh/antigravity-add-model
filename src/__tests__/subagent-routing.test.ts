@@ -650,4 +650,42 @@ describe('subagent routing at the common Gemini boundary', () => {
     expect(restoredCall.args.Model).toBe('custom-a');
     expect(restoredCall.args.Prompt).toBe('Perform deep research');
   });
+
+  it('preserves lowercase model and prompt argument keys without injecting PascalCase duplicates', () => {
+    const bridge = new SubagentRoutingBridge();
+    const context = bridge.prepareRequest(parent(), resolve).context;
+    const lowerCall = {
+      content: {
+        role: 'model',
+        parts: [
+          {
+            functionCall: {
+              name: 'invoke_subagent',
+              args: {
+                subagents: [{ model: 'custom-a', prompt: 'Lowercase task' }],
+              },
+            },
+          },
+        ],
+      },
+    };
+    const rewritten = bridge.rewriteCandidate(lowerCall, context, resolve);
+    const rewrittenEntry = (rewritten.content.parts[0].functionCall as { args: { subagents: Record<string, unknown>[] } })
+      .args.subagents[0];
+    expect(rewrittenEntry.model).toBe('inherit');
+    expect(rewrittenEntry).not.toHaveProperty('Model');
+    expect(rewrittenEntry.prompt).toContain('Lowercase task');
+    expect(rewrittenEntry.prompt).toContain('[antigravity-subagent-route:');
+    expect(rewrittenEntry).not.toHaveProperty('Prompt');
+
+    const historyBody: GeminiBody = {
+      ...parent(),
+      contents: [...parent().contents, rewritten.content],
+    };
+    const restored = bridge.prepareRequest(historyBody, resolve);
+    const restoredEntry = (
+      restored.body.contents[1].parts[0].functionCall as { args: { subagents: Record<string, unknown>[] } }
+    ).args.subagents[0];
+    expect(restoredEntry).toEqual({ model: 'custom-a', prompt: 'Lowercase task' });
+  });
 });

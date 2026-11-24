@@ -42,11 +42,26 @@ exports.getContextInformation = getContextInformation;
 const fs = __importStar(require("node:fs"));
 const path = __importStar(require("node:path"));
 const readline = __importStar(require("node:readline"));
+const conversationUsage_1 = require("./proxy/conversationUsage");
+const nativeLimits_1 = require("./proxy/nativeLimits");
+const modelUtils_1 = require("./proxy/modelUtils");
 const UUID = /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i;
 const MAX_TRANSCRIPT_BYTES = 64 * 1024 * 1024;
 const transcriptCache = new Map();
 const pendingTranscripts = new Map();
 const validLimit = (value) => typeof value === 'number' && Number.isSafeInteger(value) && value > 0;
+const validPercent = (value) => typeof value === 'number' && Number.isInteger(value) && value >= 10 && value <= 90 ? value : undefined;
+const count = (value) => typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : undefined;
+const entryTimestamp = (value) => {
+    if (typeof value === 'number' && Number.isFinite(value) && value > 0)
+        return value;
+    if (typeof value === 'string' && value.trim()) {
+        const parsed = Date.parse(value);
+        if (Number.isFinite(parsed) && parsed > 0)
+            return parsed;
+    }
+    return undefined;
+};
 const label = (value) => typeof value === 'string' ? value.trim().replace(/[▾▲▼◂▸◀▶]/g, '').replace(/\s+/g, ' ').trim().toLowerCase() : '';
 const modelKey = (value) => label(value).replace(/^models\//, '').replace(/[^a-z0-9]/g, '');
 /** Never let an earlier prefix match shadow an exact model or effort variant. */
@@ -90,9 +105,9 @@ function findConversationIdByTitle(title, dataDirectory) {
         return undefined;
     }
 }
-async function getChatContextUsage(conversationId, dataDirectory) {
+async function readChatContextSnapshot(conversationId, dataDirectory) {
     const id = typeof conversationId === 'string' && UUID.test(conversationId) ? conversationId : '';
-    const unavailable = { conversationId: id, source: 'unavailable' };
+    const unavailable = { result: { conversationId: id, source: 'unavailable' }, mtimeMs: 0 };
     if (!id)
         return unavailable;
     const filename = path.join(dataDirectory, 'brain', id, '.system_generated', 'logs', 'transcript.jsonl');
@@ -104,14 +119,29 @@ async function getChatContextUsage(conversationId, dataDirectory) {
         const stamp = `${stat.mtimeMs}:${stat.ctimeMs}:${stat.size}`;
         const cached = transcriptCache.get(filename);
         if (cached?.stamp === stamp)
-            return { ...cached.result };
+            return { ...cached.snapshot, result: { ...cached.snapshot.result } };
         const pending = pendingTranscripts.get(filename);
-        if (pending)
-            return { ...await pending };
+        if (pending) {
+            const resolved = await pending;
+            return { ...resolved, result: { ...resolved.result } };
+        }
         const read = async () => {
             let characters = 0;
+            let inputChars = 0;
+            let outputChars = 0;
             let entries = 0;
             let malformed = false;
+            let compactions = 0;
+            let turns = 0;
+            let lastPrompt = 0;
+            let lastInput = 0;
+            let lastCached = 0;
+            let lastOutput = 0;
+            let sessionInput = 0;
+            let sessionCached = 0;
+            let sessionOutput = 0;
+            let lastCheckpointAt;
+            let lastUsageAt;
             const input = fs.createReadStream(filename, { encoding: 'utf8' });
             const lines = readline.createInterface({ input, crlfDelay: Infinity });
             try {
@@ -125,16 +155,53 @@ async function getChatContextUsage(conversationId, dataDirectory) {
                             malformed = true;
                             continue;
                         }
-                        // The native structured CHECKPOINT starts a new visible context.
+                        const ts = entryTimestamp(entry.created_at);
+                        // The native structured CHECKPOINT starts a new visible context while preserving
+                        // cumulative session burn totals across compactions.
                         // Quoted "resuming" text in user messages is never a checkpoint.
-                        if (entry.type === 'CHECKPOINT' && entry.source === 'SYSTEM')
+                        if (entry.type === 'CHECKPOINT' && entry.source === 'SYSTEM') {
                             characters = 0;
+                            inputChars = 0;
+                            outputChars = 0;
+                            compactions += 1;
+                            turns = 0;
+                            lastPrompt = 0;
+                            lastInput = 0;
+                            lastCached = 0;
+                            lastOutput = 0;
+                            lastUsageAt = undefined;
+                            if (ts !== undefined)
+                                lastCheckpointAt = ts;
+                        }
+                        let entryChars = 0;
                         if (typeof entry.content === 'string')
-                            characters += entry.content.length;
+                            entryChars += entry.content.length;
                         if (typeof entry.thinking === 'string')
-                            characters += entry.thinking.length;
+                            entryChars += entry.thinking.length;
                         if (Array.isArray(entry.tool_calls))
-                            characters += JSON.stringify(entry.tool_calls).length;
+                            entryChars += JSON.stringify(entry.tool_calls).length;
+                        characters += entryChars;
+                        if (entry.source === 'MODEL' || entry.type === 'PLANNER_RESPONSE')
+                            outputChars += entryChars;
+                        else
+                            inputChars += entryChars;
+                        // Native per-step usage: immediate input excludes cached prompt tokens, so the real
+                        // prompt size is both together and includes the hidden system prompt, tools and images.
+                        const rawInput = count(entry.input_tokens);
+                        const cached = count(entry.cache_read_tokens);
+                        const output = count(entry.output_tokens);
+                        if (rawInput !== undefined || output !== undefined) {
+                            turns += 1;
+                            lastInput = rawInput ?? 0;
+                            lastCached = cached ?? 0;
+                            lastOutput = output ?? 0;
+                            lastPrompt = lastInput + lastCached;
+                            sessionInput += lastInput;
+                            sessionCached += lastCached;
+                            sessionOutput += lastOutput;
+                            if (ts !== undefined)
+                                lastUsageAt = ts;
+                        }
                         entries++;
                     }
                     catch {
@@ -150,11 +217,37 @@ async function getChatContextUsage(conversationId, dataDirectory) {
             // A concurrent append or partial JSON line must not cache a falsely small count.
             if (malformed || after.size !== stat.size || after.mtimeMs !== stat.mtimeMs || !entries)
                 return unavailable;
-            const result = { conversationId: id, source: 'estimated', currentTokens: Math.ceil(characters / 4) };
+            const result = {
+                conversationId: id,
+                source: 'estimated',
+                currentTokens: Math.ceil(characters / 4),
+                visibleInputTokens: Math.ceil(inputChars / 4),
+                visibleOutputTokens: Math.ceil(outputChars / 4),
+                compactions,
+            };
+            if (turns) {
+                result.source = 'actual';
+                result.actualTokens = lastPrompt;
+                result.actualInputTokens = lastInput;
+                result.actualCachedTokens = lastCached;
+                result.actualOutputTokens = lastOutput;
+                result.sessionInputTokens = sessionInput;
+                result.sessionCachedTokens = sessionCached;
+                result.sessionOutputTokens = sessionOutput;
+                result.turns = turns;
+                result.overheadTokens = Math.max(0, lastPrompt - result.currentTokens);
+                result.tokensPerTurn = Math.max(1, Math.round((sessionInput + sessionCached) / turns));
+            }
+            else if (sessionInput || sessionCached || sessionOutput) {
+                result.sessionInputTokens = sessionInput;
+                result.sessionCachedTokens = sessionCached;
+                result.sessionOutputTokens = sessionOutput;
+            }
+            const snapshot = { result, mtimeMs: stat.mtimeMs, lastCheckpointAt, lastUsageAt };
             if (transcriptCache.size >= 100)
                 transcriptCache.delete(transcriptCache.keys().next().value);
-            transcriptCache.set(filename, { stamp, result });
-            return { ...result };
+            transcriptCache.set(filename, { stamp, snapshot });
+            return { ...snapshot, result: { ...result } };
         };
         const promise = read();
         pendingTranscripts.set(filename, promise);
@@ -168,6 +261,9 @@ async function getChatContextUsage(conversationId, dataDirectory) {
     catch {
         return unavailable;
     }
+}
+async function getChatContextUsage(conversationId, dataDirectory) {
+    return (await readChatContextSnapshot(conversationId, dataDirectory)).result;
 }
 let catalog;
 let catalogExpires = 0;
@@ -244,18 +340,105 @@ async function discoverContextLimit(modelName, provider) {
 async function getContextInformation(payload, dataDirectory, models) {
     const request = payload && typeof payload === 'object' ? payload : {};
     const id = request.conversationId || findConversationIdByTitle(request.title, dataDirectory);
-    const result = await getChatContextUsage(id, dataDirectory);
+    const snapshot = await readChatContextSnapshot(id, dataDirectory);
+    const result = snapshot.result;
+    // The proxy records the provider's real usage and stream timing in-process. Usage covers custom
+    // models whose steps the language server has not annotated yet, and is lost when the app restarts.
+    // Timing also covers native models, whose tokens the transcript already carries.
+    let recorded = (0, conversationUsage_1.getConversationUsage)(id);
+    // Right after a CHECKPOINT resets post-compaction turns to 0, do not re-inject pre-compaction
+    // recorded usage as ghost tokens.
+    if (recorded && (result.compactions ?? 0) > 0 && !result.turns && snapshot.lastCheckpointAt !== undefined) {
+        // Only a parsed CHECKPOINT timestamp is a reliable boundary. mtimeMs is after
+        // the checkpoint and would erase genuine post-compaction usage.
+        if (recorded.updatedAt <= snapshot.lastCheckpointAt)
+            recorded = undefined;
+    }
+    if (recorded) {
+        const recordedHasTokens = recorded.hasTokens === true || (recorded.hasTokens === undefined && (recorded.inputTokens > 0 || recorded.outputTokens > 0));
+        const transcriptUsageAt = snapshot.lastUsageAt ?? snapshot.mtimeMs;
+        if (recordedHasTokens) {
+            const recordedIsNewer = !result.actualTokens || recorded.updatedAt > transcriptUsageAt;
+            if (recordedIsNewer) {
+                // diagnostics.ts stores total prompt tokens (already including cached tokens) in inputTokens.
+                result.source = 'actual';
+                result.actualTokens = recorded.inputTokens;
+                result.actualInputTokens = Math.max(0, recorded.inputTokens - recorded.cachedTokens);
+                result.actualCachedTokens = recorded.cachedTokens;
+                result.actualOutputTokens = recorded.outputTokens;
+                result.overheadTokens = Math.max(0, result.actualTokens - (result.currentTokens ?? 0));
+            }
+            // Only attribute speed/TTFT when recorded belongs to the active turn (never mix turns).
+            if (recordedIsNewer || result.actualOutputTokens === recorded.outputTokens) {
+                const speed = (0, conversationUsage_1.tokensPerSecond)(recorded.outputTokens, recorded.decodeMs);
+                if (speed !== undefined)
+                    result.tokensPerSecond = speed;
+                if (recorded.ttftMs !== undefined)
+                    result.ttftMs = recorded.ttftMs;
+            }
+        }
+        else if (result.actualTokens) {
+            // Timing-only native entry: ensure we do not divide Turn 2's decodeMs into Turn 1's outputTokens
+            // when transcript.jsonl has not yet flushed Turn 2.
+            // A timing record newer than the transcript's last usage belongs to a turn
+            // that has not been annotated yet: its decodeMs must not be divided by the
+            // previous turn's output tokens. No arbitrary time tolerance.
+            const staleForTranscriptTurn = snapshot.lastUsageAt !== undefined && recorded.updatedAt > snapshot.lastUsageAt;
+            if (!staleForTranscriptTurn) {
+                const speed = (0, conversationUsage_1.tokensPerSecond)(result.actualOutputTokens, recorded.decodeMs);
+                if (speed !== undefined)
+                    result.tokensPerSecond = speed;
+                if (recorded.ttftMs !== undefined)
+                    result.ttftMs = recorded.ttftMs;
+            }
+        }
+    }
     const name = typeof request.modelName === 'string' && request.modelName.length <= 512 ? request.modelName : '';
     const configured = findContextModel(name, models);
     if (validLimit(configured?.contextWindow)) {
         result.maxTokens = configured.contextWindow;
         result.limitSource = 'configured';
     }
-    else if (request.discoverLimit === true && name) {
-        const limit = await discoverContextLimit(configured?.externalModelName || name, configured?.provider);
-        if (limit) {
-            result.maxTokens = limit;
-            result.limitSource = 'public-catalog';
+    else {
+        // Official models are absent from the user's configuration; their limit is the one the
+        // language server's own catalog declares. A saved custom model keeps its own endpoint limit.
+        const native = !configured && name ? (0, nativeLimits_1.findNativeLimit)(name) : undefined;
+        if (validLimit(native)) {
+            result.maxTokens = native;
+            result.limitSource = 'native-catalog';
+        }
+        else if (request.discoverLimit === true && name) {
+            const limit = await discoverContextLimit(configured?.externalModelName || name, configured?.provider);
+            if (limit) {
+                result.maxTokens = limit;
+                result.limitSource = 'public-catalog';
+            }
+        }
+    }
+    if (validLimit(result.maxTokens)) {
+        // Mirror the IDE's real trigger instead of guessing a share of the window. The proxy only
+        // installs a checkpoint override for a saved model that declares its real context window;
+        // every other model (including official ones) keeps the IDE's own new-token default.
+        const checkpoint = configured
+            ? (0, modelUtils_1.nativeCheckpointConfig)(configured)
+            : undefined;
+        const configuredPercent = validPercent(configured?.compactionThresholdPercent);
+        if (checkpoint?.tokenThreshold !== undefined) {
+            // Reflect the effective capped share when maxOutputTokens + reserve cap tokenThreshold below 80%.
+            result.compactionThresholdPercent = Math.round((checkpoint.tokenThreshold / result.maxTokens) * 100)
+                || (configuredPercent ?? modelUtils_1.DEFAULT_COMPACTION_THRESHOLD_PERCENT);
+            result.compactionSource = configuredPercent === undefined ? 'default' : 'custom';
+            result.compactionAtTokens = checkpoint.tokenThreshold;
+            const inUse = result.actualTokens ?? result.currentTokens;
+            if (typeof inUse === 'number' && Number.isFinite(inUse)) {
+                result.tokensUntilCompaction = Math.max(0, checkpoint.tokenThreshold - inUse);
+                if (result.tokensPerTurn) {
+                    result.turnsUntilCompaction = Math.ceil(result.tokensUntilCompaction / result.tokensPerTurn);
+                }
+            }
+        }
+        else {
+            result.compactionSource = 'ide';
         }
     }
     return result;

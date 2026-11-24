@@ -35,8 +35,26 @@ import { subagentRouting, SubagentRoutingError } from './subagentRouting';
 import { resolveConfiguredSubagentModel } from './subagentModels';
 import { isGoogleQuotaFailure } from './googlePoolFailover';
 import { reasoningReplayCache } from './reasoningReplay';
+import { recordConversationUsage } from './conversationUsage';
 
 const circuits = new CircuitBreaker();
+/**
+ * Endpoints that rejected stream_options.include_usage. Scoped by model + endpoint + format and
+ * time-limited: one old error must not silently disable usage telemetry for the process lifetime.
+ */
+const usageOptOut = new Map<string, number>();
+const USAGE_OPT_OUT_TTL_MS = 5 * 60_000;
+const usageOptOutKey = (model: { name: string; apiUrl: string }, format: string) =>
+  `${model.name}\n${model.apiUrl}\n${format}`;
+function hasUsageOptOut(key: string): boolean {
+  const at = usageOptOut.get(key);
+  if (at === undefined) return false;
+  if (Date.now() - at > USAGE_OPT_OUT_TTL_MS) {
+    usageOptOut.delete(key);
+    return false;
+  }
+  return true;
+}
 const controllers = new Set<AbortController>();
 const counts = {
   requests: 0,
@@ -117,6 +135,16 @@ async function boundedErrorBody(upstream: http.IncomingMessage): Promise<string>
     upstream.destroy();
   }
   return Buffer.concat(chunks).toString('utf8').trim();
+}
+
+/** Detect provider context-window overflow responses without echoing provider payloads. */
+function isContextLengthExceeded(status: number, body: string): boolean {
+  if (status === 413) return true;
+  // 422 is the shape several OpenAI-compatible providers use for context overflow.
+  if (status !== 400 && status !== 422) return false;
+  return /(?:context_length_exceeded|maximum context length|too many tokens|prompt is too long|request too large|exceeds the maximum)/i.test(
+    body,
+  );
 }
 
 /** Classify schema errors without returning provider text, credentials or echoed prompts. */
@@ -212,21 +240,30 @@ export async function runCustomModelRequest(
   allModels: CustomModel[],
   cloudEnvelope = true,
   kind: 'request' | 'generation-test' = 'request',
+  prePrepared?: ReturnType<typeof subagentRouting.prepareRequest>,
 ): Promise<void> {
   const resolveSubagent = (selector: string) => resolveConfiguredSubagentModel(allModels, selector)?.name;
   let prepared: ReturnType<typeof subagentRouting.prepareRequest>;
-  try {
-    prepared = subagentRouting.prepareRequest(originalBody, resolveSubagent);
+  if (prePrepared) {
+    prepared = prePrepared;
     originalBody = prepared.body;
-    if (prepared.modelName) primary = resolveConfiguredSubagentModel(allModels, prepared.modelName)!;
-  } catch (error) {
-    res.writeHead(error instanceof SubagentRoutingError ? error.status : 400, { 'Content-Type': 'application/json' });
-    res.end(
-      JSON.stringify({
-        error: { message: error instanceof SubagentRoutingError ? error.message : 'Invalid subagent routing request.' },
-      }),
-    );
-    return;
+    if (prepared.modelName) primary = resolveConfiguredSubagentModel(allModels, prepared.modelName) ?? primary;
+  } else {
+    try {
+      prepared = subagentRouting.prepareRequest(originalBody, resolveSubagent, primary.name);
+      originalBody = prepared.body;
+      if (prepared.modelName) primary = resolveConfiguredSubagentModel(allModels, prepared.modelName)!;
+    } catch (error) {
+      res.writeHead(error instanceof SubagentRoutingError ? error.status : 400, { 'Content-Type': 'application/json' });
+      res.end(
+        JSON.stringify({
+          error: {
+            message: error instanceof SubagentRoutingError ? error.message : 'Invalid subagent routing request.',
+          },
+        }),
+      );
+      return;
+    }
   }
   // Resolve once before trimming/translating; retries and fallback providers
   // must preserve the primary model's choice for this compaction operation.
@@ -245,6 +282,10 @@ export async function runCustomModelRequest(
   res.once('close', onClose);
   let completed = false;
   let upstreamOutput = false;
+  // Decode speed is measured on the first-to-last content chunk, excluding time to first token.
+  let streamStartedAt = 0;
+  let firstChunkAt = 0;
+  let lastChunkAt = 0;
   const deadline = Date.now() + (primary.retryBudgetMs ?? Math.max(primary.timeout ?? 120_000, 120_000));
   let failure = new UpstreamError('No configured model is currently available.', 503);
   let effectiveModel = primary;
@@ -267,6 +308,30 @@ export async function runCustomModelRequest(
       });
     res.write(`data: ${JSON.stringify(envelope({ candidates: [routed] }, cloudEnvelope))}\n\n`);
   };
+  /** Real provider usage: Antigravity records it per step only when the response carries it. */
+  const writeUsage = () => {
+    const measured = diagnostic.usage();
+    recordConversationUsage(prepared.context.conversationId, {
+      ...measured,
+      ttftMs: firstChunkAt ? firstChunkAt - streamStartedAt : undefined,
+      decodeMs: firstChunkAt && lastChunkAt > firstChunkAt ? lastChunkAt - firstChunkAt : undefined,
+    });
+    if (measured.inputTokens === undefined && measured.outputTokens === undefined) return;
+    if (signal.aborted || res.destroyed) return;
+    const usageMetadata = {
+      promptTokenCount: measured.inputTokens ?? 0,
+      candidatesTokenCount: measured.outputTokens ?? 0,
+      totalTokenCount: (measured.inputTokens ?? 0) + (measured.outputTokens ?? 0),
+      ...(measured.cachedTokens !== undefined ? { cachedContentTokenCount: measured.cachedTokens } : {}),
+    };
+    if (!res.headersSent)
+      res.writeHead(200, {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        'X-Accel-Buffering': 'no',
+      });
+    res.write(`data: ${JSON.stringify(envelope({ usageMetadata }, cloudEnvelope))}\n\n`);
+  };
 
   try {
     const chain = buildFallbackChain(primary, allModels);
@@ -283,202 +348,264 @@ export async function runCustomModelRequest(
         counts.circuitSkips += 1;
         continue;
       }
-      if (modelIndex > 0) counts.fallbacks += 1;
-      let modelFailed = false;
-      const retries = kind === 'generation-test' ? 0 : Math.min(5, Math.max(0, model.maxRetries ?? 3));
-      const cloudCode = model.provider === 'google-cloudcode';
-      const opencode = !cloudCode && isOpencodeEndpoint(model.apiUrl, model.provider);
-      const accountCount =
-        cloudCode && kind !== 'generation-test'
-          ? (model.googleAccounts || []).filter((account) => account.enabled !== false).length
-          : 0;
-      const attemptsAllowed = retries + Math.max(0, accountCount - 1);
-      for (let attempt = 0; attempt <= attemptsAllowed; attempt++) {
-        const stateKey = randomUUID();
-        let replayReasoning = '';
-        const replayCalls: unknown[] = [];
-        let replayOverflow = false;
-        const observeCandidate = (candidate: unknown) => {
-          const parts = (candidate as { content?: { parts?: Record<string, unknown>[] } })?.content?.parts;
-          for (const part of parts || []) {
-            if (replayOverflow) break;
-            if (part.thought === true && typeof part.text === 'string') replayReasoning += part.text;
-            if (part.functionCall) replayCalls.push(part);
-            if (replayReasoning.length > 256 * 1024 || replayCalls.length > 128) {
-              replayOverflow = true;
-              replayReasoning = '';
-              replayCalls.length = 0;
-            }
-          }
-        };
-        let request: http.ClientRequest | undefined;
-        let accountLease: GoogleAccountLease | undefined;
-        let totalTimer: ReturnType<typeof setTimeout> | undefined;
-        let headerLatencyMs: number | undefined;
-        const abort = () => request?.destroy(new Error('Cancelled'));
-        try {
-          if (signal.aborted) break;
-          const remaining = deadline - Date.now();
-          if (remaining <= 0) throw new UpstreamError('Request retry budget exhausted.', 504, false);
-          effectiveModel = model;
-          diagnostic.resetUsage();
-          const format = resolveApiFormat(model.provider, model.apiFormat);
-          const externalName = model.externalModelName || model.name.replace(/^models\//, '');
-          if (cloudCode) {
-            const identity = originalBody.sessionId || originalBody.conversationId;
-            accountLease = await acquireGoogleAccount(
-              model.name,
-              model.googleAccounts || [],
-              model.googlePool,
-              typeof identity === 'string' ? identity : undefined,
-              externalName.replace(/^models\//, ''),
-              model.apiUrl,
-            );
-            if (signal.aborted) break;
-          }
-          let payload: Record<string, unknown>;
-          let url: URL;
-          let headers: registry.ProviderHeaders;
-          try {
-            const outputBudget =
-              model.maxOutputTokens ??
-              Number(
-                originalBody.generationConfig?.maxOutputTokens ||
-                  (model.contextWindow ? Math.min(4000, Math.max(1, Math.floor(model.contextWindow / 4))) : 0),
-              );
-            // The IDE can omit thought parts when replaying completed tool calls.
-            // Recover only this conversation/provider's matching turn before budgeting.
-            const history = format === 'openai' ? reasoningReplayCache.restore(originalBody, model) : originalBody;
-            // Each attempt uses its own model's prompt, so a fallback never inherits the
-            // primary's. The operator's global prompt sits between the IDE instruction
-            // and the model's own text, and is added before trimming so it is counted.
-            captureSystemPrompt(history);
-            const prompted = appendModelSystemPrompt(withGlobalSystemPrompt(history), model.systemPrompt);
-            // A text-only provider fails the whole request when it receives an image,
-            // so strip tool-result media the model cannot use before trimming and
-            // translating. Google's native format already carried nested tool media,
-            // so it keeps its bytes to stay identical to the pre-fix behaviour.
-            // Replayed thought parts sit on model turns and the guard only rewrites
-            // user tool results, so the order here does not affect recovery.
-            const guardedBody =
-              format === 'google'
-                ? prompted
-                : omitUnsupportedToolImages(prompted, detectModelCapabilities(model).supportsImages);
-            const body = trimContext(guardedBody, model.contextWindow, outputBudget);
-            const effectiveModel = outputBudget ? { ...model, maxOutputTokens: outputBudget } : model;
-            payload = applyRequestOptions(
-              registry.translateRequest(model.provider, body, externalName, format, stateKey) as Record<
-                string,
-                unknown
-              >,
-              effectiveModel,
-              format,
-              isStream,
-              compactionEffort,
-            );
-            const target =
-              cloudCode || model.rawUrl
-                ? model.apiUrl
-                : registry.getProviderUrl(
-                    model.apiUrl,
-                    externalName,
-                    isStream,
-                    registry.getTranslator(model.provider, format),
-                  );
-            url = new URL(target);
-            if (!['http:', 'https:'].includes(url.protocol)) throw new Error('Unsupported endpoint protocol');
-            headers = registry.getProviderHeaders(model.provider, cloudCode ? '' : model.apiKey, format, model.apiUrl);
-            if (accountLease) {
-              url = new URL(googleAccountEndpoint(accountLease.account, model.apiUrl));
-              if (accountLease.account.authMode === 'antigravity' && !accountLease.account.project)
-                throw new Error('Prepare this Antigravity account in the model manager before generating a response');
-              url.pathname = `/v1internal:${isStream ? 'streamGenerateContent' : 'generateContent'}`;
-              url.search = isStream ? '?alt=sse' : '';
-              headers.Authorization = `Bearer ${accountLease.account.accessToken}`;
-              headers['User-Agent'] = GOOGLE_CLOUD_CODE_USER_AGENT;
-              const project = accountLease.account.project || model.googleProject;
-              payload = { model: externalName, ...(project ? { project } : {}), request: payload };
-            }
-            if (opencode) {
-              const identity = originalBody.sessionId || originalBody.conversationId;
-              // Preserve conversation affinity without putting arbitrary Unicode or control characters in a header.
-              headers['x-opencode-session'] =
-                typeof identity === 'string' && identity.trim()
-                  ? createHash('sha256').update(identity).digest('hex')
-                  : requestId;
-            }
-            if (model.gateway) {
-              const identity = originalBody.conversationId || originalBody.sessionId;
-              if (typeof identity === 'string' && identity.trim()) {
-                // Stable across turns and safe as a header, even when callers use Unicode/control characters.
-                headers['x-antigravity-conversation-id'] = createHash('sha256').update(identity).digest('hex');
+      let circuitPending = true;
+      const settleCircuit = (outcome: 'succeed' | 'fail' | 'cancel') => {
+        if (!circuitPending) return;
+        circuitPending = false;
+        if (outcome === 'succeed') circuits.succeed(circuitKey);
+        else if (outcome === 'fail') circuits.fail(circuitKey, model.circuitBreaker);
+        else circuits.cancel(circuitKey);
+      };
+      try {
+        if (modelIndex > 0) counts.fallbacks += 1;
+        let modelFailed = false;
+        const retries = kind === 'generation-test' ? 0 : Math.min(5, Math.max(0, model.maxRetries ?? 3));
+        const cloudCode = model.provider === 'google-cloudcode';
+        const opencode = !cloudCode && isOpencodeEndpoint(model.apiUrl, model.provider);
+        const accountCount =
+          cloudCode && kind !== 'generation-test'
+            ? (model.googleAccounts || []).filter((account) => account.enabled !== false).length
+            : 0;
+        const attemptsAllowed = retries + Math.max(0, accountCount - 1);
+        let accountSwitchesUsed = 0;
+        let retriesUsed = 0;
+        for (let attempt = 0; attempt <= attemptsAllowed; attempt++) {
+          const stateKey = randomUUID();
+          let replayReasoning = '';
+          const replayCalls: unknown[] = [];
+          let replayOverflow = false;
+          const observeCandidate = (candidate: unknown) => {
+            const parts = (candidate as { content?: { parts?: Record<string, unknown>[] } })?.content?.parts;
+            for (const part of parts || []) {
+              if (replayOverflow) break;
+              if (part.thought === true && typeof part.text === 'string') replayReasoning += part.text;
+              if (part.functionCall) replayCalls.push(part);
+              if (replayReasoning.length > 256 * 1024 || replayCalls.length > 128) {
+                replayOverflow = true;
+                replayReasoning = '';
+                replayCalls.length = 0;
               }
             }
-            for (const [key, value] of Object.entries(model.customHeaders || {})) {
-              if (/^(host|content-length|connection|transfer-encoding)$/i.test(key))
-                throw new Error('Reserved HTTP header');
-              if (cloudCode && /^authorization$/i.test(key))
-                throw new Error('Google pool authorization comes from the selected account');
-              http.validateHeaderName(key);
-              http.validateHeaderValue(key, value);
-              headers[key] = value;
+          };
+          let request: http.ClientRequest | undefined;
+          let accountLease: GoogleAccountLease | undefined;
+          let totalTimer: ReturnType<typeof setTimeout> | undefined;
+          let headerLatencyMs: number | undefined;
+          let timeoutFailure: UpstreamError | undefined;
+          const abort = () => request?.destroy(new Error('Cancelled'));
+          const triggerTimeout = (message: string) => {
+            const err = new UpstreamError(message, 504);
+            timeoutFailure = err;
+            request?.destroy(err);
+          };
+          try {
+            if (signal.aborted) break;
+            const remaining = deadline - Date.now();
+            if (remaining <= 0) throw new UpstreamError('Request retry budget exhausted.', 504, false);
+            effectiveModel = model;
+            diagnostic.resetUsage();
+            const format = resolveApiFormat(model.provider, model.apiFormat);
+            const externalName = model.externalModelName || model.name.replace(/^models\//, '');
+            if (cloudCode) {
+              const identity = originalBody.sessionId || originalBody.conversationId;
+              accountLease = await acquireGoogleAccount(
+                model.name,
+                model.googleAccounts || [],
+                model.googlePool,
+                typeof identity === 'string' ? identity : undefined,
+                externalName.replace(/^models\//, ''),
+                model.apiUrl,
+              );
+              if (signal.aborted) break;
             }
-          } catch (error) {
-            throw new UpstreamError(`Invalid model configuration: ${(error as Error).message}`, 400, false, 0, false);
-          }
-          counts.upstreamAttempts += 1;
-          const upstreamStartedAt = Date.now();
-          const upstream = await new Promise<http.IncomingMessage>((resolve, reject) => {
-            request = (url.protocol === 'https:' ? https : http).request(
-              url,
-              { method: 'POST', headers, rejectUnauthorized: !model.allowUnauthorized },
-              resolve,
-            );
-            request.once('error', reject);
-            request.setTimeout(model.idleTimeout ?? 30_000, () =>
-              request?.destroy(new UpstreamError('Upstream idle timeout.', 504)),
-            );
-            totalTimer = setTimeout(
-              () => request?.destroy(new UpstreamError('Upstream request timeout.', 504)),
-              Math.min(model.timeout ?? 120_000, remaining),
-            );
-            signal.addEventListener('abort', abort, { once: true });
-            request.end(JSON.stringify(payload));
-          });
-          headerLatencyMs = Date.now() - upstreamStartedAt;
-          const status = upstream.statusCode || 502;
-          if (status < 200 || status >= 300) {
-            const errorBody =
-              status === 400 ||
-              status === 422 ||
-              (cloudCode && [403, 429].includes(status)) ||
-              (opencode && [401, 403].includes(status))
-                ? await boundedErrorBody(upstream)
+            let payload: Record<string, unknown>;
+            let url: URL;
+            let headers: registry.ProviderHeaders;
+            try {
+              const cap = detectModelCapabilities(model);
+              let outputBudget =
+                model.maxOutputTokens ??
+                Number(
+                  originalBody.generationConfig?.maxOutputTokens ||
+                    (model.contextWindow
+                      ? Math.min(cap.maxOutputTokens, Math.max(1, Math.floor(model.contextWindow / 4)))
+                      : 0),
+                );
+              if (!Number.isFinite(outputBudget) || outputBudget < 0) outputBudget = 0;
+              if (model.contextWindow && outputBudget >= model.contextWindow) {
+                outputBudget = Math.max(1, Math.min(cap.maxOutputTokens, Math.floor(model.contextWindow / 4)));
+              }
+              // The IDE can omit thought parts when replaying completed tool calls.
+              // Recover only this conversation/provider's matching turn before budgeting.
+              const history = format === 'openai' ? reasoningReplayCache.restore(originalBody, model) : originalBody;
+              // Each attempt uses its own model's prompt, so a fallback never inherits the
+              // primary's. The operator's global prompt sits between the IDE instruction
+              // and the model's own text, and is added before trimming so it is counted.
+              captureSystemPrompt(history);
+              const prompted = appendModelSystemPrompt(withGlobalSystemPrompt(history), model.systemPrompt);
+              // A text-only provider fails the whole request when it receives an image,
+              // so strip tool-result media the model cannot use before trimming and
+              // translating. Google's native format already carried nested tool media,
+              // so it keeps its bytes to stay identical to the pre-fix behaviour.
+              // Replayed thought parts sit on model turns and the guard only rewrites
+              // user tool results, so the order here does not affect recovery.
+              const guardedBody =
+                format === 'google'
+                  ? prompted
+                  : omitUnsupportedToolImages(prompted, detectModelCapabilities(model).supportsImages);
+              let body: GeminiBody;
+              try {
+                // Without a declared window, use the detected capability so a 500k
+                // chat is still trimmed before reaching a smaller provider limit.
+                const effectiveContextWindow = model.contextWindow ||
+                  (Number.isSafeInteger(cap.maxTokens) ? cap.maxTokens : undefined);
+                body = trimContext(guardedBody, effectiveContextWindow, outputBudget, { marker: true });
+              } catch (trimError) {
+                // Allow a configured larger-context fallback model to take over.
+                throw new UpstreamError(
+                  `Context exceeds the configured contextWindow: ${(trimError as Error).message}`,
+                  400,
+                  false,
+                  0,
+                  true,
+                );
+              }
+              const effectiveModel = outputBudget ? { ...model, maxOutputTokens: outputBudget } : model;
+              payload = applyRequestOptions(
+                registry.translateRequest(model.provider, body, externalName, format, stateKey) as Record<
+                  string,
+                  unknown
+                >,
+                effectiveModel,
+                format,
+                isStream,
+                compactionEffort,
+              );
+              // OpenAI-compatible endpoints report tokens only when asked; retried without it
+              // if the provider rejects the field.
+              if (format === 'openai' && isStream && !hasUsageOptOut(usageOptOutKey(model, format)) && payload.stream_options === undefined)
+                payload.stream_options = { include_usage: true };
+              const target =
+                cloudCode || model.rawUrl
+                  ? model.apiUrl
+                  : registry.getProviderUrl(
+                      model.apiUrl,
+                      externalName,
+                      isStream,
+                      registry.getTranslator(model.provider, format),
+                    );
+              url = new URL(target);
+              if (!['http:', 'https:'].includes(url.protocol)) throw new Error('Unsupported endpoint protocol');
+              headers = registry.getProviderHeaders(model.provider, cloudCode ? '' : model.apiKey, format, model.apiUrl);
+              if (accountLease) {
+                url = new URL(googleAccountEndpoint(accountLease.account, model.apiUrl));
+                if (accountLease.account.authMode === 'antigravity' && !accountLease.account.project)
+                  throw new Error('Prepare this Antigravity account in the model manager before generating a response');
+                url.pathname = `/v1internal:${isStream ? 'streamGenerateContent' : 'generateContent'}`;
+                url.search = isStream ? '?alt=sse' : '';
+                headers.Authorization = `Bearer ${accountLease.account.accessToken}`;
+                headers['User-Agent'] = GOOGLE_CLOUD_CODE_USER_AGENT;
+                const project = accountLease.account.project || model.googleProject;
+                payload = { model: externalName, ...(project ? { project } : {}), request: payload };
+              }
+              if (opencode) {
+                const identity = originalBody.sessionId || originalBody.conversationId;
+                // Preserve conversation affinity without putting arbitrary Unicode or control characters in a header.
+                headers['x-opencode-session'] =
+                  typeof identity === 'string' && identity.trim()
+                    ? createHash('sha256').update(identity).digest('hex')
+                    : requestId;
+              }
+              if (model.gateway) {
+                const identity = originalBody.conversationId || originalBody.sessionId;
+                if (typeof identity === 'string' && identity.trim()) {
+                  // Stable across turns and safe as a header, even when callers use Unicode/control characters.
+                  headers['x-antigravity-conversation-id'] = createHash('sha256').update(identity).digest('hex');
+                }
+              }
+              for (const [key, value] of Object.entries(model.customHeaders || {})) {
+                if (/^(host|content-length|connection|transfer-encoding)$/i.test(key))
+                  throw new Error('Reserved HTTP header');
+                if (cloudCode && /^authorization$/i.test(key))
+                  throw new Error('Google pool authorization comes from the selected account');
+                http.validateHeaderName(key);
+                http.validateHeaderValue(key, value);
+                headers[key] = value;
+              }
+            } catch (error) {
+              if (error instanceof UpstreamError) throw error;
+              throw new UpstreamError(`Invalid model configuration: ${(error as Error).message}`, 400, false, 0, false);
+            }
+            counts.upstreamAttempts += 1;
+            const upstreamStartedAt = Date.now();
+            streamStartedAt = upstreamStartedAt;
+            const upstream = await new Promise<http.IncomingMessage>((resolve, reject) => {
+              request = (url.protocol === 'https:' ? https : http).request(
+                url,
+                { method: 'POST', headers, rejectUnauthorized: !model.allowUnauthorized },
+                resolve,
+              );
+              request.once('error', reject);
+              request.setTimeout(model.idleTimeout ?? 30_000, () => triggerTimeout('Upstream idle timeout.'));
+              totalTimer = setTimeout(
+                () => triggerTimeout('Upstream request timeout.'),
+                Math.min(model.timeout ?? 120_000, remaining),
+              );
+              signal.addEventListener('abort', abort, { once: true });
+              request.end(JSON.stringify(payload));
+            });
+            // Keep an error listener attached post-headers so timeout/abort destroy() never emits unhandled error.
+            request!.on('error', () => {});
+            headerLatencyMs = Date.now() - upstreamStartedAt;
+            const status = upstream.statusCode || 502;
+            if (status < 200 || status >= 300) {
+              const errorBody =
+                status === 400 ||
+                status === 413 ||
+                status === 422 ||
+                (cloudCode && [403, 429].includes(status)) ||
+                (opencode && [401, 403].includes(status))
+                  ? await boundedErrorBody(upstream)
+                  : '';
+              if (
+                (status === 400 || status === 422) &&
+                !hasUsageOptOut(usageOptOutKey(model, format)) &&
+                /stream_options|include_usage/i.test(errorBody)
+              ) {
+                // Retry this same attempt once without stream_options; decrementing avoids exiting on the final attempt.
+                usageOptOut.set(usageOptOutKey(model, format), Date.now());
+                upstream.destroy();
+                attempt -= 1;
+                continue;
+              }
+              const decision =
+                cloudCode && isGoogleQuotaFailure(status, errorBody)
+                  ? classifyGoogleRateLimit(errorBody, upstream.headers['retry-after'])
+                  : undefined;
+              const retryAfter = decision?.retryAfterMs ?? parseRetryAfter(upstream.headers['retry-after']);
+              const contextOverflow = isContextLengthExceeded(status, errorBody);
+              const hint = status === 400 || status === 422 ? toolSchemaErrorHint(errorBody) : '';
+              const overflowHint = contextOverflow
+                ? ' Context length exceeded the model limit; compact the conversation or switch to a larger-context model.'
                 : '';
-            const decision =
-              cloudCode && isGoogleQuotaFailure(status, errorBody)
-                ? classifyGoogleRateLimit(errorBody, upstream.headers['retry-after'])
-                : undefined;
-            const retryAfter = decision?.retryAfterMs ?? parseRetryAfter(upstream.headers['retry-after']);
-            const hint = status === 400 || status === 422 ? toolSchemaErrorHint(errorBody) : '';
-            upstream.destroy();
-            throw new UpstreamError(
-              `${
-                cloudCode
-                  ? decision && status === 403
-                    ? 'Google Cloud Code reported a rate or quota limit (HTTP 403). Respect the provider retry/reset delay; signing in again does not increase quota.'
-                    : describeGoogleAccessError(status).message
-                  : opencode && [401, 403].includes(status)
-                    ? describeOpencodeAccessError(status, errorBody)
-                    : `Upstream returned HTTP ${status}.`
-              }${hint}`,
-              status,
-              !!decision || status === 408 || status === 429 || status >= 500,
-              retryAfter,
-              status !== 400 && status !== 422,
-              decision,
-            );
-          }
+              upstream.destroy();
+              throw new UpstreamError(
+                `${
+                  cloudCode
+                    ? decision && status === 403
+                      ? 'Google Cloud Code reported a rate or quota limit (HTTP 403). Respect the provider retry/reset delay; signing in again does not increase quota.'
+                      : describeGoogleAccessError(status).message
+                    : opencode && [401, 403].includes(status)
+                      ? describeOpencodeAccessError(status, errorBody)
+                      : `Upstream returned HTTP ${status}.`
+                }${hint}${overflowHint}`,
+                status,
+                !!decision || status === 408 || status === 429 || status >= 500,
+                retryAfter,
+                contextOverflow || (status !== 400 && status !== 422),
+                decision,
+              );
+            }
 
           if (isStream && String(upstream.headers['content-type']).includes('text/event-stream')) {
             const decoder = new StringDecoder('utf8');
@@ -519,8 +646,12 @@ export async function runCustomModelRequest(
                 chunk.delta?.thinking ||
                 chunk.delta?.partial_json ||
                 chunk.candidates?.[0]?.content?.parts?.length
-              )
+              ) {
                 upstreamOutput = true;
+                const now = Date.now();
+                if (!firstChunkAt) firstChunkAt = now;
+                lastChunkAt = now;
+              }
               if (
                 chunk.type === 'message_stop' ||
                 chunk.choices?.[0]?.finish_reason ||
@@ -586,6 +717,7 @@ export async function runCustomModelRequest(
             event();
             if (!emitted) throw new UpstreamError('Upstream returned an empty stream.');
             if (!terminal) throw new UpstreamError('Upstream stream ended before completion.', 502, false);
+            writeUsage();
             if (!finalReason) writeCandidate({ content: { parts: [], role: 'model' }, finishReason: 'STOP', index: 0 });
           } else {
             let size = 0;
@@ -652,7 +784,9 @@ export async function runCustomModelRequest(
             }
             if (isStream) {
               for (const candidate of mapped.candidates) writeCandidate(candidate);
+              writeUsage();
             } else {
+              recordConversationUsage(prepared.context.conversationId, diagnostic.usage());
               prepared.context.modelName = effectiveModel.name;
               const routed = subagentRouting.rewriteResponse(mapped, prepared.context, resolveSubagent);
               res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -666,7 +800,9 @@ export async function runCustomModelRequest(
               { text: replayReasoning, thought: true },
               ...replayCalls,
             ]);
-          circuits.succeed(circuitKey);
+          settleCircuit('succeed');
+          // A successful stream proves this endpoint accepts usage fields again.
+          usageOptOut.delete(usageOptOutKey(model, format));
           recordModelSuccess(model.name, headerLatencyMs);
           completed = true;
           accountLease?.release({ status, latencyMs: headerLatencyMs });
@@ -674,7 +810,7 @@ export async function runCustomModelRequest(
           res.end();
           return;
         } catch (error) {
-          failure = asUpstreamError(error);
+          failure = timeoutFailure ?? asUpstreamError(error);
           accountLease?.release({
             status: failure.status,
             retryAfterMs: failure.googleRateLimit
@@ -684,29 +820,35 @@ export async function runCustomModelRequest(
             cancelled: signal.aborted,
           });
           if (signal.aborted) {
-            circuits.cancel(circuitKey);
+            settleCircuit('cancel');
             break modelLoop;
           }
           if (res.headersSent || upstreamOutput) {
-            circuits.fail(circuitKey, model.circuitBreaker);
+            settleCircuit('fail');
             recordModelFailure(model.name, failure.message);
             break modelLoop;
           }
           if (
             accountLease &&
-            attempt < accountCount - 1 &&
+            accountSwitchesUsed < accountCount - 1 &&
             [401, 403, 408, 429, 500, 502, 503, 504].includes(failure.status)
           ) {
+            accountSwitchesUsed += 1;
             counts.accountSwitches += 1;
             continue;
           }
-          if (failure.retryable && attempt < retries && Date.now() < deadline) {
+          if (failure.retryable && retriesUsed < retries && Date.now() < deadline) {
+            const backoffAttempt = retriesUsed;
+            retriesUsed += 1;
             counts.retries += 1;
             // Tear down the old attempt before waiting; timeout and error cannot each schedule a retry.
             request?.destroy();
             if (totalTimer) clearTimeout(totalTimer);
             signal.removeEventListener('abort', abort);
-            await delay(Math.min(failure.retryAfter || 500 * 2 ** attempt, Math.max(1, deadline - Date.now())), signal);
+            await delay(
+              Math.min(failure.retryAfter || 500 * 2 ** backoffAttempt, Math.max(1, deadline - Date.now())),
+              signal,
+            );
           } else {
             modelFailed = true;
             break;
@@ -720,10 +862,13 @@ export async function runCustomModelRequest(
         }
       }
       if (modelFailed) {
-        circuits.fail(circuitKey, model.circuitBreaker);
+        settleCircuit('fail');
         recordModelFailure(model.name, failure.message);
-      } else circuits.cancel(circuitKey);
+      } else settleCircuit('cancel');
       if (!failure.mayFallback) break;
+      } finally {
+        settleCircuit('cancel');
+      }
     }
     if (!signal.aborted && !res.writableEnded && !res.destroyed) {
       if (res.headersSent)

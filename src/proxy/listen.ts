@@ -22,7 +22,8 @@ export function listenProxy(server: Server, preferredPort = 50999, allowFallback
       resolve((server.address() as AddressInfo).port);
     };
     const onError = (error: NodeJS.ErrnoException) => {
-      if (error.code === 'EADDRINUSE' && allowFallback && !triedFallback) {
+      const fallbackEligible = error.code === 'EADDRINUSE' || error.code === 'EACCES';
+      if (fallbackEligible && allowFallback && !triedFallback) {
         triedFallback = true;
         server.listen(0, '127.0.0.1');
         return;
@@ -31,6 +32,8 @@ export function listenProxy(server: Server, preferredPort = 50999, allowFallback
       server.removeListener('error', onError);
       if (error.code === 'EADDRINUSE' && !allowFallback) {
         error.message = `Port ${preferredPort} is occupied. The patched language server requires this exact port; close the other instance before starting Antigravity.`;
+      } else if (error.code === 'EACCES' && !allowFallback) {
+        error.message = `Port ${preferredPort} cannot be bound (access denied or excluded port range). The patched language server requires this exact port.`;
       }
       reject(error);
     };

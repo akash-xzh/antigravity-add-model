@@ -4,7 +4,7 @@ const names = [
   'gateway-integration', 'gateway-lifecycle', 'dashboard-ui', 'parse-tool-args', 'token-estimator', 'tool-translation',
   'mapper-translation', 'google-adapter', 'gateway-protocols', 'router-classify',
   'reasoning-store', 'session-store-ttl', 'safe-write', 'error-response',
-  'context-windows', 'plugin-architecture', 'provider-expansion', 'settings-validation', 'compaction-effort',
+  'context-windows', 'plugin-architecture', 'provider-expansion', 'settings-validation', 'compaction-effort', 'compaction',
 ];
 const selected = process.argv[2] ? names.filter(n => n.includes(process.argv[2])) : names;
 if (!selected.length) throw new Error('No matching test module');

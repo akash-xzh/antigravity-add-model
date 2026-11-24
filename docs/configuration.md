@@ -154,10 +154,12 @@ explicitly when migrating a configuration.
 ## Compaction threshold
 
 In **Advanced settings → Compaction threshold (%)**, set when the native IDE
-should consider summarizing new context. Leaving it blank preserves the IDE's
-default. Start at **50%** when many tools are enabled, then check context usage
-before raising it. For example, a local server actually configured for an
-85,000-token context and an 8,192-token output limit can use:
+should consider summarizing new context. Leave it blank to use **80%** of the
+context window you declared above; with no declared window the model keeps the
+IDE's own 50,000-token new-token default, so a model whose real limit is unknown
+is never given a guessed 1M budget. Start at **50%** when many tools are enabled,
+then check context usage before raising it. For example, a local server actually
+configured for an 85,000-token context and an 8,192-token output limit can use:
 
 ```json
 {

@@ -6,6 +6,27 @@ import { protocol, net } from 'electron';
 // is then exposed on plugin://<authority>.
 export const extensionAuthorities = new Map<string, string>();
 
+const LOOPBACK_AUTHORITY_RE = /^http:\/\/(?:127\.0\.0\.1|localhost):\d+\/?$/i;
+
+export function parseLoopbackAuthorityOrigin(value: unknown): string | null {
+  if (typeof value !== 'string') return null;
+  const trimmed = value.trim();
+  if (!LOOPBACK_AUTHORITY_RE.test(trimmed)) return null;
+  let parsed: URL;
+  try {
+    parsed = new URL(trimmed);
+  } catch {
+    return null;
+  }
+  if (parsed.protocol !== 'http:') return null;
+  if (parsed.hostname !== '127.0.0.1' && parsed.hostname !== 'localhost') return null;
+  if (parsed.username || parsed.password) return null;
+  if (parsed.pathname !== '/' || parsed.search || parsed.hash) return null;
+  const port = Number(parsed.port || '80');
+  if (!Number.isInteger(port) || port < 1 || port > 65535) return null;
+  return parsed.origin;
+}
+
 export function registerCustomSchemes(): void {
   protocol.registerSchemesAsPrivileged([
     {
@@ -25,13 +46,30 @@ export function registerCustomSchemes(): void {
 export function registerCustomSchemeHandlers(): void {
   // Handle custom scheme for UI extensions
   protocol.handle('plugin', async (request) => {
-    const url = new URL(request.url);
+    let url: URL;
+    try {
+      url = new URL(request.url);
+    } catch {
+      return new Response(null, { status: 400 });
+    }
     const authority = url.hostname;
     const originalHost = extensionAuthorities.get(authority);
     if (!originalHost) {
       return new Response(null, { status: 404 });
     }
-    const targetUrl = new URL(url.pathname + url.search, originalHost);
+    const validatedOrigin = parseLoopbackAuthorityOrigin(originalHost);
+    if (!validatedOrigin) {
+      return new Response(null, { status: 403 });
+    }
+    let targetUrl: URL;
+    try {
+      targetUrl = new URL(url.pathname + url.search, validatedOrigin);
+    } catch {
+      return new Response(null, { status: 400 });
+    }
+    if (targetUrl.origin !== validatedOrigin) {
+      return new Response(null, { status: 403 });
+    }
     try {
       const fetchOptions: RequestInit & { duplex?: string } = {
         method: request.method,

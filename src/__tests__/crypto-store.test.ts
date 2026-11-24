@@ -14,7 +14,14 @@ function fixture(available = false, failEncryption = false, failDecryption = fal
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-crypto-'));
   directories.push(directory);
   const logs: unknown[][] = [];
-  const api = {} as { encryptString(value: string): string; decryptString(value: string): string };
+  const api = {} as {
+    encryptString(value: string): string;
+    decryptString(value: string): string;
+    encryptModels(models: Array<Record<string, unknown>> | null): Array<Record<string, unknown>>;
+    decryptModels(models: Array<Record<string, unknown>> | null): Array<Record<string, unknown>>;
+    backupFile(filePath: string): void;
+    removeBackupFile(filePath: string): void;
+  };
   const dependencies: Record<string, unknown> = {
     fs,
     path,
@@ -100,5 +107,54 @@ describe('credential encryption', () => {
     expect(codec.decryptString('enc:c2VjcmV0')).toBe('DECRYPTION_FAILED');
     expect(codec.logs.flat().join(' ')).toContain('OS-backed credentials could not be decrypted');
     expect(JSON.stringify(codec.logs)).not.toContain('sensitive-provider-token');
+  });
+
+  it('never double-encrypts ciphertext prefixes and decrypts prefixed keys even when encrypted flag is falsy', () => {
+    const codec = fixture(false);
+    const encrypted = codec.encryptString('my-api-secret');
+    expect(encrypted).toMatch(/^local-gcm:/);
+
+    // Omitted/false encrypted flag on an already-encrypted key must not double-encrypt
+    const reEncrypted = codec.encryptModels([{ name: 'm1', apiKey: encrypted, encrypted: false }]);
+    expect(reEncrypted[0].apiKey).toBe(encrypted);
+    expect(reEncrypted[0].encrypted).toBe(true);
+
+    // Falsy encrypted flag on an encrypted key must still decrypt
+    const decrypted = codec.decryptModels([{ name: 'm1', apiKey: encrypted, encrypted: false }]);
+    expect(decrypted[0].apiKey).toBe('my-api-secret');
+    expect(decrypted[0].encrypted).toBe(false);
+
+    // Legacy fallback prefix with missing encrypted flag also decrypts
+    const decryptedLegacy = codec.decryptModels([{ name: 'm2', apiKey: 'fallback:bGVnYWN5' }]);
+    expect(decryptedLegacy[0].apiKey).toBe('legacy');
+  });
+
+  it('repairs a zero-byte key left by an interrupted first boot instead of locking out credentials', () => {
+    const codec = fixture();
+    fs.mkdirSync(path.dirname(codec.keyPath), { recursive: true });
+    fs.writeFileSync(codec.keyPath, Buffer.alloc(0));
+    const encrypted = codec.encryptString('secret-after-repair');
+    expect(encrypted).toMatch(/^local-gcm:/);
+    expect(fs.readFileSync(codec.keyPath)).toHaveLength(32);
+    expect(codec.decryptString(encrypted)).toBe('secret-after-repair');
+    expect(fs.readdirSync(path.dirname(codec.keyPath)).filter((f) => f.endsWith('.tmp'))).toEqual([]);
+  });
+
+  it('creates 0o600 backups, removes them on cleanup, and leaves no temp key files on fresh boot', () => {
+    const codec = fixture(false);
+    codec.encryptString('bootstrap-key');
+    const keyDir = path.dirname(codec.keyPath);
+    expect(fs.readdirSync(keyDir).filter((f) => f.endsWith('.tmp'))).toEqual([]);
+
+    const configPath = path.join(codec.directory, 'custom_models.json');
+    fs.writeFileSync(configPath, JSON.stringify({ models: [{ name: 'models/a', apiKey: 'plain' }] }));
+    codec.backupFile(configPath);
+    const bakPath = `${configPath}.bak`;
+    expect(fs.existsSync(bakPath)).toBe(true);
+    if (process.platform !== 'win32') {
+      expect(fs.statSync(bakPath).mode & 0o777).toBe(0o600);
+    }
+    codec.removeBackupFile(configPath);
+    expect(fs.existsSync(bakPath)).toBe(false);
   });
 });

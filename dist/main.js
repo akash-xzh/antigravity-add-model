@@ -155,12 +155,31 @@ electron_1.app
     // from overriding the local proxy endpoint.
     // Redirect GetAvailableModels to our proxy so custom models are injected.
     electron_1.session.defaultSession.webRequest.onBeforeRequest((details, callback) => {
-        if (details.url.includes('SetCloudCodeURL')) {
+        const lsPort = (0, languageServer_1.getLsPort)();
+        if (!lsPort) {
+            callback({});
+            return;
+        }
+        let parsedUrl;
+        try {
+            parsedUrl = new URL(details.url);
+        }
+        catch {
+            callback({});
+            return;
+        }
+        if (!['http:', 'https:'].includes(parsedUrl.protocol) ||
+            !['127.0.0.1', 'localhost'].includes(parsedUrl.hostname) ||
+            Number(parsedUrl.port) !== lsPort) {
+            callback({});
+            return;
+        }
+        if (/(?:\/|\.)LanguageServerService\/SetCloudCodeURL$/.test(parsedUrl.pathname)) {
             console.log(`[Proxy Intercept] Blocked SetCloudCodeURL: ${details.url}`);
             callback({ cancel: true });
             return;
         }
-        if (details.url.includes('LanguageServerService/GetAvailableModels')) {
+        if (/(?:\/|\.)LanguageServerService\/GetAvailableModels$/.test(parsedUrl.pathname)) {
             const proxyPort = require('./proxy').getProxyPort();
             if (proxyPort > 0) {
                 const redirectTarget = `http://127.0.0.1:${proxyPort}/GetAvailableModels?ls=${encodeURIComponent(details.url)}`;
@@ -169,7 +188,7 @@ electron_1.app
                 return;
             }
         }
-        if (details.url.includes('CloudCode') || details.url.includes('LanguageServerService')) {
+        if (parsedUrl.pathname.includes('CloudCode') || parsedUrl.pathname.includes('LanguageServerService')) {
             console.log(`[Proxy Intercept] Request URL: ${details.url}`);
         }
         callback({});
@@ -181,6 +200,9 @@ electron_1.app
         applicationVersion: electron_1.app.getVersion(),
         version: cl || undefined,
     });
+    // A corrupt settings file must not prevent the app from starting: quarantine
+    // it once at boot (strict reads/writes elsewhere still refuse to overwrite it).
+    await storageManager.quarantineCorruptFile();
     // Pre-onboarding: check if we should offer to re-install the IDE.
     // This runs before the LS starts so we can show a standalone wizard.
     if (!HEADLESS) {
@@ -260,13 +282,20 @@ electron_1.app
     }
     // Initial window — opened once after the LS has successfully started.
     if (!HEADLESS) {
+        const currentWindowUrl = () => `${constants_1.WINDOW_ORIGIN}:${(0, languageServer_1.getLsPort)() || handle.port}/`;
         (0, menu_1.setupApplicationMenu)(url);
+        const appMenu = electron_1.Menu.getApplicationMenu?.();
+        const fileSubmenu = appMenu?.items?.find((item) => item.label === 'File')?.submenu;
+        const newWinItem = fileSubmenu?.items?.find((item) => item.label === 'New Window');
+        if (newWinItem) {
+            newWinItem.click = () => (0, utils_1.createWindow)(currentWindowUrl());
+        }
         const mainWindow = (0, utils_1.createWindow)(url);
         if (electron_1.app.dock) {
             const dockMenu = electron_1.Menu.buildFromTemplate([
                 {
                     label: 'New Window',
-                    click: () => (0, utils_1.createWindow)(url),
+                    click: () => (0, utils_1.createWindow)(currentWindowUrl()),
                 },
             ]);
             electron_1.app.dock.setMenu(dockMenu);
@@ -334,7 +363,8 @@ electron_1.app.on('before-quit', async (event) => {
         // Destroy all windows to terminate renderers and release keep-alive sockets
         const windows = electron_1.BrowserWindow.getAllWindows();
         for (const win of windows) {
-            win.destroy();
+            if (!win.isDestroyed())
+                win.destroy();
         }
         // Close all active connections and kill the language server in parallel
         await Promise.all([
@@ -348,7 +378,9 @@ electron_1.app.on('before-quit', async (event) => {
     }
     // Show a confirmation dialog before quitting
     event.preventDefault();
-    const win = electron_1.BrowserWindow.getFocusedWindow() || electron_1.BrowserWindow.getAllWindows()[0];
+    const focused = electron_1.BrowserWindow.getFocusedWindow();
+    const win = (focused && !focused.isDestroyed() ? focused : undefined) ||
+        electron_1.BrowserWindow.getAllWindows().find((w) => !w.isDestroyed());
     const options = {
         type: 'question',
         buttons: ['Cancel', 'Quit'],
@@ -359,14 +391,25 @@ electron_1.app.on('before-quit', async (event) => {
         detail: 'There may be agents or background tasks running.',
     };
     (0, utils_1.setShowQuitConfirmation)(false);
-    if (win) {
-        void electron_1.dialog.showMessageBox(win, options).then((result) => {
-            if (result.response === 1) {
-                // Quit - this will retrigger 'before-quit'
-                electron_1.app.quit();
-            }
-        });
+    if (!win) {
+        // No live window to attach a confirmation dialog; retrigger graceful quit immediately.
+        electron_1.app.quit();
+        return;
     }
+    void electron_1.dialog
+        .showMessageBox(win, options)
+        .then((result) => {
+        if (result.response === 1) {
+            // Quit - this will retrigger 'before-quit'
+            electron_1.app.quit();
+        }
+        else {
+            (0, utils_1.setShowQuitConfirmation)(true);
+        }
+    })
+        .catch(() => {
+        electron_1.app.quit();
+    });
 });
 /**
  * Fired when the app is re-activated (e.g. clicking the dock icon on macOS).

@@ -8,6 +8,7 @@ import * as http from 'http';
 import * as https from 'https';
 import * as fs from 'fs';
 import * as path from 'path';
+import * as url from 'url';
 import log from 'electron-log';
 
 // ─── Types ────────────────────────────────────────────────────────────────
@@ -17,6 +18,7 @@ export interface CustomModel {
   displayName: string;
   description: string;
   provider: string;
+  providerName?: string;
   apiKey: string;
   apiUrl: string;
   externalModelName: string;
@@ -95,10 +97,43 @@ function stopUpstreams(): void {
   for (const request of upstreamRequests) request.destroy();
 }
 
+function safeWriteHead(
+  res: http.ServerResponse,
+  statusCode: number,
+  headers?: http.OutgoingHttpHeaders,
+): boolean {
+  if (res.headersSent || res.writableEnded || res.destroyed || res.socket?.destroyed) return false;
+  res.writeHead(statusCode, headers);
+  return true;
+}
+
+function uiCorsHeaders(req: http.IncomingMessage): Record<string, string> {
+  // Keep CORP: cross-origin so Chromium's ORB/CORP checks allow the redirected
+  // no-cors /main.js script load from the HTTPS loopback language-server origin,
+  // without granting wildcard CORS read access to external websites.
+  const headers: Record<string, string> = {
+    'Cross-Origin-Resource-Policy': 'cross-origin',
+  };
+  const origin = typeof req.headers.origin === 'string' ? req.headers.origin.trim() : '';
+  if (!origin) return headers;
+  try {
+    const parsed = new URL(origin);
+    if (
+      (parsed.protocol === 'https:' || parsed.protocol === 'http:') &&
+      (parsed.hostname === '127.0.0.1' || parsed.hostname === 'localhost') &&
+      parsed.origin === origin
+    ) {
+      return { ...headers, 'Access-Control-Allow-Origin': origin, Vary: 'Origin' };
+    }
+  } catch {
+    /* Invalid origin header: omit Access-Control-Allow-Origin. */
+  }
+  return headers;
+}
+
 function rejectDuringShutdown(res: http.ServerResponse): boolean {
   if (!stoppingProxy) return false;
-  if (!res.destroyed && !res.writableEnded) {
-    res.writeHead(503, { Connection: 'close', 'Content-Type': 'application/json' });
+  if (safeWriteHead(res, 503, { Connection: 'close', 'Content-Type': 'application/json' })) {
     res.end(JSON.stringify({ error: 'Proxy is shutting down' }));
   }
   return true;
@@ -134,17 +169,33 @@ import {
 import { detectModelCapabilities, nativeCatalogCapabilities, nativeModelExperiments } from './proxy/modelUtils';
 import { CloudCodeRouting } from './proxy/cloudCodeRouting';
 import { catalogModelSlug, catalogDisplayNames, localModelSlug, mergeCloudCodeCatalog } from './proxy/modelCatalog';
+import { configureNativeLimits, nativeLimitsPath, recordNativeLimits } from './proxy/nativeLimits';
+import { recordConversationTiming } from './proxy/conversationUsage';
 import { allocateModelIdentities, ModelIdentity } from './modelIdentity';
 
 // Custom request transport and model storage
 import { runCustomModelRequest, getProxyMetrics, stopCustomRequests } from './proxy/customRequest';
 import { readModelConfig, writeJsonAtomic } from './modelStore';
 import { getRequiredProxyPort, listenProxy } from './proxy/listen';
-import { subagentRouting, SubagentRoutingError } from './proxy/subagentRouting';
+import { subagentRouting, nativeConversationId, SubagentRoutingError } from './proxy/subagentRouting';
 import { resolveConfiguredSubagentModel } from './proxy/subagentModels';
-import { authenticatedGoogleFileUrl, guardLoopbackRequest, languageServerModelsUrl } from './proxy/loopbackSecurity';
-import { forwardNativeGeneration, NativeSubagentRouting } from './proxy/nativeSubagentResponse';
+import {
+  authenticatedGoogleFileUrl,
+  getUiMitmToken,
+  guardLoopbackRequest,
+  languageServerModelsUrl,
+} from './proxy/loopbackSecurity';
+export { getUiMitmToken };
+import { forwardNativeGeneration, NativeSubagentRouting, wasForwardedSuccessfully } from './proxy/nativeSubagentResponse';
 import { attemptGooglePoolFailover, resolveGoogleFailoverPool } from './proxy/googlePoolFailover';
+function getUiMitm(): typeof import('./proxy/uiMitm') | null {
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    return require('./proxy/uiMitm');
+  } catch {
+    return null;
+  }
+}
 function getGlobalPrompt() {
   try {
     return require('./proxy/globalPrompt');
@@ -230,10 +281,10 @@ function recordRecentModel(name: string): void {
   } catch {}
 }
 
-function formatHealthDisplayName(baseName: string, health?: unknown, isRecent?: boolean): string {
+function formatHealthDisplayName(baseName: string, health?: unknown, isRecent?: boolean, showStatusEmoji?: boolean): string {
   try {
     const mod = getModelHealth();
-    return mod?.formatHealthDisplayName ? mod.formatHealthDisplayName(baseName, health, isRecent) : baseName;
+    return mod?.formatHealthDisplayName ? mod.formatHealthDisplayName(baseName, health, isRecent, showStatusEmoji) : baseName;
   } catch {
     return baseName;
   }
@@ -282,7 +333,14 @@ function modelIdentities(models: CustomModel[], upstream?: unknown): Map<string,
     const saved = readModelConfig(getCustomModelsPath()).filter(
       (model) => typeof model.name === 'string' && model.name,
     );
-    const configured = [...new Map([...saved, ...models].map((model) => [model.name, model])).values()];
+    const configured: Array<typeof saved[number]> = [];
+    const seen = new Set<string>();
+    for (const model of [...saved, ...models]) {
+      if (!seen.has(model.name)) {
+        seen.add(model.name);
+        configured.push(model as typeof saved[number]);
+      }
+    }
     return new Map(
       allocateModelIdentities(path.dirname(getCustomModelsPath()), configured, upstream).map((identity) => [
         identity.name,
@@ -329,6 +387,9 @@ function matchCustomModel(models: CustomModel[], ...selectors: unknown[]): Custo
 }
 
 function customCloudCodeCatalog(upstream: unknown = {}): Record<string, unknown> {
+  // Official models carry the only authoritative context limit; capture it for the context pill.
+  configureNativeLimits(nativeLimitsPath(path.dirname(getCustomModelsPath())));
+  recordNativeLimits(upstream);
   const models = sortCustomModels(loadCustomModels());
   const identities = modelIdentities(models, upstream);
   const labels = catalogDisplayNames(models, upstream, getCachedHealthMap(), getRecentModels());
@@ -549,10 +610,17 @@ export function loadCustomModels(): CustomModel[] {
 
     // Validate all models
     const validModels: CustomModel[] = [];
+    const seenNames = new Set<string>();
     for (let i = 0; i < decrypted.length; i++) {
       const validation = validateCustomModel(decrypted[i]) as { valid: boolean; error?: string };
       if (validation.valid) {
-        if (decrypted[i].enabled !== false) validModels.push(decrypted[i]);
+        if (decrypted[i].enabled !== false && !seenNames.has(decrypted[i].name)) {
+          seenNames.add(decrypted[i].name);
+          if (!decrypted[i].displayName || !decrypted[i].displayName.trim()) {
+            decrypted[i].displayName = decrypted[i].externalModelName || decrypted[i].name.replace(/^models\//, '');
+          }
+          validModels.push(decrypted[i]);
+        }
       } else {
         log.warn(`[Proxy] Skipping invalid model at index ${i}: ${validation.error}`);
       }
@@ -700,14 +768,89 @@ function proxyToGoogle(
     .catch(() => {
       if (res.destroyed || res.writableEnded) return;
       log.warn('[Proxy] Could not determine the native Cloud Code account route.');
-      res.writeHead(502, { 'Content-Type': 'application/json' });
-      res.end(
-        JSON.stringify({
-          error: { message: 'Could not determine the native Cloud Code account route. Please retry.' },
-        }),
-      );
+      if (safeWriteHead(res, 502, { 'Content-Type': 'application/json' })) {
+        res.end(
+          JSON.stringify({
+            error: { message: 'Could not determine the native Cloud Code account route. Please retry.' },
+          }),
+        );
+      }
     })
     .finally(() => res.off('close', cancel));
+}
+
+/**
+ * Official-model speed telemetry. Antigravity annotates those tokens in the transcript, so only the
+ * measured decode window is kept: first byte to last byte of the streamed response.
+ */
+function tapNativeStream(upstream: http.IncomingMessage, reqBody: Buffer, requestStartedAt: number): void {
+  const conversationId = nativeConversationId(reqBody);
+  if (!conversationId) return;
+  let firstAt = 0;
+  let lastAt = 0;
+  upstream.on('data', () => {
+    const now = Date.now();
+    if (!firstAt) firstAt = now;
+    lastAt = now;
+  });
+  upstream.on('end', () =>
+    recordConversationTiming(conversationId, {
+      ttftMs: firstAt ? firstAt - requestStartedAt : undefined,
+      decodeMs: firstAt && lastAt > firstAt ? lastAt - firstAt : undefined,
+    }),
+  );
+}
+
+/**
+ * Taps downstream writes for `forwardNativeGeneration` without switching the upstream
+ * IncomingMessage into flowing mode (preserving `for await` / `pipeline` backpressure).
+ */
+function tapNativeResponse(
+  res: http.ServerResponse,
+  reqBody: Buffer,
+  requestStartedAt: number,
+): { finish: () => void; cancel: () => void } {
+  const conversationId = nativeConversationId(reqBody);
+  if (!conversationId) return { finish: () => {}, cancel: () => {} };
+  let firstAt = 0;
+  let lastAt = 0;
+  let settled = false;
+  const origWrite = res.write.bind(res) as typeof res.write;
+  const origEnd = res.end.bind(res) as typeof res.end;
+  res.write = ((chunk: unknown, ...args: unknown[]) => {
+    const now = Date.now();
+    if (!firstAt) firstAt = now;
+    lastAt = now;
+    return (origWrite as (...a: unknown[]) => boolean)(chunk, ...args);
+  }) as typeof res.write;
+  res.end = ((chunk?: unknown, ...args: unknown[]) => {
+    if (chunk && typeof chunk !== 'function') {
+      const now = Date.now();
+      if (!firstAt) firstAt = now;
+      lastAt = now;
+    }
+    return (origEnd as (...a: unknown[]) => http.ServerResponse)(chunk, ...args);
+  }) as typeof res.end;
+  const restore = () => {
+    res.write = origWrite;
+    res.end = origEnd;
+  };
+  return {
+    finish() {
+      if (settled) return;
+      settled = true;
+      restore();
+      recordConversationTiming(conversationId, {
+        ttftMs: firstAt ? firstAt - requestStartedAt : undefined,
+        decodeMs: firstAt && lastAt > firstAt ? lastAt - firstAt : undefined,
+      });
+    },
+    cancel() {
+      if (settled) return;
+      settled = true;
+      restore();
+    },
+  };
 }
 
 function forwardToGoogle(
@@ -730,6 +873,7 @@ function forwardToGoogle(
   headers['content-length'] = String(reqBody.length);
 
   const isGeneration = req.url!.includes('generateContent') || req.url!.includes('streamGenerateContent');
+  const streamingGeneration = isGeneration && (req.url!.includes('streamGenerateContent') || req.url!.includes('alt=sse'));
   const shouldBufferAndModify = isCloudCodeUrl && !isGeneration;
   const failoverEnabled = isCloudCodeUrl && isGeneration && !!resolveGoogleFailoverPool(loadCustomModels(), reqBody);
 
@@ -751,9 +895,11 @@ function forwardToGoogle(
       res.destroy();
       return;
     }
-    res.writeHead(status, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ error: { message } }));
+    if (safeWriteHead(res, status, { 'Content-Type': 'application/json' })) {
+      res.end(JSON.stringify({ error: { message } }));
+    }
   };
+  const requestStartedAt = Date.now();
   const proxyReq = https.request(parsedUrl, options, (proxyRes) => {
     if (
       failoverEnabled &&
@@ -795,11 +941,15 @@ function forwardToGoogle(
           cloudCodeOrigin || targetUrl,
         )
           .then((handled) => {
-            if (handled || stoppingProxy || res.destroyed || res.writableEnded) return;
+            // The error-body listeners belong to the short probe read; once the
+            // failover decision is made, later error/aborted events are stale.
+            interrupted = true;
+            if (handled || stoppingProxy) return;
             const responseHeaders = forwardingHeaders(proxyRes.headers);
             responseHeaders['content-length'] = String(original.length);
-            res.writeHead(proxyRes.statusCode || 429, responseHeaders);
-            res.end(original);
+            if (safeWriteHead(res, proxyRes.statusCode || 429, responseHeaders)) {
+              res.end(original);
+            }
           })
           .catch(() => failForwarding(502, 'Google account failover failed.'));
       });
@@ -808,17 +958,39 @@ function forwardToGoogle(
     if (nativeSubagent && isGeneration) {
       nativeResponse = proxyRes;
       const streamHint = req.url!.includes('streamGenerateContent') || req.url!.includes('alt=sse');
-      void forwardNativeGeneration(proxyRes, res, nativeSubagent, streamHint).catch((error: unknown) => {
-        log.error('[Proxy] Native generation forwarding failed:', error);
-        failForwarding(502, 'Native generation forwarding failed.');
-      });
+      const tap =
+        streamingGeneration && (proxyRes.statusCode || 200) < 300
+          ? tapNativeResponse(res, reqBody, requestStartedAt)
+          : undefined;
+      void forwardNativeGeneration(proxyRes, res, nativeSubagent, streamHint).then(
+        (result) => {
+          if (wasForwardedSuccessfully(result)) tap?.finish();
+          else tap?.cancel();
+        },
+        (error: unknown) => {
+          tap?.cancel();
+          log.error('[Proxy] Native generation forwarding failed:', error);
+          failForwarding(502, 'Native generation forwarding failed.');
+        },
+      );
       return;
     }
 
     if (shouldBufferAndModify) {
       const responseChunks: Buffer[] = [];
+      let bufferFailed = false;
+      const onBufferError = (err?: unknown) => {
+        if (bufferFailed) return;
+        bufferFailed = true;
+        if (err) log.error('[Proxy] Google buffered response error:', err);
+        failForwarding(502, 'Google response was interrupted.');
+        proxyRes.destroy();
+      };
+      proxyRes.once('error', onBufferError);
+      proxyRes.once('aborted', () => onBufferError());
       proxyRes.on('data', (chunk) => responseChunks.push(chunk));
       proxyRes.on('end', () => {
+        if (bufferFailed || stoppingProxy) return;
         const fullResBody = Buffer.concat(responseChunks);
         let text: string;
         const encoding = proxyRes.headers['content-encoding'];
@@ -883,12 +1055,25 @@ function forwardToGoogle(
         const modifiedBuffer = Buffer.from(text, 'utf-8');
         modifiedHeaders['content-length'] = String(modifiedBuffer.length);
 
-        res.writeHead(proxyRes.statusCode || 200, modifiedHeaders as Record<string, string>);
-        res.end(modifiedBuffer);
+        if (safeWriteHead(res, proxyRes.statusCode || 200, modifiedHeaders as Record<string, string>)) {
+          res.end(modifiedBuffer);
+        }
       });
     } else {
-      res.writeHead(proxyRes.statusCode || 200, forwardingHeaders(proxyRes.headers));
-      proxyRes.pipe(res);
+      proxyRes.once('error', (err) => {
+        log.error('[Proxy] Google response stream error:', err);
+        failForwarding(502, 'Google response stream failed.');
+        proxyRes.destroy();
+      });
+      proxyRes.once('aborted', () => {
+        if (!res.writableEnded && !res.destroyed) res.destroy();
+      });
+      if (safeWriteHead(res, proxyRes.statusCode || 200, forwardingHeaders(proxyRes.headers))) {
+        if (streamingGeneration && (proxyRes.statusCode || 200) < 300) tapNativeStream(proxyRes, reqBody, requestStartedAt);
+        proxyRes.pipe(res);
+      } else {
+        proxyRes.destroy();
+      }
     }
   });
 
@@ -919,6 +1104,8 @@ function forwardToGoogle(
 
 // ─── File Data Resolver ────────────────────────────────────────────────────
 
+const MAX_RESOLVED_FILE_BYTES = 10 * 1024 * 1024;
+
 async function resolveFileData(
   body: GeminiRequestBody,
   reqHeaders: Record<string, string | string[] | undefined>,
@@ -946,10 +1133,17 @@ async function resolveFileData(
         const uri = fd.fileUri;
         let fileContent = '';
         if (uri.startsWith('file://')) {
-          const fp = uri.replace('file://', '').replace(/\//g, path.sep);
-          if (fs.existsSync(fp)) fileContent = fs.readFileSync(fp, 'utf-8');
+          const fp = url.fileURLToPath(uri);
+          if (fs.existsSync(fp)) {
+            const stat = fs.statSync(fp);
+            if (stat.isFile() && stat.size <= MAX_RESOLVED_FILE_BYTES) {
+              fileContent = fs.readFileSync(fp, 'utf-8');
+            } else if (stat.isFile()) {
+              log.warn(`[Proxy] Skipping fileData exceeding ${MAX_RESOLVED_FILE_BYTES} bytes`);
+            }
+          }
         } else if (authHeader && authenticatedGoogleFileUrl(uri)) {
-          fileContent = await downloadFileContent(uri, authHeader);
+          fileContent = await downloadFileContent(uri, authHeader, downstream);
         }
         if (fileContent) {
           (item.parts[i] as Record<string, unknown>) = { text: '[File content]:\n\n' + fileContent };
@@ -961,14 +1155,39 @@ async function resolveFileData(
   }
 }
 
-function downloadFileContent(url: string, authHeader: string): Promise<string> {
+function downloadFileContent(
+  fileUrl: string,
+  authHeader: string,
+  downstream?: http.ServerResponse,
+): Promise<string> {
   return new Promise((resolve, reject) => {
-    const u = authenticatedGoogleFileUrl(url);
+    const u = authenticatedGoogleFileUrl(fileUrl);
     if (!u) {
       reject(new Error('Authenticated file downloads require a Google API HTTPS URL'));
       return;
     }
-    const request = https.request(
+    let settled = false;
+    let request: http.ClientRequest | undefined;
+    const onDownstreamClose = () => {
+      if (downstream && !downstream.writableFinished) {
+        request?.destroy(new Error('Client disconnected during file download'));
+      }
+    };
+    const finish = (error?: Error, value?: string) => {
+      if (settled) return;
+      settled = true;
+      downstream?.off('close', onDownstreamClose);
+      if (error) reject(error);
+      else resolve(value ?? '');
+    };
+    if (downstream) {
+      if (downstream.destroyed || downstream.writableEnded) {
+        finish(new Error('Client disconnected before file download'));
+        return;
+      }
+      downstream.once('close', onDownstreamClose);
+    }
+    request = https.request(
       {
         hostname: u.hostname,
         path: u.pathname + u.search,
@@ -977,19 +1196,31 @@ function downloadFileContent(url: string, authHeader: string): Promise<string> {
         timeout: 30000,
       },
       (res) => {
-        res.on('error', reject);
+        res.once('error', (err) => finish(err instanceof Error ? err : new Error('File download failed')));
+        res.once('aborted', () => finish(new Error('File download aborted')));
         if (res.statusCode !== 200) {
           res.resume();
-          reject(new Error('HTTP ' + res.statusCode));
+          finish(new Error('HTTP ' + res.statusCode));
           return;
         }
-        let d = '';
-        res.on('data', (c: Buffer) => (d += c.toString()));
-        res.on('end', () => resolve(d));
+        const chunks: Buffer[] = [];
+        let totalBytes = 0;
+        res.on('data', (chunk: Buffer | string) => {
+          const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+          totalBytes += bytes.length;
+          if (totalBytes > MAX_RESOLVED_FILE_BYTES) {
+            res.destroy();
+            request?.destroy();
+            finish(new Error(`File download exceeds ${MAX_RESOLVED_FILE_BYTES} byte limit`));
+            return;
+          }
+          chunks.push(bytes);
+        });
+        res.once('end', () => finish(undefined, Buffer.concat(chunks).toString('utf8')));
       },
     );
-    request.on('error', reject);
-    request.on('timeout', () => request.destroy(new Error('File download timed out')));
+    request.once('error', (err) => finish(err instanceof Error ? err : new Error('File download failed')));
+    request.once('timeout', () => request?.destroy(new Error('File download timed out')));
     trackUpstream(request);
     request.end();
   });
@@ -1003,6 +1234,7 @@ function handleCustomModelRequest(
   body: GeminiRequestBody,
   isStream: boolean,
   cloudEnvelope = true,
+  prepared?: ReturnType<typeof subagentRouting.prepareRequest>,
 ): void {
   if (res.destroyed || res.writableEnded || rejectDuringShutdown(res)) return;
   recordRecentModel(model.name);
@@ -1013,6 +1245,8 @@ function handleCustomModelRequest(
     isStream,
     loadCustomModels(),
     cloudEnvelope,
+    'request',
+    prepared,
   );
 }
 
@@ -1176,10 +1410,11 @@ function encodeModelEntryForGetModels(
 function handleGetAvailableModelsProxy(res: http.ServerResponse, reqBody: Buffer, lsUrl: string): void {
   const lsParsed = languageServerModelsUrl(lsUrl, currentLanguageServerPort());
   if (!lsParsed) {
-    res.writeHead(400, { 'Content-Type': 'application/json' });
-    res.end(
-      JSON.stringify({ error: { message: 'URL must target the active local language server model-list endpoint' } }),
-    );
+    if (safeWriteHead(res, 400, { 'Content-Type': 'application/json' })) {
+      res.end(
+        JSON.stringify({ error: { message: 'URL must target the active local language server model-list endpoint' } }),
+      );
+    }
     return;
   }
   const client = lsParsed.protocol === 'https:' ? https : http;
@@ -1248,18 +1483,26 @@ function handleGetAvailableModelsProxy(res: http.ServerResponse, reqBody: Buffer
         }
       }
 
-      res.writeHead(lsRes.statusCode || 200, {
-        'Content-Type': 'application/grpc-web+proto',
-        'Content-Length': String(modifiedBuf.length),
-      });
-      res.end(modifiedBuf);
+      if (
+        safeWriteHead(res, lsRes.statusCode || 200, {
+          'Content-Type': 'application/grpc-web+proto',
+          'Content-Length': String(modifiedBuf.length),
+        })
+      ) {
+        res.end(modifiedBuf);
+      }
     });
 
     lsRes.on('error', (err) => {
       if (stoppingProxy || res.destroyed || res.socket?.destroyed) return;
       log.error('[Proxy] LS error for GetAvailableModels:', err.message);
-      if (!res.headersSent) {
-        res.writeHead(502);
+      if (safeWriteHead(res, 502)) {
+        res.end();
+      }
+    });
+    lsRes.on('aborted', () => {
+      if (stoppingProxy || res.destroyed || res.socket?.destroyed) return;
+      if (safeWriteHead(res, 502)) {
         res.end();
       }
     });
@@ -1268,8 +1511,7 @@ function handleGetAvailableModelsProxy(res: http.ServerResponse, reqBody: Buffer
   lsReq.setTimeout(30_000, () => {
     log.error('[Proxy] GetAvailableModels forward timed out');
     lsReq.destroy();
-    if (!res.headersSent) {
-      res.writeHead(504);
+    if (safeWriteHead(res, 504)) {
       res.end();
     }
   });
@@ -1277,8 +1519,7 @@ function handleGetAvailableModelsProxy(res: http.ServerResponse, reqBody: Buffer
   lsReq.on('error', (err) => {
     if (stoppingProxy || res.destroyed || res.socket?.destroyed) return;
     log.error('[Proxy] GetAvailableModels forward error:', err.message);
-    if (!res.headersSent) {
-      res.writeHead(502);
+    if (safeWriteHead(res, 502)) {
       res.end();
     }
   });
@@ -1300,40 +1541,43 @@ function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): voi
     if (!req.url.startsWith('/') || /^[\\/]{2}/.test(req.url)) throw new Error('Invalid target');
     requestUrl = new URL(req.url, 'http://localhost');
   } catch {
-    res.writeHead(400, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ error: { message: 'Invalid request target' } }));
+    if (safeWriteHead(res, 400, { 'Content-Type': 'application/json' })) {
+      res.end(JSON.stringify({ error: { message: 'Invalid request target' } }));
+    }
     return;
   }
 
   // Health check
   if (req.method === 'GET' && (req.url === '/health' || req.url === '/healthz')) {
     const memUsage = process.memoryUsage();
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(
-      JSON.stringify({
-        status: 'ok',
-        uptime: process.uptime(),
-        port: proxyPort,
-        memory: {
-          rssMB: Math.round(memUsage.rss / 1024 / 1024),
-          heapUsedMB: Math.round(memUsage.heapUsed / 1024 / 1024),
-          heapTotalMB: Math.round(memUsage.heapTotal / 1024 / 1024),
-        },
-        state: {
-          activeStreamContexts: activeStreamContexts.size,
-          modelToolCallIds: modelToolCallIds.size,
-          translatedToolCalls: translatedToolCalls.size,
-          modelReasoningContent: modelReasoningContent.size,
-        },
-        timestamp: new Date().toISOString(),
-      }),
-    );
+    if (safeWriteHead(res, 200, { 'Content-Type': 'application/json' })) {
+      res.end(
+        JSON.stringify({
+          status: 'ok',
+          uptime: process.uptime(),
+          port: proxyPort,
+          memory: {
+            rssMB: Math.round(memUsage.rss / 1024 / 1024),
+            heapUsedMB: Math.round(memUsage.heapUsed / 1024 / 1024),
+            heapTotalMB: Math.round(memUsage.heapTotal / 1024 / 1024),
+          },
+          state: {
+            activeStreamContexts: activeStreamContexts.size,
+            modelToolCallIds: modelToolCallIds.size,
+            translatedToolCalls: translatedToolCalls.size,
+            modelReasoningContent: modelReasoningContent.size,
+          },
+          timestamp: new Date().toISOString(),
+        }),
+      );
+    }
     return;
   }
 
   if (req.method === 'GET' && requestUrl.pathname === '/metrics') {
-    res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
-    res.end(JSON.stringify(getProxyMetrics()));
+    if (safeWriteHead(res, 200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' })) {
+      res.end(JSON.stringify(getProxyMetrics()));
+    }
     return;
   }
 
@@ -1350,8 +1594,7 @@ function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): voi
       if (!bodyRejected) {
         bodyRejected = true;
         log.warn(`[Proxy] Request body exceeds ${MAX_BODY_SIZE / 1024 / 1024}MB limit (${req.method} ${req.url})`);
-        if (!res.headersSent) {
-          res.writeHead(413, { 'Content-Type': 'application/json', Connection: 'close' });
+        if (safeWriteHead(res, 413, { 'Content-Type': 'application/json', Connection: 'close' })) {
           res.end(
             JSON.stringify({ error: { message: `Request body too large. Maximum: ${MAX_BODY_SIZE / 1024 / 1024}MB` } }),
           );
@@ -1370,6 +1613,109 @@ function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): voi
 
     log.info(`[Proxy] Request: ${req.method} ${req.url}`);
 
+    // 0a. Serve MITM UI assets (/main.js + live provider map)
+    if (req.method === 'GET' && req.url!.startsWith('/_ui/custom-providers.json')) {
+      const map = getUiMitm()?.buildCustomProviderMap(loadCustomModels()) || {};
+      if (
+        safeWriteHead(res, 200, {
+          'Content-Type': 'application/json; charset=utf-8',
+          ...uiCorsHeaders(req),
+          'Cache-Control': 'no-store',
+        })
+      ) {
+        res.end(JSON.stringify(map));
+      }
+      return;
+    }
+
+    if (req.method === 'GET' && req.url!.startsWith('/_ui/main.js')) {
+      const cors = uiCorsHeaders(req);
+      const lsPort = currentLanguageServerPort();
+      if (!lsPort) {
+        if (safeWriteHead(res, 503, { 'Content-Type': 'application/javascript; charset=utf-8', ...cors })) {
+          res.end('console.error("[Model Patch] Language server port unavailable");');
+        }
+        return;
+      }
+      const lsReq = https.request(
+        {
+          host: '127.0.0.1',
+          port: lsPort,
+          path: '/main.js',
+          method: 'GET',
+          rejectUnauthorized: false,
+          headers: { 'accept-encoding': 'identity' },
+        },
+        (lsRes) => {
+          const chunks: Buffer[] = [];
+          let failed = false;
+          const failLsRes = (err?: unknown) => {
+            if (failed) return;
+            failed = true;
+            if (err) log.error('[Proxy] Error reading /main.js response from language server:', err);
+            if (safeWriteHead(res, 502, { 'Content-Type': 'application/javascript; charset=utf-8', ...cors })) {
+              res.end('console.error("[Model Patch] Error reading /main.js");');
+            }
+            lsRes.destroy();
+          };
+          lsRes.once('error', failLsRes);
+          lsRes.once('aborted', () => failLsRes());
+          lsRes.on('data', (chunk: Buffer) => chunks.push(chunk));
+          lsRes.on('end', () => {
+            if (failed || stoppingProxy) return;
+            const rawBuffer = Buffer.concat(chunks);
+            try {
+              const raw = rawBuffer.toString('utf8');
+              const uiMitm = getUiMitm();
+              const providerMap = uiMitm ? uiMitm.buildCustomProviderMap(loadCustomModels()) : {};
+              const { code, patched, missed } = uiMitm
+                ? uiMitm.patchMainJsModelSelector(raw, proxyPort, providerMap)
+                : { code: raw, patched: false, missed: [] };
+              log.info(`[Proxy] Served MITM /main.js (patched=${patched}, providers=${Object.keys(providerMap).length})`);
+              if (missed.length)
+                log.warn(`[Proxy] main.js effort patches not applicable to this build: ${missed.join(', ')}`);
+              if (
+                safeWriteHead(res, lsRes.statusCode || 200, {
+                  'Content-Type': 'application/javascript; charset=utf-8',
+                  ...cors,
+                  'Cache-Control': 'no-store',
+                })
+              ) {
+                res.end(code);
+              }
+            } catch (err) {
+              log.error('[Proxy] Failed to patch /main.js; serving unpatched fallback:', err);
+              // Return HTTP 200 (not 500) so Chromium still executes the unpatched fallback bundle.
+              if (
+                safeWriteHead(res, lsRes.statusCode || 200, {
+                  'Content-Type': 'application/javascript; charset=utf-8',
+                  ...cors,
+                  'Cache-Control': 'no-store',
+                })
+              ) {
+                res.end(rawBuffer);
+              }
+            }
+          });
+        },
+      );
+      lsReq.setTimeout(15_000, () => {
+        lsReq.destroy();
+        if (safeWriteHead(res, 504, { 'Content-Type': 'application/javascript; charset=utf-8', ...cors })) {
+          res.end('console.error("[Model Patch] Timed out fetching /main.js");');
+        }
+      });
+      lsReq.on('error', (err) => {
+        log.error('[Proxy] Error fetching /main.js from language server:', err);
+        if (safeWriteHead(res, 502, { 'Content-Type': 'application/javascript; charset=utf-8', ...cors })) {
+          res.end('console.error("[Model Patch] Error fetching /main.js");');
+        }
+      });
+      trackUpstream(lsReq);
+      lsReq.end();
+      return;
+    }
+
     // 0. Intercept GetAvailableModels (redirected from Electron webRequest)
     if (req.url!.startsWith('/GetAvailableModels')) {
       const gavParsed = new URL(req.url!, 'http://127.0.0.1');
@@ -1378,8 +1724,9 @@ function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): voi
         handleGetAvailableModelsProxy(res, fullBody, lsUrl);
         return;
       }
-      res.writeHead(400, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: 'Missing ls parameter' }));
+      if (safeWriteHead(res, 400, { 'Content-Type': 'application/json' })) {
+        res.end(JSON.stringify({ error: 'Missing ls parameter' }));
+      }
       return;
     }
 
@@ -1422,33 +1769,74 @@ function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): voi
 
       const mdlOptions: https.RequestOptions = { method: 'GET', headers: mdlHeaders as Record<string, string> };
 
-      const googleReq = https.request(parsedUrl, mdlOptions, (googleRes) => {
-        // P0-5: Timeout for models list forward request (30s)
-        googleReq.setTimeout(30_000, () => {
-          log.error('[Proxy] Models list forward request timed out');
-          googleReq.destroy();
-          if (!res.headersSent) {
-            const customModels = loadCustomModels();
-            res.writeHead(200, { 'Content-Type': 'application/json' });
-            res.end(
-              JSON.stringify({
-                models: customModels.map((m) => ({
-                  name: m.name,
-                  displayName: m.displayName,
-                  description: m.description,
-                  ...getAdvertisedModelCapabilities(m),
-                  supportedGenerationMethods: ['generateContent'],
-                })),
-              }),
-            );
-          }
-        });
+      let modelsResponded = false;
+      const sendCustomOnlyModels = (withLimits = false) => {
+        if (modelsResponded || stoppingProxy) return;
+        modelsResponded = true;
+        const customModels = loadCustomModels();
+        const mappedCustom = customModels.map((m) =>
+          withLimits
+            ? {
+                name: m.name,
+                version: '1.0',
+                displayName: m.displayName,
+                description: m.description,
+                ...getAdvertisedModelCapabilities(m),
+                inputTokenLimit: detectModelCapabilities(m).maxTokens,
+                outputTokenLimit: detectModelCapabilities(m).maxOutputTokens,
+                supportedGenerationMethods: ['generateContent', 'countTokens'],
+              }
+            : {
+                name: m.name,
+                displayName: m.displayName,
+                description: m.description,
+                ...getAdvertisedModelCapabilities(m),
+                supportedGenerationMethods: ['generateContent'],
+              },
+        );
+        if (safeWriteHead(res, 200, { 'Content-Type': 'application/json' })) {
+          res.end(JSON.stringify({ models: mappedCustom }));
+        }
+      };
 
-        let googleBody = '';
-        googleRes.on('data', (chunk) => (googleBody += chunk));
+      const googleReq = https.request(parsedUrl, mdlOptions, (googleRes) => {
+        const googleChunks: Buffer[] = [];
+        // A catalog response is small; never buffer an unbounded upstream body or
+        // keep a socket alive after the client has gone away.
+        const GOOGLE_MODELS_MAX_BYTES = 4 * 1024 * 1024;
+        let googleBytes = 0;
+        const abortGoogleModels = () => {
+          googleReq.destroy();
+          googleRes.destroy();
+        };
+        if (typeof res.once === 'function') {
+          res.once('close', () => {
+            if (!res.writableEnded) abortGoogleModels();
+          });
+        }
+        googleRes.once('error', (err) => {
+          log.error('[Proxy] Google models list response error:', err);
+          sendCustomOnlyModels(false);
+          googleRes.destroy();
+        });
+        googleRes.once('aborted', () => {
+          sendCustomOnlyModels(false);
+        });
+        googleRes.on('data', (chunk: Buffer | string) => {
+          const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+          googleBytes += bytes.length;
+          if (googleBytes > GOOGLE_MODELS_MAX_BYTES) {
+            log.error('[Proxy] Google models list response exceeded the size cap');
+            if (!modelsResponded) sendCustomOnlyModels(true);
+            abortGoogleModels();
+            return;
+          }
+          googleChunks.push(bytes);
+        });
         googleRes.on('end', () => {
+          if (modelsResponded || stoppingProxy) return;
           try {
-            const googleJson = JSON.parse(googleBody) as { models?: unknown[] };
+            const googleJson = JSON.parse(Buffer.concat(googleChunks).toString('utf8')) as { models?: unknown[] };
             const customModels = loadCustomModels();
 
             const mappedCustom = customModels.map((m) => ({
@@ -1474,43 +1862,28 @@ function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): voi
               googleJson.models = mappedCustom;
             }
 
-            res.writeHead(200, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify(googleJson));
+            modelsResponded = true;
+            if (safeWriteHead(res, 200, { 'Content-Type': 'application/json' })) {
+              res.end(JSON.stringify(googleJson));
+            }
           } catch (err) {
             log.error('[Proxy] Google list models failed, returning custom models list only:', err);
-            const customModels = loadCustomModels();
-            const mappedCustom = customModels.map((m) => ({
-              name: m.name,
-              version: '1.0',
-              displayName: m.displayName,
-              description: m.description,
-              ...getAdvertisedModelCapabilities(m),
-              inputTokenLimit: detectModelCapabilities(m).maxTokens,
-              outputTokenLimit: detectModelCapabilities(m).maxOutputTokens,
-              supportedGenerationMethods: ['generateContent', 'countTokens'],
-            }));
-            res.writeHead(200, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ models: mappedCustom }));
+            sendCustomOnlyModels(true);
           }
         });
+      });
+
+      // Install before response headers arrive so stalled connections still fall back within 30s.
+      googleReq.setTimeout(30_000, () => {
+        log.error('[Proxy] Models list forward request timed out');
+        googleReq.destroy();
+        sendCustomOnlyModels(false);
       });
 
       googleReq.on('error', (err) => {
         if (stoppingProxy || res.destroyed || res.writableEnded || res.socket?.destroyed) return;
         log.error('[Proxy] Google models list request error:', err);
-        const customModels = loadCustomModels();
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(
-          JSON.stringify({
-            models: customModels.map((m) => ({
-              name: m.name,
-              displayName: m.displayName,
-              description: m.description,
-              ...getAdvertisedModelCapabilities(m),
-              supportedGenerationMethods: ['generateContent'],
-            })),
-          }),
-        );
+        sendCustomOnlyModels(false);
       });
       trackUpstream(googleReq);
       googleReq.end();
@@ -1535,13 +1908,15 @@ function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): voi
           if (typeof reqJson.conversationId === 'string') actualGeminiBody.conversationId = reqJson.conversationId;
           if (!actualGeminiBody.labels && reqJson.labels && typeof reqJson.labels === 'object')
             actualGeminiBody.labels = reqJson.labels as Record<string, unknown>;
+          const requestMatchedModel = matchCustomModel(customModels, modelName, modelId);
           const prepared = subagentRouting.prepareRequest(
             actualGeminiBody,
             (selector) => resolveConfiguredSubagentModel(customModels, selector)?.name,
+            requestMatchedModel?.name,
           );
           const matchedCustomModel = prepared.modelName
             ? resolveConfiguredSubagentModel(customModels, prepared.modelName)
-            : matchCustomModel(customModels, modelName, modelId);
+            : requestMatchedModel;
           if (matchedCustomModel) {
             log.info(
               `[Proxy] Intercepting Cloud Code generation for custom model: ${modelName} => ${matchedCustomModel.displayName}`,
@@ -1553,7 +1928,14 @@ function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): voi
               req.headers as Record<string, string | string[] | undefined>,
               res,
             ).then(() => {
-              handleCustomModelRequest(res, matchedCustomModel, prepared.body as GeminiRequestBody, isStream);
+              handleCustomModelRequest(
+                res,
+                matchedCustomModel,
+                prepared.body as GeminiRequestBody,
+                isStream,
+                true,
+                prepared,
+              );
             });
             return;
           }
@@ -1580,13 +1962,15 @@ function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): voi
         }
       } catch (err) {
         if (err instanceof SubagentRoutingError) {
-          res.writeHead(err.status, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: { message: err.message } }));
+          if (safeWriteHead(res, err.status, { 'Content-Type': 'application/json' })) {
+            res.end(JSON.stringify({ error: { message: err.message } }));
+          }
           return;
         }
         log.error('[Proxy] Failed to parse Cloud Code stream body:', err);
-        res.writeHead(400, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: { message: 'Invalid Cloud Code generation request body' } }));
+        if (safeWriteHead(res, 400, { 'Content-Type': 'application/json' })) {
+          res.end(JSON.stringify({ error: { message: 'Invalid Cloud Code generation request body' } }));
+        }
         return;
       }
     }
@@ -1603,20 +1987,23 @@ function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): voi
       try {
         matchedModelName = decodeURIComponent(isGenerate ? generateMatch![1] : streamMatch![1]);
       } catch {
-        res.writeHead(400, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: { message: 'Invalid model URL encoding' } }));
+        if (safeWriteHead(res, 400, { 'Content-Type': 'application/json' })) {
+          res.end(JSON.stringify({ error: { message: 'Invalid model URL encoding' } }));
+        }
         return;
       }
       const customModels = loadCustomModels();
       try {
         const geminiBody = JSON.parse(bodyStr) as GeminiRequestBody;
+        const requestMatchedModel = matchCustomModel(customModels, matchedModelName);
         const prepared = subagentRouting.prepareRequest(
           geminiBody,
           (selector) => resolveConfiguredSubagentModel(customModels, selector)?.name,
+          requestMatchedModel?.name,
         );
         const matchedCustomModel = prepared.modelName
           ? resolveConfiguredSubagentModel(customModels, prepared.modelName)
-          : matchCustomModel(customModels, matchedModelName);
+          : requestMatchedModel;
         if (matchedCustomModel) {
           resolveFileData(
             prepared.body as GeminiRequestBody,
@@ -1629,6 +2016,7 @@ function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): voi
               prepared.body as GeminiRequestBody,
               isStandardStream,
               false,
+              prepared,
             );
           });
           return;
@@ -1647,12 +2035,13 @@ function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): voi
         return;
       } catch (e) {
         log.error('[Proxy] JSON parse error in request body:', e);
-        res.writeHead(e instanceof SubagentRoutingError ? e.status : 400, { 'Content-Type': 'application/json' });
-        res.end(
-          JSON.stringify({
-            error: { message: e instanceof SubagentRoutingError ? e.message : 'Invalid JSON request body' },
-          }),
-        );
+        if (safeWriteHead(res, e instanceof SubagentRoutingError ? e.status : 400, { 'Content-Type': 'application/json' })) {
+          res.end(
+            JSON.stringify({
+              error: { message: e instanceof SubagentRoutingError ? e.message : 'Invalid JSON request body' },
+            }),
+          );
+        }
         return;
       }
     }
@@ -1683,7 +2072,9 @@ export async function startProxy(options: ProxyStartOptions = {}): Promise<numbe
   loadHealthCache(serviceDataDirectory);
   // Non-blocking background health check of configured models (smart paced, deduplicated)
   try {
-    checkAllModelsHealth(loadCustomModels());
+    if (fs.existsSync(getCustomModelsPath())) {
+      checkAllModelsHealth(loadCustomModels());
+    }
   } catch {}
   languageServerRoutingEnabled = options.allowLanguageServerRouting !== false;
   shutdownGraceMs = options.shutdownGraceMs ?? DEFAULT_SHUTDOWN_GRACE_MS;

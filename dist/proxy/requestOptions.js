@@ -138,28 +138,30 @@ function applyCompactionEffort(result, model, format, effort) {
         result.generationConfig = generation;
     }
 }
-// A budgeting estimate, not a provider tokenizer. Image token costs depend on
-// the model and dimensions; base64 byte counts are not text token counts.
-const ESTIMATED_IMAGE_TOKENS = 1024;
-function isImageAttachment(field, attachment) {
-    return ((typeof attachment.mimeType === 'string' && /^image\//i.test(attachment.mimeType.trim())) ||
-        (field === 'fileData' && typeof attachment.fileUri === 'string' && /^data:image\//i.test(attachment.fileUri)));
+// A budgeting estimate, not a provider tokenizer. Binary media token costs depend on
+// the model and dimensions/duration; base64 byte counts are not text token counts.
+const ESTIMATED_MEDIA_TOKENS = 1024;
+const BINARY_MEDIA_MIME = /^(?:image\/|audio\/|video\/|application\/pdf\b)/i;
+const BINARY_MEDIA_DATA_URI = /^data:(?:image\/|audio\/|video\/|application\/pdf\b)/i;
+function isBinaryMediaAttachment(field, attachment) {
+    return ((typeof attachment.mimeType === 'string' && BINARY_MEDIA_MIME.test(attachment.mimeType.trim())) ||
+        (field === 'fileData' && typeof attachment.fileUri === 'string' && BINARY_MEDIA_DATA_URI.test(attachment.fileUri)));
 }
 /**
- * Blank every image payload on a copy of the part and report how many were found.
- * Tool media is nested in `functionResponse.parts`, so this must recurse; otherwise
- * a base64 screenshot inside a tool result would be billed as raw text.
+ * Blank binary media payloads (`image/*`, `audio/*`, `video/*`, `application/pdf`) on a copy
+ * of the part and report how many were found. Non-binary inline data (such as `text/plain`)
+ * keeps its raw size. Tool media is nested in `functionResponse.parts`, so this recurses.
  */
 function estimatePart(part) {
-    let images = 0;
+    let mediaCount = 0;
     let estimatedPart = part;
     for (const field of ['inlineData', 'fileData']) {
         const attachment = part[field];
         if (!attachment || typeof attachment !== 'object')
             continue;
-        if (!isImageAttachment(field, attachment))
+        if (!isBinaryMediaAttachment(field, attachment))
             continue;
-        images += 1;
+        mediaCount += 1;
         estimatedPart = {
             ...estimatedPart,
             [field]: { ...attachment, [field === 'inlineData' ? 'data' : 'fileUri']: '' },
@@ -169,48 +171,111 @@ function estimatePart(part) {
     if (response && typeof response === 'object' && Array.isArray(response.parts)) {
         const nested = response.parts.map((nestedPart) => {
             const estimate = estimatePart((nestedPart || {}));
-            images += estimate.images;
+            mediaCount += estimate.mediaCount;
             return estimate.part;
         });
         estimatedPart = { ...estimatedPart, functionResponse: { ...response, parts: nested } };
     }
-    return { part: estimatedPart, images };
+    return { part: estimatedPart, mediaCount };
 }
-function estimateContextTokens(body) {
-    let imageTokens = 0;
-    const estimatedBody = {
-        ...body,
-        contents: body.contents?.map((content) => ({
-            ...content,
-            parts: content.parts?.map((part) => {
-                const estimate = estimatePart(part);
-                imageTokens += estimate.images * ESTIMATED_IMAGE_TOKENS;
-                return estimate.part;
-            }),
-        })),
+function estimateContentItem(content) {
+    let mediaCount = 0;
+    const estimatedContent = {
+        ...content,
+        parts: content.parts?.map((part) => {
+            const estimate = estimatePart(part);
+            mediaCount += estimate.mediaCount;
+            return estimate.part;
+        }),
     };
-    return Math.ceil(Buffer.byteLength(JSON.stringify(estimatedBody), 'utf8') / 3) + imageTokens;
+    return {
+        content,
+        bytes: Buffer.byteLength(JSON.stringify(estimatedContent), 'utf8'),
+        mediaTokens: mediaCount * ESTIMATED_MEDIA_TOKENS,
+    };
+}
+function isModelToolCall(content) {
+    return content.role === 'model' && Boolean(content.parts?.some((part) => part.functionCall));
+}
+function isUserToolResponse(content) {
+    return content.role !== 'model' && Boolean(content.parts?.some((part) => part.functionResponse));
 }
 /** Approximate input budget. Drop whole oldest turns, never half a tool exchange. */
-function trimContext(body, contextWindow, maxOutputTokens = 0) {
+function trimContext(body, contextWindow, maxOutputTokens = 0, options) {
     if (!contextWindow)
         return body;
-    const budget = contextWindow - maxOutputTokens;
+    const budget = contextWindow - Math.max(0, maxOutputTokens);
+    if (budget <= 0) {
+        throw new Error('The latest turn, system instructions and tools exceed the configured contextWindow.');
+    }
+    // Reserve room for the marker up front so appending it can never exceed the budget.
+    const withMarker = options?.marker === true;
+    const markerReserve = withMarker ? Buffer.byteLength('[Context trimmed: 0000000 earlier turns removed]') : 0;
+    const baseBytes = Buffer.byteLength(JSON.stringify({ ...body, contents: [] }), 'utf8') + markerReserve;
     const groups = [];
+    let totalContentBytes = 0;
+    let totalMediaTokens = 0;
+    let totalItems = 0;
     for (const content of body.contents || []) {
         const startsTurn = content.role !== 'model' && !content.parts?.some((part) => part.functionResponse);
         if (!groups.length || startsTurn)
-            groups.push([]);
-        groups[groups.length - 1].push(content);
+            groups.push({ items: [], bytes: 0, mediaTokens: 0 });
+        const item = estimateContentItem(content);
+        const currentGroup = groups[groups.length - 1];
+        currentGroup.items.push(item);
+        currentGroup.bytes += item.bytes;
+        currentGroup.mediaTokens += item.mediaTokens;
+        totalContentBytes += item.bytes;
+        totalMediaTokens += item.mediaTokens;
+        totalItems += 1;
     }
-    const result = { ...body, contents: groups.flat() };
-    while (estimateContextTokens(result) > budget && groups.length > 1) {
-        groups.shift();
-        result.contents = groups.flat();
+    const estimatedTokens = () => Math.ceil((baseBytes + totalContentBytes + Math.max(0, totalItems - 1)) / 3) + totalMediaTokens;
+    let droppedTurns = 0;
+    while (estimatedTokens() > budget && groups.length > 1) {
+        const dropped = groups.shift();
+        droppedTurns += 1;
+        totalContentBytes -= dropped.bytes;
+        totalMediaTokens -= dropped.mediaTokens;
+        totalItems -= dropped.items.length;
     }
-    if (estimateContextTokens(result) > budget)
+    // If a single agentic turn contains multiple complete model(functionCall)+user(functionResponse)
+    // exchanges and still exceeds the budget, progressively drop the oldest complete exchanges while
+    // preserving the initial user prompt and the latest exchange.
+    if (estimatedTokens() > budget && groups.length === 1) {
+        const items = groups[0].items;
+        const pairStarts = [];
+        for (let i = 0; i < items.length - 1; i++) {
+            if (isModelToolCall(items[i].content) && isUserToolResponse(items[i + 1].content)) {
+                pairStarts.push(i);
+                i += 1;
+            }
+        }
+        if (pairStarts.length > 1) {
+            const droppedIndices = new Set();
+            for (let p = 0; p < pairStarts.length - 1 && estimatedTokens() > budget; p++) {
+                const idx = pairStarts[p];
+                droppedIndices.add(idx);
+                droppedIndices.add(idx + 1);
+                totalContentBytes -= items[idx].bytes + items[idx + 1].bytes;
+                totalMediaTokens -= items[idx].mediaTokens + items[idx + 1].mediaTokens;
+                totalItems -= 2;
+            }
+            if (droppedIndices.size > 0) {
+                groups[0].items = items.filter((_, idx) => !droppedIndices.has(idx));
+                droppedTurns += pairStarts.length - 1;
+            }
+        }
+    }
+    if (estimatedTokens() > budget)
         throw new Error('The latest turn, system instructions and tools exceed the configured contextWindow.');
-    return result;
+    const contents = groups.flatMap((group) => group.items.map((item) => item.content));
+    if (withMarker && droppedTurns > 0) {
+        contents.unshift({
+            role: 'user',
+            parts: [{ text: `[Context trimmed: ${droppedTurns} earlier turn${droppedTurns === 1 ? '' : 's'} removed]` }],
+        });
+    }
+    return { ...body, contents };
 }
 function applyRequestOptions(payload, model, format, stream, compactionEffort) {
     const result = { ...payload };
@@ -237,7 +302,7 @@ function applyRequestOptions(payload, model, format, stream, compactionEffort) {
             else
                 result.max_tokens = model.maxOutputTokens;
         }
-        if (compactionEffort === undefined && format === 'openai' && model.reasoningEffort !== undefined)
+        if (compactionEffort === undefined && format === 'openai' && result.reasoning_effort === undefined && model.reasoningEffort !== undefined)
             result.reasoning_effort = model.reasoningEffort;
         if (compactionEffort === undefined && format === 'anthropic' && model.thinkingBudget !== undefined) {
             if (model.thinkingBudget === 0)

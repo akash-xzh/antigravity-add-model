@@ -60,7 +60,25 @@ const subagentRouting_1 = require("./subagentRouting");
 const subagentModels_1 = require("./subagentModels");
 const googlePoolFailover_1 = require("./googlePoolFailover");
 const reasoningReplay_1 = require("./reasoningReplay");
+const conversationUsage_1 = require("./conversationUsage");
 const circuits = new circuitBreaker_1.CircuitBreaker();
+/**
+ * Endpoints that rejected stream_options.include_usage. Scoped by model + endpoint + format and
+ * time-limited: one old error must not silently disable usage telemetry for the process lifetime.
+ */
+const usageOptOut = new Map();
+const USAGE_OPT_OUT_TTL_MS = 5 * 60000;
+const usageOptOutKey = (model, format) => `${model.name}\n${model.apiUrl}\n${format}`;
+function hasUsageOptOut(key) {
+    const at = usageOptOut.get(key);
+    if (at === undefined)
+        return false;
+    if (Date.now() - at > USAGE_OPT_OUT_TTL_MS) {
+        usageOptOut.delete(key);
+        return false;
+    }
+    return true;
+}
 const controllers = new Set();
 const counts = {
     requests: 0,
@@ -147,6 +165,15 @@ async function boundedErrorBody(upstream) {
     }
     return Buffer.concat(chunks).toString('utf8').trim();
 }
+/** Detect provider context-window overflow responses without echoing provider payloads. */
+function isContextLengthExceeded(status, body) {
+    if (status === 413)
+        return true;
+    // 422 is the shape several OpenAI-compatible providers use for context overflow.
+    if (status !== 400 && status !== 422)
+        return false;
+    return /(?:context_length_exceeded|maximum context length|too many tokens|prompt is too long|request too large|exceeds the maximum)/i.test(body);
+}
 /** Classify schema errors without returning provider text, credentials or echoed prompts. */
 function toolSchemaErrorHint(body) {
     let message = body;
@@ -227,21 +254,31 @@ function buildFallbackChain(primary, allModels) {
     return chain;
 }
 /** The sole retry/fallback owner; nothing is retried after any model output was received. */
-async function runCustomModelRequest(res, primary, originalBody, isStream, allModels, cloudEnvelope = true, kind = 'request') {
+async function runCustomModelRequest(res, primary, originalBody, isStream, allModels, cloudEnvelope = true, kind = 'request', prePrepared) {
     const resolveSubagent = (selector) => (0, subagentModels_1.resolveConfiguredSubagentModel)(allModels, selector)?.name;
     let prepared;
-    try {
-        prepared = subagentRouting_1.subagentRouting.prepareRequest(originalBody, resolveSubagent);
+    if (prePrepared) {
+        prepared = prePrepared;
         originalBody = prepared.body;
         if (prepared.modelName)
-            primary = (0, subagentModels_1.resolveConfiguredSubagentModel)(allModels, prepared.modelName);
+            primary = (0, subagentModels_1.resolveConfiguredSubagentModel)(allModels, prepared.modelName) ?? primary;
     }
-    catch (error) {
-        res.writeHead(error instanceof subagentRouting_1.SubagentRoutingError ? error.status : 400, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({
-            error: { message: error instanceof subagentRouting_1.SubagentRoutingError ? error.message : 'Invalid subagent routing request.' },
-        }));
-        return;
+    else {
+        try {
+            prepared = subagentRouting_1.subagentRouting.prepareRequest(originalBody, resolveSubagent, primary.name);
+            originalBody = prepared.body;
+            if (prepared.modelName)
+                primary = (0, subagentModels_1.resolveConfiguredSubagentModel)(allModels, prepared.modelName);
+        }
+        catch (error) {
+            res.writeHead(error instanceof subagentRouting_1.SubagentRoutingError ? error.status : 400, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({
+                error: {
+                    message: error instanceof subagentRouting_1.SubagentRoutingError ? error.message : 'Invalid subagent routing request.',
+                },
+            }));
+            return;
+        }
     }
     // Resolve once before trimming/translating; retries and fallback providers
     // must preserve the primary model's choice for this compaction operation.
@@ -261,6 +298,10 @@ async function runCustomModelRequest(res, primary, originalBody, isStream, allMo
     res.once('close', onClose);
     let completed = false;
     let upstreamOutput = false;
+    // Decode speed is measured on the first-to-last content chunk, excluding time to first token.
+    let streamStartedAt = 0;
+    let firstChunkAt = 0;
+    let lastChunkAt = 0;
     const deadline = Date.now() + (primary.retryBudgetMs ?? Math.max(primary.timeout ?? 120000, 120000));
     let failure = new UpstreamError('No configured model is currently available.', 503);
     let effectiveModel = primary;
@@ -283,6 +324,32 @@ async function runCustomModelRequest(res, primary, originalBody, isStream, allMo
             });
         res.write(`data: ${JSON.stringify(envelope({ candidates: [routed] }, cloudEnvelope))}\n\n`);
     };
+    /** Real provider usage: Antigravity records it per step only when the response carries it. */
+    const writeUsage = () => {
+        const measured = diagnostic.usage();
+        (0, conversationUsage_1.recordConversationUsage)(prepared.context.conversationId, {
+            ...measured,
+            ttftMs: firstChunkAt ? firstChunkAt - streamStartedAt : undefined,
+            decodeMs: firstChunkAt && lastChunkAt > firstChunkAt ? lastChunkAt - firstChunkAt : undefined,
+        });
+        if (measured.inputTokens === undefined && measured.outputTokens === undefined)
+            return;
+        if (signal.aborted || res.destroyed)
+            return;
+        const usageMetadata = {
+            promptTokenCount: measured.inputTokens ?? 0,
+            candidatesTokenCount: measured.outputTokens ?? 0,
+            totalTokenCount: (measured.inputTokens ?? 0) + (measured.outputTokens ?? 0),
+            ...(measured.cachedTokens !== undefined ? { cachedContentTokenCount: measured.cachedTokens } : {}),
+        };
+        if (!res.headersSent)
+            res.writeHead(200, {
+                'Content-Type': 'text/event-stream',
+                'Cache-Control': 'no-cache',
+                'X-Accel-Buffering': 'no',
+            });
+        res.write(`data: ${JSON.stringify(envelope({ usageMetadata }, cloudEnvelope))}\n\n`);
+    };
     try {
         const chain = buildFallbackChain(primary, allModels);
         modelLoop: for (let modelIndex = 0; modelIndex < chain.length; modelIndex++) {
@@ -299,403 +366,483 @@ async function runCustomModelRequest(res, primary, originalBody, isStream, allMo
                 counts.circuitSkips += 1;
                 continue;
             }
-            if (modelIndex > 0)
-                counts.fallbacks += 1;
-            let modelFailed = false;
-            const retries = kind === 'generation-test' ? 0 : Math.min(5, Math.max(0, model.maxRetries ?? 3));
-            const cloudCode = model.provider === 'google-cloudcode';
-            const opencode = !cloudCode && (0, providers_1.isOpencodeEndpoint)(model.apiUrl, model.provider);
-            const accountCount = cloudCode && kind !== 'generation-test'
-                ? (model.googleAccounts || []).filter((account) => account.enabled !== false).length
-                : 0;
-            const attemptsAllowed = retries + Math.max(0, accountCount - 1);
-            for (let attempt = 0; attempt <= attemptsAllowed; attempt++) {
-                const stateKey = (0, crypto_1.randomUUID)();
-                let replayReasoning = '';
-                const replayCalls = [];
-                let replayOverflow = false;
-                const observeCandidate = (candidate) => {
-                    const parts = candidate?.content?.parts;
-                    for (const part of parts || []) {
-                        if (replayOverflow)
-                            break;
-                        if (part.thought === true && typeof part.text === 'string')
-                            replayReasoning += part.text;
-                        if (part.functionCall)
-                            replayCalls.push(part);
-                        if (replayReasoning.length > 256 * 1024 || replayCalls.length > 128) {
-                            replayOverflow = true;
-                            replayReasoning = '';
-                            replayCalls.length = 0;
+            let circuitPending = true;
+            const settleCircuit = (outcome) => {
+                if (!circuitPending)
+                    return;
+                circuitPending = false;
+                if (outcome === 'succeed')
+                    circuits.succeed(circuitKey);
+                else if (outcome === 'fail')
+                    circuits.fail(circuitKey, model.circuitBreaker);
+                else
+                    circuits.cancel(circuitKey);
+            };
+            try {
+                if (modelIndex > 0)
+                    counts.fallbacks += 1;
+                let modelFailed = false;
+                const retries = kind === 'generation-test' ? 0 : Math.min(5, Math.max(0, model.maxRetries ?? 3));
+                const cloudCode = model.provider === 'google-cloudcode';
+                const opencode = !cloudCode && (0, providers_1.isOpencodeEndpoint)(model.apiUrl, model.provider);
+                const accountCount = cloudCode && kind !== 'generation-test'
+                    ? (model.googleAccounts || []).filter((account) => account.enabled !== false).length
+                    : 0;
+                const attemptsAllowed = retries + Math.max(0, accountCount - 1);
+                let accountSwitchesUsed = 0;
+                let retriesUsed = 0;
+                for (let attempt = 0; attempt <= attemptsAllowed; attempt++) {
+                    const stateKey = (0, crypto_1.randomUUID)();
+                    let replayReasoning = '';
+                    const replayCalls = [];
+                    let replayOverflow = false;
+                    const observeCandidate = (candidate) => {
+                        const parts = candidate?.content?.parts;
+                        for (const part of parts || []) {
+                            if (replayOverflow)
+                                break;
+                            if (part.thought === true && typeof part.text === 'string')
+                                replayReasoning += part.text;
+                            if (part.functionCall)
+                                replayCalls.push(part);
+                            if (replayReasoning.length > 256 * 1024 || replayCalls.length > 128) {
+                                replayOverflow = true;
+                                replayReasoning = '';
+                                replayCalls.length = 0;
+                            }
                         }
-                    }
-                };
-                let request;
-                let accountLease;
-                let totalTimer;
-                let headerLatencyMs;
-                const abort = () => request?.destroy(new Error('Cancelled'));
-                try {
-                    if (signal.aborted)
-                        break;
-                    const remaining = deadline - Date.now();
-                    if (remaining <= 0)
-                        throw new UpstreamError('Request retry budget exhausted.', 504, false);
-                    effectiveModel = model;
-                    diagnostic.resetUsage();
-                    const format = (0, providers_1.resolveApiFormat)(model.provider, model.apiFormat);
-                    const externalName = model.externalModelName || model.name.replace(/^models\//, '');
-                    if (cloudCode) {
-                        const identity = originalBody.sessionId || originalBody.conversationId;
-                        accountLease = await (0, googleAccounts_1.acquireGoogleAccount)(model.name, model.googleAccounts || [], model.googlePool, typeof identity === 'string' ? identity : undefined, externalName.replace(/^models\//, ''), model.apiUrl);
+                    };
+                    let request;
+                    let accountLease;
+                    let totalTimer;
+                    let headerLatencyMs;
+                    let timeoutFailure;
+                    const abort = () => request?.destroy(new Error('Cancelled'));
+                    const triggerTimeout = (message) => {
+                        const err = new UpstreamError(message, 504);
+                        timeoutFailure = err;
+                        request?.destroy(err);
+                    };
+                    try {
                         if (signal.aborted)
                             break;
-                    }
-                    let payload;
-                    let url;
-                    let headers;
-                    try {
-                        const outputBudget = model.maxOutputTokens ??
-                            Number(originalBody.generationConfig?.maxOutputTokens ||
-                                (model.contextWindow ? Math.min(4000, Math.max(1, Math.floor(model.contextWindow / 4))) : 0));
-                        // The IDE can omit thought parts when replaying completed tool calls.
-                        // Recover only this conversation/provider's matching turn before budgeting.
-                        const history = format === 'openai' ? reasoningReplay_1.reasoningReplayCache.restore(originalBody, model) : originalBody;
-                        // Each attempt uses its own model's prompt, so a fallback never inherits the
-                        // primary's. The operator's global prompt sits between the IDE instruction
-                        // and the model's own text, and is added before trimming so it is counted.
-                        (0, globalPrompt_1.captureSystemPrompt)(history);
-                        const prompted = (0, requestOptions_1.appendModelSystemPrompt)((0, globalPrompt_1.withGlobalSystemPrompt)(history), model.systemPrompt);
-                        // A text-only provider fails the whole request when it receives an image,
-                        // so strip tool-result media the model cannot use before trimming and
-                        // translating. Google's native format already carried nested tool media,
-                        // so it keeps its bytes to stay identical to the pre-fix behaviour.
-                        // Replayed thought parts sit on model turns and the guard only rewrites
-                        // user tool results, so the order here does not affect recovery.
-                        const guardedBody = format === 'google'
-                            ? prompted
-                            : (0, images_1.omitUnsupportedToolImages)(prompted, (0, modelUtils_1.detectModelCapabilities)(model).supportsImages);
-                        const body = (0, requestOptions_1.trimContext)(guardedBody, model.contextWindow, outputBudget);
-                        const effectiveModel = outputBudget ? { ...model, maxOutputTokens: outputBudget } : model;
-                        payload = (0, requestOptions_1.applyRequestOptions)(registry.translateRequest(model.provider, body, externalName, format, stateKey), effectiveModel, format, isStream, compactionEffort);
-                        const target = cloudCode || model.rawUrl
-                            ? model.apiUrl
-                            : registry.getProviderUrl(model.apiUrl, externalName, isStream, registry.getTranslator(model.provider, format));
-                        url = new URL(target);
-                        if (!['http:', 'https:'].includes(url.protocol))
-                            throw new Error('Unsupported endpoint protocol');
-                        headers = registry.getProviderHeaders(model.provider, cloudCode ? '' : model.apiKey, format, model.apiUrl);
-                        if (accountLease) {
-                            url = new URL((0, googleAccounts_1.googleAccountEndpoint)(accountLease.account, model.apiUrl));
-                            if (accountLease.account.authMode === 'antigravity' && !accountLease.account.project)
-                                throw new Error('Prepare this Antigravity account in the model manager before generating a response');
-                            url.pathname = `/v1internal:${isStream ? 'streamGenerateContent' : 'generateContent'}`;
-                            url.search = isStream ? '?alt=sse' : '';
-                            headers.Authorization = `Bearer ${accountLease.account.accessToken}`;
-                            headers['User-Agent'] = googleAccounts_1.GOOGLE_CLOUD_CODE_USER_AGENT;
-                            const project = accountLease.account.project || model.googleProject;
-                            payload = { model: externalName, ...(project ? { project } : {}), request: payload };
-                        }
-                        if (opencode) {
+                        const remaining = deadline - Date.now();
+                        if (remaining <= 0)
+                            throw new UpstreamError('Request retry budget exhausted.', 504, false);
+                        effectiveModel = model;
+                        diagnostic.resetUsage();
+                        const format = (0, providers_1.resolveApiFormat)(model.provider, model.apiFormat);
+                        const externalName = model.externalModelName || model.name.replace(/^models\//, '');
+                        if (cloudCode) {
                             const identity = originalBody.sessionId || originalBody.conversationId;
-                            // Preserve conversation affinity without putting arbitrary Unicode or control characters in a header.
-                            headers['x-opencode-session'] =
-                                typeof identity === 'string' && identity.trim()
-                                    ? (0, crypto_1.createHash)('sha256').update(identity).digest('hex')
-                                    : requestId;
+                            accountLease = await (0, googleAccounts_1.acquireGoogleAccount)(model.name, model.googleAccounts || [], model.googlePool, typeof identity === 'string' ? identity : undefined, externalName.replace(/^models\//, ''), model.apiUrl);
+                            if (signal.aborted)
+                                break;
                         }
-                        if (model.gateway) {
-                            const identity = originalBody.conversationId || originalBody.sessionId;
-                            if (typeof identity === 'string' && identity.trim()) {
-                                // Stable across turns and safe as a header, even when callers use Unicode/control characters.
-                                headers['x-antigravity-conversation-id'] = (0, crypto_1.createHash)('sha256').update(identity).digest('hex');
+                        let payload;
+                        let url;
+                        let headers;
+                        try {
+                            const cap = (0, modelUtils_1.detectModelCapabilities)(model);
+                            let outputBudget = model.maxOutputTokens ??
+                                Number(originalBody.generationConfig?.maxOutputTokens ||
+                                    (model.contextWindow
+                                        ? Math.min(cap.maxOutputTokens, Math.max(1, Math.floor(model.contextWindow / 4)))
+                                        : 0));
+                            if (!Number.isFinite(outputBudget) || outputBudget < 0)
+                                outputBudget = 0;
+                            if (model.contextWindow && outputBudget >= model.contextWindow) {
+                                outputBudget = Math.max(1, Math.min(cap.maxOutputTokens, Math.floor(model.contextWindow / 4)));
+                            }
+                            // The IDE can omit thought parts when replaying completed tool calls.
+                            // Recover only this conversation/provider's matching turn before budgeting.
+                            const history = format === 'openai' ? reasoningReplay_1.reasoningReplayCache.restore(originalBody, model) : originalBody;
+                            // Each attempt uses its own model's prompt, so a fallback never inherits the
+                            // primary's. The operator's global prompt sits between the IDE instruction
+                            // and the model's own text, and is added before trimming so it is counted.
+                            (0, globalPrompt_1.captureSystemPrompt)(history);
+                            const prompted = (0, requestOptions_1.appendModelSystemPrompt)((0, globalPrompt_1.withGlobalSystemPrompt)(history), model.systemPrompt);
+                            // A text-only provider fails the whole request when it receives an image,
+                            // so strip tool-result media the model cannot use before trimming and
+                            // translating. Google's native format already carried nested tool media,
+                            // so it keeps its bytes to stay identical to the pre-fix behaviour.
+                            // Replayed thought parts sit on model turns and the guard only rewrites
+                            // user tool results, so the order here does not affect recovery.
+                            const guardedBody = format === 'google'
+                                ? prompted
+                                : (0, images_1.omitUnsupportedToolImages)(prompted, (0, modelUtils_1.detectModelCapabilities)(model).supportsImages);
+                            let body;
+                            try {
+                                // Without a declared window, use the detected capability so a 500k
+                                // chat is still trimmed before reaching a smaller provider limit.
+                                const effectiveContextWindow = model.contextWindow ||
+                                    (Number.isSafeInteger(cap.maxTokens) ? cap.maxTokens : undefined);
+                                body = (0, requestOptions_1.trimContext)(guardedBody, effectiveContextWindow, outputBudget, { marker: true });
+                            }
+                            catch (trimError) {
+                                // Allow a configured larger-context fallback model to take over.
+                                throw new UpstreamError(`Context exceeds the configured contextWindow: ${trimError.message}`, 400, false, 0, true);
+                            }
+                            const effectiveModel = outputBudget ? { ...model, maxOutputTokens: outputBudget } : model;
+                            payload = (0, requestOptions_1.applyRequestOptions)(registry.translateRequest(model.provider, body, externalName, format, stateKey), effectiveModel, format, isStream, compactionEffort);
+                            // OpenAI-compatible endpoints report tokens only when asked; retried without it
+                            // if the provider rejects the field.
+                            if (format === 'openai' && isStream && !hasUsageOptOut(usageOptOutKey(model, format)) && payload.stream_options === undefined)
+                                payload.stream_options = { include_usage: true };
+                            const target = cloudCode || model.rawUrl
+                                ? model.apiUrl
+                                : registry.getProviderUrl(model.apiUrl, externalName, isStream, registry.getTranslator(model.provider, format));
+                            url = new URL(target);
+                            if (!['http:', 'https:'].includes(url.protocol))
+                                throw new Error('Unsupported endpoint protocol');
+                            headers = registry.getProviderHeaders(model.provider, cloudCode ? '' : model.apiKey, format, model.apiUrl);
+                            if (accountLease) {
+                                url = new URL((0, googleAccounts_1.googleAccountEndpoint)(accountLease.account, model.apiUrl));
+                                if (accountLease.account.authMode === 'antigravity' && !accountLease.account.project)
+                                    throw new Error('Prepare this Antigravity account in the model manager before generating a response');
+                                url.pathname = `/v1internal:${isStream ? 'streamGenerateContent' : 'generateContent'}`;
+                                url.search = isStream ? '?alt=sse' : '';
+                                headers.Authorization = `Bearer ${accountLease.account.accessToken}`;
+                                headers['User-Agent'] = googleAccounts_1.GOOGLE_CLOUD_CODE_USER_AGENT;
+                                const project = accountLease.account.project || model.googleProject;
+                                payload = { model: externalName, ...(project ? { project } : {}), request: payload };
+                            }
+                            if (opencode) {
+                                const identity = originalBody.sessionId || originalBody.conversationId;
+                                // Preserve conversation affinity without putting arbitrary Unicode or control characters in a header.
+                                headers['x-opencode-session'] =
+                                    typeof identity === 'string' && identity.trim()
+                                        ? (0, crypto_1.createHash)('sha256').update(identity).digest('hex')
+                                        : requestId;
+                            }
+                            if (model.gateway) {
+                                const identity = originalBody.conversationId || originalBody.sessionId;
+                                if (typeof identity === 'string' && identity.trim()) {
+                                    // Stable across turns and safe as a header, even when callers use Unicode/control characters.
+                                    headers['x-antigravity-conversation-id'] = (0, crypto_1.createHash)('sha256').update(identity).digest('hex');
+                                }
+                            }
+                            for (const [key, value] of Object.entries(model.customHeaders || {})) {
+                                if (/^(host|content-length|connection|transfer-encoding)$/i.test(key))
+                                    throw new Error('Reserved HTTP header');
+                                if (cloudCode && /^authorization$/i.test(key))
+                                    throw new Error('Google pool authorization comes from the selected account');
+                                http.validateHeaderName(key);
+                                http.validateHeaderValue(key, value);
+                                headers[key] = value;
                             }
                         }
-                        for (const [key, value] of Object.entries(model.customHeaders || {})) {
-                            if (/^(host|content-length|connection|transfer-encoding)$/i.test(key))
-                                throw new Error('Reserved HTTP header');
-                            if (cloudCode && /^authorization$/i.test(key))
-                                throw new Error('Google pool authorization comes from the selected account');
-                            http.validateHeaderName(key);
-                            http.validateHeaderValue(key, value);
-                            headers[key] = value;
+                        catch (error) {
+                            if (error instanceof UpstreamError)
+                                throw error;
+                            throw new UpstreamError(`Invalid model configuration: ${error.message}`, 400, false, 0, false);
                         }
-                    }
-                    catch (error) {
-                        throw new UpstreamError(`Invalid model configuration: ${error.message}`, 400, false, 0, false);
-                    }
-                    counts.upstreamAttempts += 1;
-                    const upstreamStartedAt = Date.now();
-                    const upstream = await new Promise((resolve, reject) => {
-                        request = (url.protocol === 'https:' ? https : http).request(url, { method: 'POST', headers, rejectUnauthorized: !model.allowUnauthorized }, resolve);
-                        request.once('error', reject);
-                        request.setTimeout(model.idleTimeout ?? 30000, () => request?.destroy(new UpstreamError('Upstream idle timeout.', 504)));
-                        totalTimer = setTimeout(() => request?.destroy(new UpstreamError('Upstream request timeout.', 504)), Math.min(model.timeout ?? 120000, remaining));
-                        signal.addEventListener('abort', abort, { once: true });
-                        request.end(JSON.stringify(payload));
-                    });
-                    headerLatencyMs = Date.now() - upstreamStartedAt;
-                    const status = upstream.statusCode || 502;
-                    if (status < 200 || status >= 300) {
-                        const errorBody = status === 400 ||
-                            status === 422 ||
-                            (cloudCode && [403, 429].includes(status)) ||
-                            (opencode && [401, 403].includes(status))
-                            ? await boundedErrorBody(upstream)
-                            : '';
-                        const decision = cloudCode && (0, googlePoolFailover_1.isGoogleQuotaFailure)(status, errorBody)
-                            ? (0, googlePoolPolicy_1.classifyGoogleRateLimit)(errorBody, upstream.headers['retry-after'])
-                            : undefined;
-                        const retryAfter = decision?.retryAfterMs ?? (0, requestOptions_1.parseRetryAfter)(upstream.headers['retry-after']);
-                        const hint = status === 400 || status === 422 ? toolSchemaErrorHint(errorBody) : '';
-                        upstream.destroy();
-                        throw new UpstreamError(`${cloudCode
-                            ? decision && status === 403
-                                ? 'Google Cloud Code reported a rate or quota limit (HTTP 403). Respect the provider retry/reset delay; signing in again does not increase quota.'
-                                : (0, googleAccessErrors_1.describeGoogleAccessError)(status).message
-                            : opencode && [401, 403].includes(status)
-                                ? (0, providers_1.describeOpencodeAccessError)(status, errorBody)
-                                : `Upstream returned HTTP ${status}.`}${hint}`, status, !!decision || status === 408 || status === 429 || status >= 500, retryAfter, status !== 400 && status !== 422, decision);
-                    }
-                    if (isStream && String(upstream.headers['content-type']).includes('text/event-stream')) {
-                        const decoder = new string_decoder_1.StringDecoder('utf8');
-                        let buffer = '';
-                        let dataLines = [];
-                        let emitted = false;
-                        let finalReason = false;
-                        let terminal = false;
-                        const event = () => {
-                            const data = dataLines.join('\n');
-                            dataLines = [];
-                            if (!data)
-                                return;
-                            let chunk;
-                            if (data.trim() === '[DONE]') {
-                                terminal = true;
-                                // Some compatible endpoints omit finish_reason. Flush remaining
-                                // text/tools through validation, but never replay a finalized context.
-                                if (format !== 'openai' || !shared_1.activeStreamContexts.has(stateKey))
+                        counts.upstreamAttempts += 1;
+                        const upstreamStartedAt = Date.now();
+                        streamStartedAt = upstreamStartedAt;
+                        const upstream = await new Promise((resolve, reject) => {
+                            request = (url.protocol === 'https:' ? https : http).request(url, { method: 'POST', headers, rejectUnauthorized: !model.allowUnauthorized }, resolve);
+                            request.once('error', reject);
+                            request.setTimeout(model.idleTimeout ?? 30000, () => triggerTimeout('Upstream idle timeout.'));
+                            totalTimer = setTimeout(() => triggerTimeout('Upstream request timeout.'), Math.min(model.timeout ?? 120000, remaining));
+                            signal.addEventListener('abort', abort, { once: true });
+                            request.end(JSON.stringify(payload));
+                        });
+                        // Keep an error listener attached post-headers so timeout/abort destroy() never emits unhandled error.
+                        request.on('error', () => { });
+                        headerLatencyMs = Date.now() - upstreamStartedAt;
+                        const status = upstream.statusCode || 502;
+                        if (status < 200 || status >= 300) {
+                            const errorBody = status === 400 ||
+                                status === 413 ||
+                                status === 422 ||
+                                (cloudCode && [403, 429].includes(status)) ||
+                                (opencode && [401, 403].includes(status))
+                                ? await boundedErrorBody(upstream)
+                                : '';
+                            if ((status === 400 || status === 422) &&
+                                !hasUsageOptOut(usageOptOutKey(model, format)) &&
+                                /stream_options|include_usage/i.test(errorBody)) {
+                                // Retry this same attempt once without stream_options; decrementing avoids exiting on the final attempt.
+                                usageOptOut.set(usageOptOutKey(model, format), Date.now());
+                                upstream.destroy();
+                                attempt -= 1;
+                                continue;
+                            }
+                            const decision = cloudCode && (0, googlePoolFailover_1.isGoogleQuotaFailure)(status, errorBody)
+                                ? (0, googlePoolPolicy_1.classifyGoogleRateLimit)(errorBody, upstream.headers['retry-after'])
+                                : undefined;
+                            const retryAfter = decision?.retryAfterMs ?? (0, requestOptions_1.parseRetryAfter)(upstream.headers['retry-after']);
+                            const contextOverflow = isContextLengthExceeded(status, errorBody);
+                            const hint = status === 400 || status === 422 ? toolSchemaErrorHint(errorBody) : '';
+                            const overflowHint = contextOverflow
+                                ? ' Context length exceeded the model limit; compact the conversation or switch to a larger-context model.'
+                                : '';
+                            upstream.destroy();
+                            throw new UpstreamError(`${cloudCode
+                                ? decision && status === 403
+                                    ? 'Google Cloud Code reported a rate or quota limit (HTTP 403). Respect the provider retry/reset delay; signing in again does not increase quota.'
+                                    : (0, googleAccessErrors_1.describeGoogleAccessError)(status).message
+                                : opencode && [401, 403].includes(status)
+                                    ? (0, providers_1.describeOpencodeAccessError)(status, errorBody)
+                                    : `Upstream returned HTTP ${status}.`}${hint}${overflowHint}`, status, !!decision || status === 408 || status === 429 || status >= 500, retryAfter, contextOverflow || (status !== 400 && status !== 422), decision);
+                        }
+                        if (isStream && String(upstream.headers['content-type']).includes('text/event-stream')) {
+                            const decoder = new string_decoder_1.StringDecoder('utf8');
+                            let buffer = '';
+                            let dataLines = [];
+                            let emitted = false;
+                            let finalReason = false;
+                            let terminal = false;
+                            const event = () => {
+                                const data = dataLines.join('\n');
+                                dataLines = [];
+                                if (!data)
                                     return;
-                                chunk = { choices: [{ delta: {}, finish_reason: 'stop' }] };
-                            }
-                            else {
-                                try {
-                                    chunk = JSON.parse(data);
+                                let chunk;
+                                if (data.trim() === '[DONE]') {
+                                    terminal = true;
+                                    // Some compatible endpoints omit finish_reason. Flush remaining
+                                    // text/tools through validation, but never replay a finalized context.
+                                    if (format !== 'openai' || !shared_1.activeStreamContexts.has(stateKey))
+                                        return;
+                                    chunk = { choices: [{ delta: {}, finish_reason: 'stop' }] };
                                 }
-                                catch {
-                                    throw new UpstreamError('Upstream sent malformed SSE JSON.');
-                                }
-                            }
-                            if (chunk.error || chunk.type === 'error')
-                                throw new UpstreamError('Upstream reported a stream error.');
-                            if (cloudCode && chunk.response)
-                                chunk = chunk.response;
-                            diagnostic.observe(chunk, format);
-                            const delta = chunk.choices?.[0]?.delta;
-                            if (delta?.content ||
-                                delta?.reasoning_content ||
-                                delta?.reasoning ||
-                                delta?.tool_calls?.length ||
-                                chunk.content_block?.type === 'tool_use' ||
-                                chunk.delta?.text ||
-                                chunk.delta?.thinking ||
-                                chunk.delta?.partial_json ||
-                                chunk.candidates?.[0]?.content?.parts?.length)
-                                upstreamOutput = true;
-                            if (chunk.type === 'message_stop' ||
-                                chunk.choices?.[0]?.finish_reason ||
-                                chunk.candidates?.[0]?.finishReason)
-                                terminal = true;
-                            if ((chunk.type === 'message_delta' && chunk.delta?.stop_reason === 'tool_use') ||
-                                chunk.choices?.[0]?.finish_reason) {
-                                const pending = shared_1.activeStreamContexts.get(stateKey)?.toolCalls || {};
-                                // Validate a copy including this event before the translator appends
-                                // its fragments and consumes the state. Never append to live state twice.
-                                const completed = new Map(Object.entries(pending).map(([index, tool]) => [index, tool.arguments]));
-                                if (format === 'openai' && Array.isArray(delta?.tool_calls)) {
-                                    for (const tool of delta.tool_calls) {
-                                        const index = String(tool.index ?? 0);
-                                        completed.set(index, (completed.get(index) || '') + (tool.function?.arguments || ''));
+                                else {
+                                    try {
+                                        chunk = JSON.parse(data);
+                                    }
+                                    catch {
+                                        throw new UpstreamError('Upstream sent malformed SSE JSON.');
                                     }
                                 }
-                                for (const args of completed.values())
-                                    validateToolArguments(args);
+                                if (chunk.error || chunk.type === 'error')
+                                    throw new UpstreamError('Upstream reported a stream error.');
+                                if (cloudCode && chunk.response)
+                                    chunk = chunk.response;
+                                diagnostic.observe(chunk, format);
+                                const delta = chunk.choices?.[0]?.delta;
+                                if (delta?.content ||
+                                    delta?.reasoning_content ||
+                                    delta?.reasoning ||
+                                    delta?.tool_calls?.length ||
+                                    chunk.content_block?.type === 'tool_use' ||
+                                    chunk.delta?.text ||
+                                    chunk.delta?.thinking ||
+                                    chunk.delta?.partial_json ||
+                                    chunk.candidates?.[0]?.content?.parts?.length) {
+                                    upstreamOutput = true;
+                                    const now = Date.now();
+                                    if (!firstChunkAt)
+                                        firstChunkAt = now;
+                                    lastChunkAt = now;
+                                }
+                                if (chunk.type === 'message_stop' ||
+                                    chunk.choices?.[0]?.finish_reason ||
+                                    chunk.candidates?.[0]?.finishReason)
+                                    terminal = true;
+                                if ((chunk.type === 'message_delta' && chunk.delta?.stop_reason === 'tool_use') ||
+                                    chunk.choices?.[0]?.finish_reason) {
+                                    const pending = shared_1.activeStreamContexts.get(stateKey)?.toolCalls || {};
+                                    // Validate a copy including this event before the translator appends
+                                    // its fragments and consumes the state. Never append to live state twice.
+                                    const completed = new Map(Object.entries(pending).map(([index, tool]) => [index, tool.arguments]));
+                                    if (format === 'openai' && Array.isArray(delta?.tool_calls)) {
+                                        for (const tool of delta.tool_calls) {
+                                            const index = String(tool.index ?? 0);
+                                            completed.set(index, (completed.get(index) || '') + (tool.function?.arguments || ''));
+                                        }
+                                    }
+                                    for (const args of completed.values())
+                                        validateToolArguments(args);
+                                }
+                                const mapped = registry.translateStreamChunk(model.provider, chunk, stateKey, format, stateKey, toolSchemas, artifactContext);
+                                if (mapped) {
+                                    if (format === 'openai')
+                                        observeCandidate(mapped);
+                                    if (mapped.content?.parts?.length)
+                                        emitted = true;
+                                    if (mapped.finishReason && mapped.finishReason !== 'OTHER')
+                                        finalReason = true;
+                                    // A role-only or empty completion must not commit headers and prevent fallback.
+                                    if (emitted)
+                                        writeCandidate(mapped);
+                                }
+                            };
+                            const drain = () => {
+                                let index;
+                                while ((index = buffer.indexOf('\n')) >= 0) {
+                                    const line = buffer.slice(0, index).replace(/\r$/, '');
+                                    buffer = buffer.slice(index + 1);
+                                    if (!line)
+                                        event();
+                                    else if (line.startsWith('data:'))
+                                        dataLines.push(line.slice(5).replace(/^ /, ''));
+                                }
+                            };
+                            for await (const bytes of upstream) {
+                                if (signal.aborted)
+                                    throw new Error('Cancelled');
+                                buffer += decoder.write(bytes);
+                                if (buffer.length + dataLines.join('').length > 2 * 1024 * 1024)
+                                    throw new UpstreamError('Upstream SSE event is too large.', 502, false);
+                                drain();
+                                await waitForDrain(res);
                             }
-                            const mapped = registry.translateStreamChunk(model.provider, chunk, stateKey, format, stateKey, toolSchemas, artifactContext);
-                            if (mapped) {
-                                if (format === 'openai')
-                                    observeCandidate(mapped);
-                                if (mapped.content?.parts?.length)
-                                    emitted = true;
-                                if (mapped.finishReason && mapped.finishReason !== 'OTHER')
-                                    finalReason = true;
-                                // A role-only or empty completion must not commit headers and prevent fallback.
-                                if (emitted)
-                                    writeCandidate(mapped);
-                            }
-                        };
-                        const drain = () => {
-                            let index;
-                            while ((index = buffer.indexOf('\n')) >= 0) {
-                                const line = buffer.slice(0, index).replace(/\r$/, '');
-                                buffer = buffer.slice(index + 1);
-                                if (!line)
-                                    event();
-                                else if (line.startsWith('data:'))
-                                    dataLines.push(line.slice(5).replace(/^ /, ''));
-                            }
-                        };
-                        for await (const bytes of upstream) {
-                            if (signal.aborted)
-                                throw new Error('Cancelled');
-                            buffer += decoder.write(bytes);
-                            if (buffer.length + dataLines.join('').length > 2 * 1024 * 1024)
-                                throw new UpstreamError('Upstream SSE event is too large.', 502, false);
+                            buffer += decoder.end();
+                            if (buffer)
+                                buffer += '\n';
                             drain();
-                            await waitForDrain(res);
-                        }
-                        buffer += decoder.end();
-                        if (buffer)
-                            buffer += '\n';
-                        drain();
-                        event();
-                        if (!emitted)
-                            throw new UpstreamError('Upstream returned an empty stream.');
-                        if (!terminal)
-                            throw new UpstreamError('Upstream stream ended before completion.', 502, false);
-                        if (!finalReason)
-                            writeCandidate({ content: { parts: [], role: 'model' }, finishReason: 'STOP', index: 0 });
-                    }
-                    else {
-                        let size = 0;
-                        const chunks = [];
-                        for await (const bytes of upstream) {
-                            size += bytes.length;
-                            if (size > 20 * 1024 * 1024)
-                                throw new UpstreamError('Upstream response exceeds 20 MB.', 502, false);
-                            chunks.push(bytes);
-                        }
-                        let parsed;
-                        try {
-                            parsed = JSON.parse(Buffer.concat(chunks).toString('utf8'));
-                        }
-                        catch {
-                            throw new UpstreamError('Upstream returned invalid JSON.');
-                        }
-                        if (parsed.error)
-                            throw new UpstreamError('Upstream returned an error response.');
-                        if (cloudCode && parsed.response)
-                            parsed = parsed.response;
-                        diagnostic.observe(parsed, format);
-                        if ((format === 'openai' && !parsed.choices?.[0]?.message) ||
-                            (format === 'anthropic' && !Array.isArray(parsed.content)))
-                            throw new UpstreamError('Upstream returned an invalid completion.');
-                        if (parsed.choices?.[0]?.message?.tool_calls?.length) {
-                            upstreamOutput = true;
-                            for (const tool of parsed.choices[0].message.tool_calls)
-                                validateToolArguments(tool.function?.arguments);
-                        }
-                        // Some compatible endpoints return a complete JSON response even when stream=true.
-                        const mapped = registry.translateResponse(model.provider, parsed, stateKey, format, toolSchemas, artifactContext);
-                        if (!mapped?.candidates?.length)
-                            throw new UpstreamError('Upstream returned no candidates.');
-                        if (format === 'openai')
-                            for (const candidate of mapped.candidates)
-                                observeCandidate(candidate);
-                        if (kind === 'generation-test' &&
-                            !mapped.candidates.some((candidate) => {
-                                const content = candidate
-                                    ?.content;
-                                return (Array.isArray(content?.parts) &&
-                                    content.parts.some((part) => part?.thought !== true && typeof part?.text === 'string' && part.text.trim()));
-                            })) {
-                            // The short test can exhaust its output budget despite a healthy account.
-                            // Record the accepted upstream response before the logical test failure.
-                            accountLease?.release({ status, latencyMs: headerLatencyMs });
-                            throw new UpstreamError('The provider did not return generated text. Check the model and test output budget.', 502, false, 0, false);
-                        }
-                        if (isStream) {
-                            for (const candidate of mapped.candidates)
-                                writeCandidate(candidate);
+                            event();
+                            if (!emitted)
+                                throw new UpstreamError('Upstream returned an empty stream.');
+                            if (!terminal)
+                                throw new UpstreamError('Upstream stream ended before completion.', 502, false);
+                            writeUsage();
+                            if (!finalReason)
+                                writeCandidate({ content: { parts: [], role: 'model' }, finishReason: 'STOP', index: 0 });
                         }
                         else {
-                            prepared.context.modelName = effectiveModel.name;
-                            const routed = subagentRouting_1.subagentRouting.rewriteResponse(mapped, prepared.context, resolveSubagent);
-                            res.writeHead(200, { 'Content-Type': 'application/json' });
-                            res.end(JSON.stringify(envelope(routed, cloudEnvelope)));
+                            let size = 0;
+                            const chunks = [];
+                            for await (const bytes of upstream) {
+                                size += bytes.length;
+                                if (size > 20 * 1024 * 1024)
+                                    throw new UpstreamError('Upstream response exceeds 20 MB.', 502, false);
+                                chunks.push(bytes);
+                            }
+                            let parsed;
+                            try {
+                                parsed = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+                            }
+                            catch {
+                                throw new UpstreamError('Upstream returned invalid JSON.');
+                            }
+                            if (parsed.error)
+                                throw new UpstreamError('Upstream returned an error response.');
+                            if (cloudCode && parsed.response)
+                                parsed = parsed.response;
+                            diagnostic.observe(parsed, format);
+                            if ((format === 'openai' && !parsed.choices?.[0]?.message) ||
+                                (format === 'anthropic' && !Array.isArray(parsed.content)))
+                                throw new UpstreamError('Upstream returned an invalid completion.');
+                            if (parsed.choices?.[0]?.message?.tool_calls?.length) {
+                                upstreamOutput = true;
+                                for (const tool of parsed.choices[0].message.tool_calls)
+                                    validateToolArguments(tool.function?.arguments);
+                            }
+                            // Some compatible endpoints return a complete JSON response even when stream=true.
+                            const mapped = registry.translateResponse(model.provider, parsed, stateKey, format, toolSchemas, artifactContext);
+                            if (!mapped?.candidates?.length)
+                                throw new UpstreamError('Upstream returned no candidates.');
+                            if (format === 'openai')
+                                for (const candidate of mapped.candidates)
+                                    observeCandidate(candidate);
+                            if (kind === 'generation-test' &&
+                                !mapped.candidates.some((candidate) => {
+                                    const content = candidate
+                                        ?.content;
+                                    return (Array.isArray(content?.parts) &&
+                                        content.parts.some((part) => part?.thought !== true && typeof part?.text === 'string' && part.text.trim()));
+                                })) {
+                                // The short test can exhaust its output budget despite a healthy account.
+                                // Record the accepted upstream response before the logical test failure.
+                                accountLease?.release({ status, latencyMs: headerLatencyMs });
+                                throw new UpstreamError('The provider did not return generated text. Check the model and test output budget.', 502, false, 0, false);
+                            }
+                            if (isStream) {
+                                for (const candidate of mapped.candidates)
+                                    writeCandidate(candidate);
+                                writeUsage();
+                            }
+                            else {
+                                (0, conversationUsage_1.recordConversationUsage)(prepared.context.conversationId, diagnostic.usage());
+                                prepared.context.modelName = effectiveModel.name;
+                                const routed = subagentRouting_1.subagentRouting.rewriteResponse(mapped, prepared.context, resolveSubagent);
+                                res.writeHead(200, { 'Content-Type': 'application/json' });
+                                res.end(JSON.stringify(envelope(routed, cloudEnvelope)));
+                            }
+                        }
+                        // Do not retain partial, failed, cancelled, or retried output. This cache
+                        // outlives the per-attempt translator state, but never the proxy service.
+                        if (format === 'openai' && !replayOverflow && !signal.aborted)
+                            reasoningReplay_1.reasoningReplayCache.record(originalBody, model, [
+                                { text: replayReasoning, thought: true },
+                                ...replayCalls,
+                            ]);
+                        settleCircuit('succeed');
+                        // A successful stream proves this endpoint accepts usage fields again.
+                        usageOptOut.delete(usageOptOutKey(model, format));
+                        (0, modelHealth_1.recordModelSuccess)(model.name, headerLatencyMs);
+                        completed = true;
+                        accountLease?.release({ status, latencyMs: headerLatencyMs });
+                        counts.succeeded += 1;
+                        res.end();
+                        return;
+                    }
+                    catch (error) {
+                        failure = timeoutFailure ?? asUpstreamError(error);
+                        accountLease?.release({
+                            status: failure.status,
+                            retryAfterMs: failure.googleRateLimit
+                                ? failure.googleRateLimit.retryAfterMs
+                                : failure.retryAfter || undefined,
+                            cooldownReason: failure.googleRateLimit?.reason,
+                            cancelled: signal.aborted,
+                        });
+                        if (signal.aborted) {
+                            settleCircuit('cancel');
+                            break modelLoop;
+                        }
+                        if (res.headersSent || upstreamOutput) {
+                            settleCircuit('fail');
+                            (0, modelHealth_1.recordModelFailure)(model.name, failure.message);
+                            break modelLoop;
+                        }
+                        if (accountLease &&
+                            accountSwitchesUsed < accountCount - 1 &&
+                            [401, 403, 408, 429, 500, 502, 503, 504].includes(failure.status)) {
+                            accountSwitchesUsed += 1;
+                            counts.accountSwitches += 1;
+                            continue;
+                        }
+                        if (failure.retryable && retriesUsed < retries && Date.now() < deadline) {
+                            const backoffAttempt = retriesUsed;
+                            retriesUsed += 1;
+                            counts.retries += 1;
+                            // Tear down the old attempt before waiting; timeout and error cannot each schedule a retry.
+                            request?.destroy();
+                            if (totalTimer)
+                                clearTimeout(totalTimer);
+                            signal.removeEventListener('abort', abort);
+                            await delay(Math.min(failure.retryAfter || 500 * 2 ** backoffAttempt, Math.max(1, deadline - Date.now())), signal);
+                        }
+                        else {
+                            modelFailed = true;
+                            break;
                         }
                     }
-                    // Do not retain partial, failed, cancelled, or retried output. This cache
-                    // outlives the per-attempt translator state, but never the proxy service.
-                    if (format === 'openai' && !replayOverflow && !signal.aborted)
-                        reasoningReplay_1.reasoningReplayCache.record(originalBody, model, [
-                            { text: replayReasoning, thought: true },
-                            ...replayCalls,
-                        ]);
-                    circuits.succeed(circuitKey);
-                    (0, modelHealth_1.recordModelSuccess)(model.name, headerLatencyMs);
-                    completed = true;
-                    accountLease?.release({ status, latencyMs: headerLatencyMs });
-                    counts.succeeded += 1;
-                    res.end();
-                    return;
-                }
-                catch (error) {
-                    failure = asUpstreamError(error);
-                    accountLease?.release({
-                        status: failure.status,
-                        retryAfterMs: failure.googleRateLimit
-                            ? failure.googleRateLimit.retryAfterMs
-                            : failure.retryAfter || undefined,
-                        cooldownReason: failure.googleRateLimit?.reason,
-                        cancelled: signal.aborted,
-                    });
-                    if (signal.aborted) {
-                        circuits.cancel(circuitKey);
-                        break modelLoop;
-                    }
-                    if (res.headersSent || upstreamOutput) {
-                        circuits.fail(circuitKey, model.circuitBreaker);
-                        (0, modelHealth_1.recordModelFailure)(model.name, failure.message);
-                        break modelLoop;
-                    }
-                    if (accountLease &&
-                        attempt < accountCount - 1 &&
-                        [401, 403, 408, 429, 500, 502, 503, 504].includes(failure.status)) {
-                        counts.accountSwitches += 1;
-                        continue;
-                    }
-                    if (failure.retryable && attempt < retries && Date.now() < deadline) {
-                        counts.retries += 1;
-                        // Tear down the old attempt before waiting; timeout and error cannot each schedule a retry.
-                        request?.destroy();
+                    finally {
                         if (totalTimer)
                             clearTimeout(totalTimer);
                         signal.removeEventListener('abort', abort);
-                        await delay(Math.min(failure.retryAfter || 500 * 2 ** attempt, Math.max(1, deadline - Date.now())), signal);
-                    }
-                    else {
-                        modelFailed = true;
-                        break;
+                        request?.destroy();
+                        accountLease?.release();
+                        clearRequestState(stateKey);
                     }
                 }
-                finally {
-                    if (totalTimer)
-                        clearTimeout(totalTimer);
-                    signal.removeEventListener('abort', abort);
-                    request?.destroy();
-                    accountLease?.release();
-                    clearRequestState(stateKey);
+                if (modelFailed) {
+                    settleCircuit('fail');
+                    (0, modelHealth_1.recordModelFailure)(model.name, failure.message);
                 }
+                else
+                    settleCircuit('cancel');
+                if (!failure.mayFallback)
+                    break;
             }
-            if (modelFailed) {
-                circuits.fail(circuitKey, model.circuitBreaker);
-                (0, modelHealth_1.recordModelFailure)(model.name, failure.message);
+            finally {
+                settleCircuit('cancel');
             }
-            else
-                circuits.cancel(circuitKey);
-            if (!failure.mayFallback)
-                break;
         }
         if (!signal.aborted && !res.writableEnded && !res.destroyed) {
             if (res.headersSent)

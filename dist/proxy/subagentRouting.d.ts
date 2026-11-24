@@ -8,9 +8,17 @@ export interface SubagentRoutingContext {
     readonly scope: string;
     readonly stable: boolean;
     readonly requestId: string;
+    /** Native conversation identity (labels.cascade_id), when the request carries one. */
+    readonly conversationId?: string;
     /** Set to the actual configured provider attempt before emitting its output. */
     modelName?: string;
+    httpModelName?: string;
 }
+/**
+ * Native conversation identity of a generation request. Cloud Code wraps the Gemini body, so the
+ * labels can sit on either envelope. Only stream telemetry reads this; no content is retained.
+ */
+export declare function nativeConversationId(reqBody: Buffer | string): string | undefined;
 /**
  * Bridge the IDE's fixed subagent tiers at the common Gemini boundary. Provider
  * translators never own this state: history can switch providers at any turn.
@@ -38,7 +46,7 @@ export declare class SubagentRoutingBridge {
     private requireBoundModel;
     private validateBinding;
     private bind;
-    prepareRequest(body: GeminiBody, resolve: SubagentModelResolver): {
+    prepareRequest(body: GeminiBody, resolve: SubagentModelResolver, requestModelName?: string): {
         body: GeminiBody;
         context: SubagentRoutingContext;
         modelName?: string;

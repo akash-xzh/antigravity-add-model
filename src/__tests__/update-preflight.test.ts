@@ -129,6 +129,31 @@ describe('Windows update recovery', () => {
     ], { platform: 'win32', realpath: (value: string) => value }).matching).toHaveLength(1);
   });
 
+  it('detects a running standalone update installer without treating it as the old app', async () => {
+    const f = await standalone();
+    const installer = path.join(f.root, 'updater/pending/Antigravity-x64.exe');
+    put(installer, 'simulated installer; never executed');
+    const hooks = quiet();
+    hooks.listProcesses.mockResolvedValue([
+      { pid: 456, name: 'Antigravity-x64.exe', executable: installer },
+    ] as never);
+    const report = await updatePreflight({ ...f, command: 'check' }, hooks);
+    expect(report.processes.matching).toEqual([]);
+    expect(report.processes.otherInstallations).toEqual([]);
+    expect(report.processes.installers).toMatchObject([{ pid: 456, name: 'Antigravity-x64.exe' }]);
+    expect(report.readyForPreparation).toBe(false);
+    expect(report.guidance).toContain('does not guarantee');
+    await expect(updatePreflight({ ...f, command: 'prepare' }, hooks)).rejects.toThrow('An Antigravity installer is running');
+    expect(hooks.serviceCommand).not.toHaveBeenCalled();
+
+    const copiedDownload = path.join(f.root, 'Downloads/Antigravity-x64 (1).exe');
+    put(copiedDownload, 'download copy; never executed');
+    expect(classifyUpdateProcesses(path.dirname(f.resources), [
+      { pid: 789, name: 'Antigravity-x64 (1).exe', executable: copiedDownload },
+      { pid: 790, name: 'Antigravity-x64.exe', executable: null },
+    ], f)).toMatchObject({ installers: [{ pid: 789 }], unverifiable: [{ pid: 790 }] });
+  });
+
   it('reports a second installation as a possible shared updater blocker without restoring either app', async () => {
     const f = ide(); const other = ide(); configureIde({ ...f, action: 'apply' });
     const before = fs.readFileSync(f.settings); const hooks = quiet();

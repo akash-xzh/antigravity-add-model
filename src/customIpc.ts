@@ -5,7 +5,13 @@ import * as cryptoStore from './cryptoStore';
 import { createModelManager } from './modelManagement';
 import { createModelActions } from './modelActions';
 
+let handlersRegistered = false;
+
 export function registerCustomModelHandlers(): void {
+  // Both main.ts (via ipcHandlers) and desktop.ts can load this module in one
+  // process. ipcMain.handle throws on a duplicate channel registration.
+  if (handlersRegistered) return;
+  handlersRegistered = true;
   const manager = createModelManager(path.join(app.getPath('home'), '.gemini', 'antigravity'), cryptoStore, (url) =>
     shell.openExternal(url),
   );
@@ -15,8 +21,17 @@ export function registerCustomModelHandlers(): void {
         return await action(...args);
       } catch (error) {
         if (channel === 'storage:get-custom-models' || channel === 'storage:export-custom-models') throw error;
-        const status = (error as { status?: number }).status;
-        return { success: false, error: (error as Error).message, ...(status ? { status } : {}) };
+        const status =
+          error && typeof error === 'object' && 'status' in error && typeof (error as { status?: unknown }).status === 'number'
+            ? (error as { status: number }).status
+            : undefined;
+        const message =
+          error instanceof Error
+            ? error.message
+            : error && typeof error === 'object' && 'message' in error && typeof (error as { message?: unknown }).message === 'string'
+              ? (error as { message: string }).message
+              : String(error);
+        return { success: false, error: message, ...(status ? { status } : {}) };
       }
     });
   };

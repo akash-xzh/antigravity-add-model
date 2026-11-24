@@ -21,16 +21,65 @@ export function configureCredentialDirectory(directory: string): void {
 function localKey(create: boolean): Buffer {
   const directory = credentialDirectory || path.join(app?.getPath('home') || os.homedir(), '.gemini', 'antigravity');
   const filename = path.join(directory, '.model-credentials-key');
-  if (create && !fs.existsSync(filename)) {
-    fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+  const readValidKey = (): Buffer | undefined => {
     try {
-      fs.writeFileSync(filename, randomBytes(32), { mode: 0o600, flag: 'wx' });
+      const key = fs.readFileSync(filename);
+      return key.length === 32 ? key : undefined;
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+      throw error;
+    }
+  };
+  const existing = readValidKey();
+  if (existing) return existing;
+  // A zero-byte/short key is the artifact of an interrupted first boot. Leaving
+  // it in place would permanently lock the user out of their saved credentials.
+  if (!create) throw new Error('Invalid local credential encryption key');
+  fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+  const tmp = `${filename}.${randomBytes(8).toString('hex')}.tmp`;
+  try {
+    fs.writeFileSync(tmp, randomBytes(32), { mode: 0o600, flag: 'wx' });
+    for (let attempt = 0; attempt < 5; attempt++) {
+      try {
+        fs.linkSync(tmp, filename);
+        break;
+      } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code;
+        if (code === 'EEXIST') {
+          if (readValidKey()) break; // another process won the race with a valid key
+          try {
+            fs.unlinkSync(filename);
+          } catch (unlinkError) {
+            if ((unlinkError as NodeJS.ErrnoException).code !== 'ENOENT') throw unlinkError;
+          }
+          continue;
+        }
+        if (code === 'EPERM' || code === 'EACCES' || code === 'ENOSYS' || code === 'EOPNOTSUPP') {
+          if (readValidKey()) break;
+          try {
+            fs.unlinkSync(filename);
+          } catch (unlinkError) {
+            if ((unlinkError as NodeJS.ErrnoException).code !== 'ENOENT') throw unlinkError;
+          }
+          try {
+            fs.renameSync(tmp, filename);
+          } catch (renameError) {
+            if (!['EPERM', 'EBUSY', 'EACCES'].includes((renameError as NodeJS.ErrnoException).code || '')) throw renameError;
+          }
+          break;
+        }
+        throw error;
+      }
+    }
+  } finally {
+    try {
+      if (fs.existsSync(tmp)) fs.unlinkSync(tmp);
+    } catch {
+      /* ignore cleanup error */
     }
   }
-  const key = fs.readFileSync(filename);
-  if (key.length !== 32) throw new Error('Invalid local credential encryption key');
+  const key = readValidKey();
+  if (!key) throw new Error('Invalid local credential encryption key');
   return key;
 }
 
@@ -42,17 +91,36 @@ function encryptLocal(value: string): string {
 }
 
 /**
- * Creates a backup of the specified file with a .bak extension.
+ * Creates a backup of the specified file with a .bak extension and mode 0o600.
  */
 export function backupFile(filePath: string): void {
   try {
     if (fs.existsSync(filePath)) {
       const backupPath = filePath + '.bak';
-      fs.copyFileSync(filePath, backupPath);
+      fs.writeFileSync(backupPath, fs.readFileSync(filePath), { mode: 0o600 });
+      try {
+        fs.chmodSync(backupPath, 0o600);
+      } catch {
+        /* ignore on platforms/filesystems without POSIX chmod */
+      }
       log.info('[CryptoStore] Credential backup created.');
     }
   } catch {
     log.error('[CryptoStore] Could not create credential backup. Check file permissions and available disk space.');
+  }
+}
+
+/**
+ * Removes a previously created .bak backup file after successful migration.
+ */
+export function removeBackupFile(filePath: string): void {
+  try {
+    const backupPath = filePath + '.bak';
+    if (fs.existsSync(backupPath)) {
+      fs.unlinkSync(backupPath);
+    }
+  } catch {
+    /* best-effort cleanup */
   }
 }
 
@@ -144,18 +212,37 @@ interface ModelWithKey {
   [key: string]: unknown;
 }
 
+const ENCRYPTED_PREFIX_RE = /^(enc:|local-gcm:)/;
+const DECRYPTABLE_PREFIX_RE = /^(enc:|local-gcm:|fallback:)/;
+
 /**
  * Iterates through a list of custom models and encrypts their API keys.
+ * Checks ciphertext prefixes so already-encrypted values are never double-encrypted.
  */
 export function encryptModels(models: ModelWithKey[] | null): ModelWithKey[] {
   if (!models || !Array.isArray(models)) return [];
   return models.map((model) => {
-    if (model.apiKey && model.apiKey !== 'none' && !model.encrypted) {
-      return {
-        ...model,
-        apiKey: encryptString(model.apiKey),
-        encrypted: true,
-      };
+    const apiKey = typeof model.apiKey === 'string' ? model.apiKey : '';
+    if (apiKey && apiKey !== 'none') {
+      if (ENCRYPTED_PREFIX_RE.test(apiKey)) {
+        return model.encrypted ? model : { ...model, encrypted: true };
+      }
+      if (apiKey.startsWith('fallback:')) {
+        const plain = decryptString(apiKey);
+        if (plain === 'DECRYPTION_FAILED') return model;
+        return {
+          ...model,
+          apiKey: encryptString(plain),
+          encrypted: true,
+        };
+      }
+      if (!model.encrypted) {
+        return {
+          ...model,
+          apiKey: encryptString(apiKey),
+          encrypted: true,
+        };
+      }
     }
     return model;
   });
@@ -163,14 +250,16 @@ export function encryptModels(models: ModelWithKey[] | null): ModelWithKey[] {
 
 /**
  * Iterates through a list of custom models and decrypts their API keys for in-memory use.
+ * Decrypts any value carrying a ciphertext prefix even if the encrypted flag is falsy.
  */
 export function decryptModels(models: ModelWithKey[] | null): ModelWithKey[] {
   if (!models || !Array.isArray(models)) return [];
   return models.map((model) => {
-    if (model.encrypted) {
+    const apiKey = typeof model.apiKey === 'string' ? model.apiKey : '';
+    if (model.encrypted || DECRYPTABLE_PREFIX_RE.test(apiKey)) {
       return {
         ...model,
-        apiKey: decryptString(model.apiKey as string),
+        apiKey: decryptString(apiKey),
         encrypted: false,
       };
     }

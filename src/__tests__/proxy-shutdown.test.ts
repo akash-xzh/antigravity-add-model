@@ -5,6 +5,7 @@ import * as net from 'node:net';
 import { once } from 'node:events';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import * as url from 'node:url';
 import { runInNewContext } from 'node:vm';
 import ts from 'typescript';
 import type { ProxyStartOptions } from '../proxy';
@@ -21,6 +22,7 @@ const dependencies: Record<string, unknown> = {
   https: {},
   fs,
   path,
+  url,
   'electron-log': { info: vi.fn(), error: vi.fn(), warn: vi.fn() },
   './proxy/shared': { startCleanupInterval: vi.fn(), stopCleanupInterval: vi.fn() },
   './proxy/modelUtils': {},
@@ -30,6 +32,8 @@ const dependencies: Record<string, unknown> = {
   './proxy/subagentModels': {},
   './proxy/googlePoolFailover': googlePoolFailover,
     './proxy/nativeSubagentResponse': {},
+  './proxy/nativeLimits': { configureNativeLimits: vi.fn(), recordNativeLimits: vi.fn(), nativeLimitsPath: () => 'native_model_limits.json' },
+  './proxy/conversationUsage': { recordConversationTiming: vi.fn() },
   './proxy/customRequest': { stopCustomRequests: vi.fn() },
   './proxy/subagentRouting': { subagentRouting: { clear: vi.fn() } },
   './modelStore': {},

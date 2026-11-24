@@ -25,8 +25,16 @@ export declare function appendModelSystemPrompt(body: GeminiBody, systemPrompt: 
  */
 export declare function isAntigravityCompactionRequest(body: GeminiBody): boolean;
 type CompactionEffort = NonNullable<CustomModel['compactionReasoningEffort']>;
+export interface TrimContextOptions {
+    /**
+     * Insert a compact, explicit marker when the oldest turns are dropped. Proxy requests enable
+     * this so a silent loss of history is visible to the model; pure budgeting callers keep the
+     * original exact-contents behaviour.
+     */
+    marker?: boolean;
+}
 /** Approximate input budget. Drop whole oldest turns, never half a tool exchange. */
-export declare function trimContext(body: GeminiBody, contextWindow?: number, maxOutputTokens?: number): GeminiBody;
+export declare function trimContext(body: GeminiBody, contextWindow?: number, maxOutputTokens?: number, options?: TrimContextOptions): GeminiBody;
 export declare function applyRequestOptions(payload: Record<string, unknown>, model: CustomModel, format: ApiFormat, stream: boolean, compactionEffort?: CompactionEffort): Record<string, unknown>;
 export declare function parseRetryAfter(value: string | string[] | undefined, now?: number): number;
 export {};

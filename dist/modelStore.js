@@ -123,20 +123,168 @@ function readModelConfig(filename) {
         throw error;
     }
 }
+const LOCK_STALE_MS = 10000;
+/** A live holder may run long (bulk import); only reclaim after this hard expiry. */
+const LOCK_HARD_EXPIRY_MS = 10 * 60000;
+const LOCK_MAX_ATTEMPTS = 20;
+const RENAME_RETRY_CODES = new Set(['EPERM', 'EBUSY']);
+const RENAME_MAX_ATTEMPTS = 5;
+function sleepSync(ms) {
+    if (ms <= 0)
+        return;
+    try {
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+    }
+    catch {
+        const end = Date.now() + ms;
+        while (Date.now() < end) {
+            /* fallback pause */
+        }
+    }
+}
+function renameWithRetry(source, destination) {
+    for (let attempt = 0; attempt < RENAME_MAX_ATTEMPTS; attempt++) {
+        try {
+            fs.renameSync(source, destination);
+            return;
+        }
+        catch (error) {
+            const code = error.code;
+            if (code && RENAME_RETRY_CODES.has(code) && attempt < RENAME_MAX_ATTEMPTS - 1) {
+                sleepSync(10 * (attempt + 1));
+                continue;
+            }
+            throw error;
+        }
+    }
+}
+function isLockReclaimable(lockfile) {
+    try {
+        const stat = fs.statSync(lockfile);
+        const ageMs = Date.now() - stat.mtimeMs;
+        const raw = fs.readFileSync(lockfile, 'utf8').trim();
+        if (!raw)
+            return ageMs > LOCK_STALE_MS;
+        let pid;
+        let createdAt;
+        if (/^\d+$/.test(raw)) {
+            pid = Number(raw);
+        }
+        else {
+            const parsed = JSON.parse(raw);
+            if (typeof parsed.pid === 'number' && Number.isInteger(parsed.pid) && parsed.pid > 0)
+                pid = parsed.pid;
+            if (typeof parsed.createdAt === 'number' && Number.isFinite(parsed.createdAt))
+                createdAt = parsed.createdAt;
+        }
+        const age = createdAt !== undefined ? Date.now() - createdAt : ageMs;
+        if (pid !== undefined) {
+            let alive = true;
+            try {
+                process.kill(pid, 0);
+            }
+            catch (failure) {
+                if (failure.code === 'ESRCH')
+                    alive = false;
+            }
+            if (alive)
+                return age > LOCK_HARD_EXPIRY_MS;
+            return true;
+        }
+        return age > LOCK_STALE_MS;
+    }
+    catch (error) {
+        if (error.code === 'ENOENT')
+            return false;
+        try {
+            return Date.now() - fs.statSync(lockfile).mtimeMs > LOCK_STALE_MS;
+        }
+        catch {
+            return false;
+        }
+    }
+}
+function withStoreLock(filename, fn) {
+    fs.mkdirSync(path.dirname(filename), { recursive: true, mode: 0o700 });
+    const lockfile = `${filename}.lock`;
+    const owner = JSON.stringify({ pid: process.pid, token: (0, node_crypto_1.randomUUID)(), createdAt: Date.now() });
+    let lockFd;
+    for (let attempt = 0; attempt < LOCK_MAX_ATTEMPTS; attempt++) {
+        try {
+            lockFd = fs.openSync(lockfile, 'wx', 0o600);
+            break;
+        }
+        catch (error) {
+            if (error.code !== 'EEXIST')
+                throw error;
+            if (isLockReclaimable(lockfile)) {
+                try {
+                    fs.unlinkSync(lockfile);
+                }
+                catch {
+                    /* ignore transient unlink race */
+                }
+                continue;
+            }
+            if (attempt < LOCK_MAX_ATTEMPTS - 1) {
+                sleepSync(Math.min(40, 10 + attempt * 2));
+            }
+        }
+    }
+    if (lockFd === undefined) {
+        throw new Error('Model configuration is being updated by another process; retry after it finishes');
+    }
+    try {
+        fs.writeFileSync(lockFd, owner);
+        return fn();
+    }
+    finally {
+        try {
+            fs.closeSync(lockFd);
+        }
+        catch {
+            /* ignore close error */
+        }
+        try {
+            if (fs.existsSync(lockfile) && fs.readFileSync(lockfile, 'utf8') === owner) {
+                fs.unlinkSync(lockfile);
+            }
+        }
+        catch {
+            /* never mask an earlier error */
+        }
+    }
+}
 function writeJsonAtomic(filename, value) {
     fs.mkdirSync(path.dirname(filename), { recursive: true, mode: 0o700 });
     const temporary = `${filename}.${(0, node_crypto_1.randomUUID)()}.tmp`;
     try {
         fs.writeFileSync(temporary, JSON.stringify(value, null, 2) + '\n', { encoding: 'utf8', mode: 0o600, flag: 'wx' });
-        fs.renameSync(temporary, filename);
+        renameWithRetry(temporary, filename);
+        // Clean up plaintext migration backup once the atomic encrypted write has succeeded.
+        if (path.basename(filename) === 'custom_models.json') {
+            const backupPath = `${filename}.bak`;
+            try {
+                if (fs.existsSync(backupPath))
+                    fs.unlinkSync(backupPath);
+            }
+            catch {
+                /* best-effort cleanup */
+            }
+        }
     }
     finally {
-        if (fs.existsSync(temporary))
-            fs.unlinkSync(temporary);
+        try {
+            if (fs.existsSync(temporary))
+                fs.unlinkSync(temporary);
+        }
+        catch {
+            /* ignore cleanup error */
+        }
     }
 }
 function isMaskedSecret(value) {
-    return typeof value === 'string' && (value === '********' || value.startsWith('***') || value.includes('...'));
+    return value === '********';
 }
 function decodeSecret(value, codec) {
     if (!value || value === 'none')
@@ -189,8 +337,10 @@ class ModelStore {
         delete model.nativeContextWindow;
         delete model.nativeMaxOutputTokens;
         delete model.nativeModelExperiments;
-        if (!model.name?.startsWith('models/'))
-            model.name = `models/${model.name || ''}`;
+        if (typeof model.name !== 'string' || !model.name.trim())
+            throw new Error('Model name is required');
+        const trimmedName = model.name.trim();
+        model.name = trimmedName.startsWith('models/') ? trimmedName : `models/${trimmedName}`;
         if (model.name === 'models/')
             throw new Error('Model name is required');
         const valid = (0, schemaValidator_1.validateCustomModel)(model);
@@ -227,6 +377,9 @@ class ModelStore {
                     if (!old[key])
                         throw new Error(`Enter a value for header ${key}`);
                     return [key, existing?.encryptedHeaders ? old[key] : this.codec.encryptString(old[key])];
+                }
+                if (typeof value === 'string' && /^(enc:|local-gcm:)/.test(value)) {
+                    throw new Error(`Machine-encrypted value cannot be imported for header ${key}. Enter a fresh value.`);
                 }
                 return [key, this.codec.encryptString(String(value))];
             }));
@@ -271,56 +424,75 @@ class ModelStore {
         return model;
     }
     save(input) {
-        const models = this.read();
-        const target = input.name?.startsWith('models/') ? input.name : `models/${input.name}`;
-        const sourceName = input.originalName || input.copyFrom || target;
-        const existing = models.find((model) => model.name === sourceName);
-        if ((input.originalName || input.copyFrom) && !existing)
-            throw new Error('Original model no longer exists');
-        if ((input.originalName || input.copyFrom) && sourceName !== target && models.some((m) => m.name === target)) {
-            throw new Error('A model with that name already exists');
+        if (typeof input?.name !== 'string' || !input.name.trim()) {
+            throw new Error('Model name is required');
         }
-        const prepared = this.prepare({ ...input, name: target }, existing);
-        const replaceName = input.copyFrom ? target : sourceName;
-        const index = models.findIndex((model) => model.name === replaceName);
-        if (index < 0)
-            models.push(prepared);
-        else
-            models[index] = prepared;
-        if (input.originalName && sourceName !== target) {
-            for (const model of models) {
-                if (Array.isArray(model.fallbackModels))
-                    model.fallbackModels = model.fallbackModels.map((name) => (name === sourceName ? target : name));
+        const trimmedName = input.name.trim();
+        const target = trimmedName.startsWith('models/') ? trimmedName : `models/${trimmedName}`;
+        if (target === 'models/') {
+            throw new Error('Model name is required');
+        }
+        withStoreLock(this.filename, () => {
+            const models = this.read();
+            const sourceName = input.originalName || input.copyFrom || target;
+            const existing = models.find((model) => model.name === sourceName);
+            if ((input.originalName || input.copyFrom) && !existing)
+                throw new Error('Original model no longer exists');
+            if ((input.originalName || input.copyFrom) && sourceName !== target && models.some((m) => m.name === target)) {
+                throw new Error('A model with that name already exists');
             }
-        }
-        writeJsonAtomic(this.filename, { models });
-    }
-    delete(name) {
-        const models = this.read().filter((model) => model.name !== name);
-        for (const model of models) {
-            if (Array.isArray(model.fallbackModels))
-                model.fallbackModels = model.fallbackModels.filter((item) => item !== name);
-        }
-        writeJsonAtomic(this.filename, { models });
-    }
-    import(payload) {
-        const incoming = normalizeModelConfig(payload);
-        const models = this.read();
-        const seen = new Set();
-        for (const item of incoming) {
-            const name = item.name?.startsWith('models/') ? item.name : `models/${item.name || ''}`;
-            if (seen.has(name))
-                throw new Error(`Duplicate model in import: ${name}`);
-            seen.add(name);
-            const index = models.findIndex((m) => m.name === name);
-            const prepared = this.prepare({ ...item, name }, models[index]);
+            const prepared = this.prepare({ ...input, name: target }, existing);
+            const replaceName = input.copyFrom ? target : sourceName;
+            const index = models.findIndex((model) => model.name === replaceName);
             if (index < 0)
                 models.push(prepared);
             else
                 models[index] = prepared;
-        }
-        writeJsonAtomic(this.filename, { models });
-        return incoming.length;
+            if (input.originalName && sourceName !== target) {
+                for (const model of models) {
+                    if (Array.isArray(model.fallbackModels))
+                        model.fallbackModels = model.fallbackModels.map((name) => (name === sourceName ? target : name));
+                }
+            }
+            writeJsonAtomic(this.filename, { models });
+        });
+    }
+    delete(name) {
+        withStoreLock(this.filename, () => {
+            const models = this.read().filter((model) => model.name !== name);
+            for (const model of models) {
+                if (Array.isArray(model.fallbackModels))
+                    model.fallbackModels = model.fallbackModels.filter((item) => item !== name);
+            }
+            writeJsonAtomic(this.filename, { models });
+        });
+    }
+    import(payload) {
+        const incoming = normalizeModelConfig(payload);
+        return withStoreLock(this.filename, () => {
+            const models = this.read();
+            const seen = new Set();
+            for (const item of incoming) {
+                if (typeof item.name !== 'string' || !item.name.trim()) {
+                    throw new Error('Model name is required');
+                }
+                const trimmedName = item.name.trim();
+                const name = trimmedName.startsWith('models/') ? trimmedName : `models/${trimmedName}`;
+                if (name === 'models/')
+                    throw new Error('Model name is required');
+                if (seen.has(name))
+                    throw new Error(`Duplicate model in import: ${name}`);
+                seen.add(name);
+                const index = models.findIndex((m) => m.name === name);
+                const prepared = this.prepare({ ...item, name }, models[index]);
+                if (index < 0)
+                    models.push(prepared);
+                else
+                    models[index] = prepared;
+            }
+            writeJsonAtomic(this.filename, { models });
+            return incoming.length;
+        });
     }
     export() {
         return {

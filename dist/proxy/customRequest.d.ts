@@ -1,6 +1,7 @@
 import * as http from 'http';
 import type { CustomModel } from '../proxy';
 import { GeminiBody } from './requestOptions';
+import { subagentRouting } from './subagentRouting';
 export declare function getProxyMetrics(): {
     circuits: {
         tracked: number;
@@ -21,5 +22,5 @@ export declare function getProxyMetrics(): {
 export declare function stopCustomRequests(): void;
 export declare function buildFallbackChain(primary: CustomModel, allModels: CustomModel[]): CustomModel[];
 /** The sole retry/fallback owner; nothing is retried after any model output was received. */
-export declare function runCustomModelRequest(res: http.ServerResponse, primary: CustomModel, originalBody: GeminiBody, isStream: boolean, allModels: CustomModel[], cloudEnvelope?: boolean, kind?: 'request' | 'generation-test'): Promise<void>;
+export declare function runCustomModelRequest(res: http.ServerResponse, primary: CustomModel, originalBody: GeminiBody, isStream: boolean, allModels: CustomModel[], cloudEnvelope?: boolean, kind?: 'request' | 'generation-test', prePrepared?: ReturnType<typeof subagentRouting.prepareRequest>): Promise<void>;
 //# sourceMappingURL=customRequest.d.ts.map

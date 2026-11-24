@@ -15,16 +15,46 @@ function install(getLanguageServerPort) {
     // Registered before the vendor's ready callback, without replacing its startup,
     // updater, WSL integration, certificate policy, or window configuration.
     void electron_1.app.whenReady().then(() => {
-        electron_1.session.defaultSession.webRequest.onBeforeRequest((details, callback) => {
+        const webRequest = electron_1.session.defaultSession.webRequest;
+        const rawOnBeforeRequest = webRequest.onBeforeRequest.bind(webRequest);
+        let chainedListener = null;
+        let chainedFilterUrls = null;
+        const matchesFilter = (url, patterns) => {
+            if (!patterns || patterns.length === 0)
+                return true;
+            for (const pattern of patterns) {
+                if (pattern === '<all_urls>' || pattern === '*://*/*')
+                    return true;
+                const regexStr = '^' + pattern.replace(/[.+?^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*') + '$';
+                if (new RegExp(regexStr).test(url))
+                    return true;
+            }
+            return false;
+        };
+        const passThrough = (details, callback) => {
+            if (chainedListener && matchesFilter(details.url, chainedFilterUrls)) {
+                chainedListener(details, callback);
+            }
+            else {
+                callback({});
+            }
+        };
+        const addonListener = (details, callback) => {
             const proxyPort = (0, proxy_1.getProxyPort)();
             const lsPort = getLanguageServerPort();
             if (!proxyPort || !lsPort)
-                return callback({});
-            const url = new URL(details.url);
+                return passThrough(details, callback);
+            let url;
+            try {
+                url = new URL(details.url);
+            }
+            catch {
+                return passThrough(details, callback);
+            }
             if (!['http:', 'https:'].includes(url.protocol) ||
                 !['127.0.0.1', 'localhost'].includes(url.hostname) ||
                 Number(url.port) !== lsPort) {
-                return callback({});
+                return passThrough(details, callback);
             }
             if (/(?:\/|\.)LanguageServerService\/SetCloudCodeURL$/.test(url.pathname)) {
                 callback({ cancel: true });
@@ -34,9 +64,47 @@ function install(getLanguageServerPort) {
                     redirectURL: `http://127.0.0.1:${proxyPort}/GetAvailableModels?ls=${encodeURIComponent(details.url)}`,
                 });
             }
-            else
-                callback({});
-        });
+            else if (url.pathname === '/main.js') {
+                const token = typeof proxy_1.getUiMitmToken === 'function' ? (0, proxy_1.getUiMitmToken)() : '';
+                callback({
+                    redirectURL: token
+                        ? `http://127.0.0.1:${proxyPort}/_ui/main.js?t=${encodeURIComponent(token)}`
+                        : `http://127.0.0.1:${proxyPort}/_ui/main.js`,
+                });
+            }
+            else {
+                passThrough(details, callback);
+            }
+        };
+        rawOnBeforeRequest(addonListener);
+        // Electron only keeps one onBeforeRequest listener per session; wrap registration
+        // so a later vendor listener chains after our non-matching pass-through instead of
+        // overwriting MITM / GetAvailableModels / SetCloudCodeURL interception.
+        try {
+            webRequest.onBeforeRequest = ((filterOrListener, maybeListener) => {
+                if (typeof filterOrListener === 'function') {
+                    chainedFilterUrls = null;
+                    chainedListener = filterOrListener;
+                }
+                else if (filterOrListener === null) {
+                    chainedFilterUrls = null;
+                    chainedListener = null;
+                    // A vendor call to onBeforeRequest(null) must actually unregister the
+                    // listener. Our wrapper stays installed and re-adds the addon listener
+                    // on the next real registration.
+                    rawOnBeforeRequest(null);
+                    return;
+                }
+                else {
+                    chainedFilterUrls = Array.isArray(filterOrListener?.urls) ? filterOrListener.urls : null;
+                    chainedListener = maybeListener ?? null;
+                }
+                rawOnBeforeRequest(addonListener);
+            });
+        }
+        catch {
+            // If onBeforeRequest is non-writable, addonListener is still registered.
+        }
     });
     electron_1.app.on('browser-window-created', (_event, win) => {
         win.webContents.on('did-fail-load', (_event, code, description, _url, isMainFrame) => {
@@ -50,8 +118,40 @@ function install(getLanguageServerPort) {
             console.error('[Model Patch] Preload failed:', error);
         });
     });
-    electron_1.app.on('will-quit', () => {
-        void (0, proxy_1.stopProxy)();
+    let proxyStopped = false;
+    let stoppingProxy = false;
+    electron_1.app.on('will-quit', (event) => {
+        if (proxyStopped)
+            return;
+        if (stoppingProxy) {
+            event?.preventDefault?.();
+            return;
+        }
+        stoppingProxy = true;
+        if (event?.preventDefault) {
+            event.preventDefault();
+            let timer;
+            const finish = () => {
+                if (timer !== undefined && typeof clearTimeout === 'function') {
+                    clearTimeout(timer);
+                    timer = undefined;
+                }
+                if (proxyStopped)
+                    return;
+                proxyStopped = true;
+                electron_1.app.quit?.();
+            };
+            if (typeof setTimeout === 'function') {
+                timer = setTimeout(finish, 5000);
+            }
+            void Promise.resolve((0, proxy_1.stopProxy)())
+                .catch(() => { })
+                .finally(finish);
+        }
+        else {
+            proxyStopped = true;
+            void Promise.resolve((0, proxy_1.stopProxy)()).catch(() => { });
+        }
     });
 }
 //# sourceMappingURL=desktop.js.map

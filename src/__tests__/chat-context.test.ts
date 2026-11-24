@@ -35,7 +35,14 @@ describe('context transcript estimates', () => {
       message('b'.repeat(80)),
     ]);
     const { getChatContextUsage } = await import('../chatContext');
-    expect(await getChatContextUsage(id, root)).toEqual({ conversationId: id, source: 'estimated', currentTokens: 30 });
+    expect(await getChatContextUsage(id, root)).toEqual({
+      conversationId: id,
+      source: 'estimated',
+      currentTokens: 30,
+      visibleInputTokens: 10,
+      visibleOutputTokens: 20,
+      compactions: 0,
+    });
   });
 
   it('keeps all post-checkpoint text across the old 2 MiB boundary', async () => {
@@ -158,5 +165,244 @@ describe('context limits and profile isolation', () => {
     expect(manager.store.read()[0].googlePool).toMatchObject({ preferredAccountId: 'one' });
     manager.googleSelectAccount({ modelName: 'models/cloud' });
     expect(manager.store.read()[0].googlePool).toEqual({ strategy: 'round-robin', maxConcurrency: 2 });
+  });
+
+  it('reports the real provider prompt size, overhead and cache from per-step usage', async () => {
+    const root = directory();
+    transcript(root, [
+      { source: 'USER_EXPLICIT', type: 'USER_INPUT', content: 'a'.repeat(400) },
+      {
+        type: 'PLANNER_RESPONSE',
+        source: 'MODEL',
+        content: 'b'.repeat(800),
+        input_tokens: 2049,
+        cache_read_tokens: 69055,
+        output_tokens: 200,
+      },
+    ]);
+    const { getChatContextUsage } = await import('../chatContext');
+    expect(await getChatContextUsage(id, root)).toEqual({
+      conversationId: id,
+      source: 'actual',
+      currentTokens: 300,
+      visibleInputTokens: 100,
+      visibleOutputTokens: 200,
+      actualTokens: 71104,
+      overheadTokens: 70804,
+      actualInputTokens: 2049,
+      actualCachedTokens: 69055,
+      actualOutputTokens: 200,
+      sessionInputTokens: 2049,
+      sessionCachedTokens: 69055,
+      sessionOutputTokens: 200,
+      turns: 1,
+      compactions: 0,
+      tokensPerTurn: 71104,
+    });
+  });
+
+  it('computes the default checkpoint policy and tokens remaining before chat compact', async () => {
+    const root = directory();
+    transcript(root, [
+      { source: 'USER_EXPLICIT', type: 'USER_INPUT', content: 'a'.repeat(400) },
+      message('b'.repeat(800)),
+    ]);
+    const { getContextInformation } = await import('../chatContext');
+    const info = await getContextInformation(
+      { conversationId: id, modelName: 'my-model' },
+      root,
+      [{ name: 'my-model', contextWindow: 100000, maxOutputTokens: 8192 }],
+    );
+    expect(info).toMatchObject({
+      conversationId: id,
+      source: 'estimated',
+      currentTokens: 300,
+      visibleInputTokens: 100,
+      visibleOutputTokens: 200,
+      maxTokens: 100000,
+      compactionSource: 'default',
+      compactionThresholdPercent: 80,
+      compactionAtTokens: 80000,
+      tokensUntilCompaction: 79700,
+    });
+  });
+
+  it('honours a configured checkpoint percentage and claims nothing without a declared window', async () => {
+    const root = directory();
+    transcript(root, [
+      { source: 'USER_EXPLICIT', type: 'USER_INPUT', content: 'a'.repeat(400) },
+      message('b'.repeat(800)),
+    ]);
+    const { getContextInformation } = await import('../chatContext');
+    const configured = await getContextInformation(
+      { conversationId: id, modelName: 'my-model' },
+      root,
+      [{ name: 'my-model', contextWindow: 100000, maxOutputTokens: 8192, compactionThresholdPercent: 50 }],
+    );
+    expect(configured).toMatchObject({ compactionSource: 'custom', compactionAtTokens: 50000 });
+    // No declared window: the IDE keeps its own new-token default, so no percentage is claimed.
+    const guessed = await getContextInformation(
+      { conversationId: id, modelName: 'my-model' },
+      root,
+      [{ name: 'my-model', maxOutputTokens: 8192 }],
+    );
+    expect(guessed.compactionSource).toBeUndefined();
+    expect(guessed.compactionAtTokens).toBeUndefined();
+    expect(guessed.tokensUntilCompaction).toBeUndefined();
+  });
+
+  it('reads an official-model limit from the language server catalog and its measured speed', async () => {
+    const root = directory();
+    transcript(root, [
+      { source: 'USER_EXPLICIT', type: 'USER_INPUT', content: 'a'.repeat(400) },
+      {
+        type: 'PLANNER_RESPONSE',
+        source: 'MODEL',
+        content: 'b'.repeat(800),
+        input_tokens: 2049,
+        cache_read_tokens: 69055,
+        output_tokens: 200,
+      },
+    ]);
+    const { recordNativeLimits } = await import('../proxy/nativeLimits');
+    const { recordConversationTiming } = await import('../proxy/conversationUsage');
+    const { getContextInformation } = await import('../chatContext');
+    recordNativeLimits({
+      models: { 'models/gemini-4-hydrogen': { displayName: 'Gemini 4 Hydrogen', maxTokens: 1_000_000 } },
+    });
+    recordConversationTiming(id, { ttftMs: 1500, decodeMs: 4000 });
+    const info = await getContextInformation(
+      { conversationId: id, modelName: 'Gemini 4 Hydrogen (Medium)' },
+      root,
+      [],
+    );
+    expect(info).toMatchObject({
+      source: 'actual',
+      actualTokens: 71104,
+      actualOutputTokens: 200,
+      maxTokens: 1_000_000,
+      limitSource: 'native-catalog',
+      tokensPerSecond: 50,
+      ttftMs: 1500,
+      compactionSource: 'ide',
+    });
+    // Official models keep the IDE's own checkpoint policy, so no window percentage is claimed.
+    expect(info.compactionAtTokens).toBeUndefined();
+    expect(info.tokensUntilCompaction).toBeUndefined();
+  });
+
+  it('reports the effective capped compaction percentage when maxOutputTokens caps tokenThreshold below 80%', async () => {
+    const root = directory();
+    transcript(root, [
+      { source: 'USER_EXPLICIT', type: 'USER_INPUT', content: 'a'.repeat(400) },
+      message('b'.repeat(800)),
+    ]);
+    const { getContextInformation } = await import('../chatContext');
+    const info = await getContextInformation(
+      { conversationId: id, modelName: 'haiku-128k-out' },
+      root,
+      [{ name: 'haiku-128k-out', contextWindow: 200_000, maxOutputTokens: 128_000 }],
+    );
+    expect(info).toMatchObject({
+      maxTokens: 200_000,
+      compactionSource: 'default',
+      compactionAtTokens: 70_976,
+      compactionThresholdPercent: 35,
+    });
+  });
+
+  it('does not double-count cached tokens for custom models recorded in process', async () => {
+    const root = directory();
+    transcript(root, [{ source: 'USER_EXPLICIT', type: 'USER_INPUT', content: 'hello' }]);
+    const { recordConversationUsage } = await import('../proxy/conversationUsage');
+    const { getContextInformation } = await import('../chatContext');
+    // diagnostics.ts stores total prompt tokens (already including cachedTokens) in inputTokens.
+    recordConversationUsage(id, {
+      inputTokens: 100_000,
+      cachedTokens: 90_000,
+      outputTokens: 500,
+      ttftMs: 400,
+      decodeMs: 5_000,
+    });
+    const info = await getContextInformation(
+      { conversationId: id, modelName: 'my-model' },
+      root,
+      [{ name: 'my-model', contextWindow: 200_000 }],
+    );
+    expect(info).toMatchObject({
+      source: 'actual',
+      actualTokens: 100_000,
+      actualInputTokens: 10_000,
+      actualCachedTokens: 90_000,
+      actualOutputTokens: 500,
+      tokensPerSecond: 100,
+      ttftMs: 400,
+    });
+  });
+
+  it('clears stale custom tokens when switching to a native model and ignores pre-checkpoint ghost usage', async () => {
+    const root = directory();
+    const { recordConversationUsage, recordConversationTiming } = await import('../proxy/conversationUsage');
+    const { getContextInformation } = await import('../chatContext');
+    const beforeCheckpoint = Date.now() - 10_000;
+    vi.spyOn(Date, 'now').mockReturnValue(beforeCheckpoint);
+    recordConversationUsage(id, { inputTokens: 160_000, cachedTokens: 80_000, outputTokens: 400, decodeMs: 4_000 });
+    vi.restoreAllMocks();
+
+    // Right after a CHECKPOINT resets turns=0, pre-compaction recorded usage must not leak as ghost tokens.
+    transcript(root, [
+      { source: 'USER_EXPLICIT', type: 'USER_INPUT', content: 'old', input_tokens: 1000, cache_read_tokens: 4000, output_tokens: 200 },
+      { source: 'SYSTEM', type: 'CHECKPOINT', content: 'summary', created_at: new Date(beforeCheckpoint + 5_000).toISOString() },
+    ]);
+    const postCheckpoint = await getContextInformation({ conversationId: id, modelName: 'my-model' }, root, []);
+    expect(postCheckpoint.source).toBe('estimated');
+    expect(postCheckpoint.actualTokens).toBeUndefined();
+    expect(postCheckpoint.tokensPerSecond).toBeUndefined();
+    // Cumulative session burn is preserved across checkpoints.
+    expect(postCheckpoint.sessionInputTokens).toBe(1000);
+    expect(postCheckpoint.sessionCachedTokens).toBe(4000);
+    expect(postCheckpoint.sessionOutputTokens).toBe(200);
+
+    // Switching from custom -> native clears stale custom tokens in recordConversationTiming.
+    recordConversationUsage(id, { inputTokens: 120_000, cachedTokens: 60_000, outputTokens: 300, decodeMs: 3_000 });
+    recordConversationTiming(id, { ttftMs: 500, decodeMs: 2_000 });
+    const nativeInfo = await getContextInformation({ conversationId: id, modelName: 'native' }, root, []);
+    expect(nativeInfo.actualTokens).toBeUndefined();
+    expect(nativeInfo.source).toBe('estimated');
+  });
+
+  it('uses newer custom-model recorded tokens and speed instead of mixing Turn 2 timing with Turn 1 transcript tokens', async () => {
+    const root = directory();
+    const turn1At = Date.now() - 10_000;
+    transcript(root, [
+      {
+        type: 'PLANNER_RESPONSE',
+        source: 'MODEL',
+        content: 'turn 1',
+        created_at: new Date(turn1At).toISOString(),
+        input_tokens: 2_000,
+        cache_read_tokens: 8_000,
+        output_tokens: 200,
+      },
+    ]);
+    const { recordConversationUsage } = await import('../proxy/conversationUsage');
+    const { getContextInformation } = await import('../chatContext');
+    recordConversationUsage(id, {
+      inputTokens: 25_000,
+      cachedTokens: 20_000,
+      outputTokens: 500,
+      ttftMs: 300,
+      decodeMs: 5_000,
+    });
+    const info = await getContextInformation({ conversationId: id, modelName: 'my-model' }, root, []);
+    expect(info).toMatchObject({
+      source: 'actual',
+      actualTokens: 25_000,
+      actualInputTokens: 5_000,
+      actualCachedTokens: 20_000,
+      actualOutputTokens: 500,
+      tokensPerSecond: 100,
+      ttftMs: 300,
+    });
   });
 });

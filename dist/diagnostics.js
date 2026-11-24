@@ -36,6 +36,10 @@ function beginDiagnosticRequest(input) {
             delete usage.outputTokens;
             delete usage.cachedTokens;
         },
+        /** Actual provider usage for the winning attempt; undefined until a provider reports it. */
+        usage() {
+            return { ...usage };
+        },
         observe(value, format) {
             if (finished || !value || typeof value !== 'object')
                 return;

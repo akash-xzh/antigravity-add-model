@@ -25,6 +25,7 @@ interface GeminiContent {
 interface GeminiPart {
     text?: string;
     thought?: boolean;
+    thoughtSignature?: string;
     functionCall?: GeminiFunctionCall;
     functionResponse?: GeminiFunctionResponse;
     fileData?: {
@@ -57,12 +58,22 @@ interface GeminiRequestBody {
     generationConfig?: {
         temperature?: number;
         maxOutputTokens?: number;
+        thinkingConfig?: {
+            thinkingBudget?: number;
+            thinking_budget?: number;
+            includeThoughts?: boolean;
+            include_thoughts?: boolean;
+            thinkingLevel?: string;
+            thinking_level?: string;
+        };
     };
 }
 interface AnthropicContentBlock {
-    type: 'text' | 'tool_use' | 'tool_result' | 'thinking' | 'image';
+    type: 'text' | 'tool_use' | 'tool_result' | 'thinking' | 'redacted_thinking' | 'image';
     text?: string;
     thinking?: string;
+    signature?: string;
+    data?: string;
     id?: string;
     name?: string;
     input?: Record<string, unknown>;
@@ -100,6 +111,7 @@ interface AnthropicResponse {
         type?: string;
         text?: string;
         thinking?: string;
+        signature?: string;
         partial_json?: string;
         stop_reason?: string;
     };
@@ -121,6 +133,7 @@ interface GeminiUsageMetadata {
     candidatesTokenCount: number;
     totalTokenCount: number;
 }
+export declare function clearAnthropicThinkingCache(): void;
 declare function mapGeminiToolsToAnthropic(geminiTools: GeminiTool[]): AnthropicTool[];
 export declare function mapGeminiToAnthropic(geminiBody: GeminiRequestBody, modelName: string, stateKey?: string): AnthropicRequestBody;
 export declare function mapAnthropicToGemini(anthRes: AnthropicResponse, modelName: string, toolSchemas?: ToolSchemas): GeminiGenerateContentResponse;

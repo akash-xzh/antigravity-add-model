@@ -11,6 +11,38 @@ import { getIdeInstallPath } from './ideInstall/constants';
 
 import { registerCustomModelHandlers } from './customIpc';
 
+const LOOPBACK_AUTHORITY_RE = /^http:\/\/(?:127\.0\.0\.1|localhost):\d+\/?$/i;
+
+function parseLoopbackAuthorityOrigin(value: unknown): string | null {
+  if (typeof value !== 'string') return null;
+  const trimmed = value.trim();
+  if (!LOOPBACK_AUTHORITY_RE.test(trimmed)) return null;
+  let parsed: URL;
+  try {
+    parsed = new URL(trimmed);
+  } catch {
+    return null;
+  }
+  if (parsed.protocol !== 'http:') return null;
+  if (parsed.hostname !== '127.0.0.1' && parsed.hostname !== 'localhost') return null;
+  if (parsed.username || parsed.password) return null;
+  if (parsed.pathname !== '/' || parsed.search || parsed.hash) return null;
+  const port = Number(parsed.port || '80');
+  if (!Number.isInteger(port) || port < 1 || port > 65535) return null;
+  return parsed.origin;
+}
+
+function getActiveWindow() {
+  const focused = BrowserWindow.getFocusedWindow?.();
+  if (focused && !focused.isDestroyed?.()) return focused;
+  return BrowserWindow.getAllWindows().find((win) => win && !win.isDestroyed?.());
+}
+
+function isWebContentsDestroyed(webContents: unknown): boolean {
+  const wc = webContents as { isDestroyed?: () => boolean } | undefined;
+  return Boolean(wc?.isDestroyed?.());
+}
+
 /**
  * Registers all IPC handlers for the main process.
  */
@@ -51,20 +83,21 @@ export function registerIpcHandlers(storageManager: StorageManager): void {
   ipcMain.handle(
     'notification:send',
     (_event, options: { title: string; body: string; silent?: boolean; payload?: unknown }) => {
+      if (!options || typeof options !== 'object' || typeof options.title !== 'string' || typeof options.body !== 'string') return;
       const notification = new Notification({
         title: options.title,
         body: options.body,
         silent: options.silent ?? false,
       });
       notification.on('click', () => {
-        const win = BrowserWindow.getAllWindows()[0];
-        if (win) {
+        const win = BrowserWindow.getAllWindows().find((w) => w && !w.isDestroyed?.());
+        if (win && !win.isDestroyed?.()) {
           if (win.isMinimized()) {
             win.restore();
           }
           win.show();
           win.focus();
-          if (options.payload) {
+          if (options.payload && !isWebContentsDestroyed(win.webContents)) {
             win.webContents.send('notification:clicked', options.payload);
           }
         }
@@ -77,25 +110,32 @@ export function registerIpcHandlers(storageManager: StorageManager): void {
   // vs/platform/nativeNotification/electron-main/electronNotificationService.ts
   ipcMain.handle('notification:open-system-preferences', async () => {
     if (process.platform === 'darwin') {
-      void shell.openExternal('x-apple.systempreferences:com.apple.preference.notifications');
+      await shell.openExternal('x-apple.systempreferences:com.apple.preference.notifications').catch(() => {});
     } else if (process.platform === 'win32') {
-      void shell.openExternal('ms-settings:notifications');
+      await shell.openExternal('ms-settings:notifications').catch(() => {});
     } else if (process.platform === 'linux') {
-      const { exec } = await import('child_process');
-      const commands = [
-        'gnome-control-center notifications',
-        'systemsettings kcm_notifications',
-        'xfce4-notifyd-config',
-        'gnome-control-center',
-        'systemsettings',
+      const { spawn } = await import('child_process');
+      const commands: [string, string[]][] = [
+        ['gnome-control-center', ['notifications']],
+        ['systemsettings', ['kcm_notifications']],
+        ['xfce4-notifyd-config', []],
+        ['gnome-control-center', []],
+        ['systemsettings', []],
       ];
-      for (const command of commands) {
-        try {
-          exec(command);
-          return; // If one command executes without immediate error, assume success for now
-        } catch {
-          // Try next
-        }
+      for (const [cmd, args] of commands) {
+        const launched = await new Promise<boolean>((resolve) => {
+          try {
+            const child = spawn(cmd, args, { detached: true, stdio: 'ignore' });
+            child.once('spawn', () => {
+              child.unref?.();
+              resolve(true);
+            });
+            child.once('error', () => resolve(false));
+          } catch {
+            resolve(false);
+          }
+        });
+        if (launched) return;
       }
     }
   });
@@ -121,9 +161,23 @@ export function registerIpcHandlers(storageManager: StorageManager): void {
   });
 
   // Sidecar extension custom scheme
-  ipcMain.handle('extensions:send-authorities', async (_event, authorities: Record<string, string>) => {
+  ipcMain.handle('extensions:send-authorities', async (_event, authorities: unknown) => {
+    if (!authorities || typeof authorities !== 'object' || Array.isArray(authorities)) {
+      throw new Error('Expected an extension authorities map');
+    }
+    const validated = new Map<string, string>();
+    for (const [key, value] of Object.entries(authorities as Record<string, unknown>)) {
+      if (!key) continue;
+      const origin = parseLoopbackAuthorityOrigin(value);
+      if (!origin) {
+        throw new Error(
+          `Invalid extension authority URL for "${key}": must be http://127.0.0.1:<port> or http://localhost:<port>`,
+        );
+      }
+      validated.set(key, origin);
+    }
     extensionAuthorities.clear();
-    for (const [key, value] of Object.entries(authorities)) {
+    for (const [key, value] of validated) {
       extensionAuthorities.set(key, value);
     }
   });
@@ -135,8 +189,9 @@ export function registerIpcHandlers(storageManager: StorageManager): void {
 
   // Window
   ipcMain.handle('window:set-title-bar-overlay', async (_event, options: { color: string; symbolColor: string }) => {
-    const win = BrowserWindow.getFocusedWindow() || BrowserWindow.getAllWindows()[0];
-    if (win && process.platform === 'win32') {
+    if (!options || typeof options !== 'object' || typeof options.color !== 'string' || typeof options.symbolColor !== 'string') return;
+    const win = getActiveWindow();
+    if (win && !win.isDestroyed?.() && process.platform === 'win32') {
       win.setTitleBarOverlay({
         color: options.color,
         symbolColor: options.symbolColor,
@@ -145,36 +200,36 @@ export function registerIpcHandlers(storageManager: StorageManager): void {
     }
   });
   ipcMain.handle('window:minimize', async () => {
-    const win = BrowserWindow.getFocusedWindow() || BrowserWindow.getAllWindows()[0];
-    if (win) {
+    const win = getActiveWindow();
+    if (win && !win.isDestroyed?.()) {
       win.minimize();
     }
   });
   ipcMain.handle('window:maximize', async () => {
-    const win = BrowserWindow.getFocusedWindow() || BrowserWindow.getAllWindows()[0];
-    if (win) {
+    const win = getActiveWindow();
+    if (win && !win.isDestroyed?.()) {
       win.maximize();
     }
   });
   ipcMain.handle('window:unmaximize', async () => {
-    const win = BrowserWindow.getFocusedWindow() || BrowserWindow.getAllWindows()[0];
-    if (win) {
+    const win = getActiveWindow();
+    if (win && !win.isDestroyed?.()) {
       win.unmaximize();
     }
   });
   ipcMain.handle('window:is-maximized', async () => {
-    const win = BrowserWindow.getFocusedWindow() || BrowserWindow.getAllWindows()[0];
-    return win ? win.isMaximized() : false;
+    const win = getActiveWindow();
+    return win && !win.isDestroyed?.() ? win.isMaximized() : false;
   });
   ipcMain.handle('window:close', async () => {
-    const win = BrowserWindow.getFocusedWindow() || BrowserWindow.getAllWindows()[0];
-    if (win) {
+    const win = getActiveWindow();
+    if (win && !win.isDestroyed?.()) {
       win.close();
     }
   });
   ipcMain.handle('window:toggle-devtools', async () => {
-    const win = BrowserWindow.getFocusedWindow() || BrowserWindow.getAllWindows()[0];
-    if (win) {
+    const win = getActiveWindow();
+    if (win && !win.isDestroyed?.() && !isWebContentsDestroyed(win.webContents)) {
       win.webContents.toggleDevTools();
     }
   });
@@ -185,8 +240,15 @@ export function registerIpcHandlers(storageManager: StorageManager): void {
   });
 
   // Safe external shell launch
-  ipcMain.handle('shell:open-external', async (_event, url: string) => {
-    if (url.startsWith('https://') || url.startsWith('http://')) {
+  ipcMain.handle('shell:open-external', async (_event, url: unknown) => {
+    if (typeof url !== 'string') return;
+    let parsed: URL;
+    try {
+      parsed = new URL(url);
+    } catch {
+      return;
+    }
+    if (parsed.protocol === 'https:' || parsed.protocol === 'http:') {
       await shell.openExternal(url);
     }
   });

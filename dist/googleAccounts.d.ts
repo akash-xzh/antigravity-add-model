@@ -33,12 +33,19 @@ export interface GoogleQuotaBucket {
     groupName?: string;
     remainingFraction?: number;
     resetTime?: string;
+    /** Native window label, e.g. "weekly" or "5h". */
+    window?: string;
+    /** Provider explanation, e.g. "Models within this group: …" or why a bucket does not apply. */
+    description?: string;
+    /** The provider reports the window as not currently applicable (e.g. weekly already exhausted). */
+    disabled?: boolean;
     /** Project measurements and complementary user measurements remain distinguishable. */
     scope?: 'project' | 'user';
 }
 export interface GoogleQuotaGroup {
     name: string;
     displayName?: string;
+    description?: string;
     buckets: GoogleQuotaBucket[];
 }
 export interface GoogleQuotaSnapshot {
@@ -74,7 +81,9 @@ export declare function quotaFamily(name: string): 'third-party' | 'gemini' | un
 /** Preserve local test/custom endpoints, and use the prepared tier for official Google requests. */
 export declare function googleAccountEndpoint(account: GoogleAccount, configured?: string): string;
 /** Refresh requests are coalesced and cached. Endpoint override is restricted to localhost fixtures. */
-export declare function refreshGoogleAccount(account: GoogleAccount, tokenEndpointOverride?: string): Promise<GoogleAccount>;
+export declare function refreshGoogleAccount(account: GoogleAccount, tokenEndpointOverride?: string, options?: {
+    force?: boolean;
+}): Promise<GoogleAccount>;
 /** Explicit quota refresh; never infers subscription eligibility or fabricates an available quota. */
 export declare function fetchGoogleQuota(account: GoogleAccount, baseURL?: string, options?: {
     includeIdentity?: boolean;
@@ -86,7 +95,7 @@ export declare function fetchGoogleModels(account: GoogleAccount, baseURL?: stri
     id: string;
     displayName: string;
 }[]>;
-export declare function acquireGoogleAccount(modelName: string, accounts: GoogleAccount[], options?: GooglePoolOptions, requestIdentity?: string, cooldownScope?: string, endpoint?: string): Promise<GoogleAccountLease>;
+export declare function acquireGoogleAccount(modelName: string, accounts: GoogleAccount[], options?: GooglePoolOptions, requestIdentity?: string, cooldownScope?: string, endpoint?: string, tokenEndpointOverride?: string): Promise<GoogleAccountLease>;
 export declare function recordGoogleAccountFailure(account: GoogleAccount, status: number, retryAfterMs?: number, cooldownScope?: string, reason?: GoogleCooldownReason, endpoint?: string): void;
 export declare function getGooglePoolStatus(): {
     id: string;

@@ -59,6 +59,12 @@ export const REQUIRED_BUILD_FILES = [
   'proxy/cloudCodeRouting.js',
   'proxy/translators/utils.js',
   'proxy/translators/images.js',
+  'proxy/globalPrompt.js',
+  'proxy/promptSections.js',
+  'proxy/modelHealth.js',
+  'proxy/nativeLimits.js',
+  'proxy/conversationUsage.js',
+  'proxy/uiMitm.js',
 ];
 
 function fail(code, message) {
@@ -97,7 +103,7 @@ function assertNoLinks(root, target) {
 }
 function removeOwned(root, target) {
   assertNoLinks(root, target);
-  fs.rmSync(target, { recursive: true, force: true });
+  fs.rmSync(target, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
 }
 function hashFile(filename) {
   const hash = createHash('sha256');
@@ -456,6 +462,45 @@ function swapTransaction(resources, staging, replacements, rename = fs.renameSyn
     throw error;
   }
 }
+function readDeployLockPid(lock) {
+  try {
+    const match = /pid=(\d+)/.exec(fs.readFileSync(lock, 'utf8'));
+    return match ? Number(match[1]) : undefined;
+  } catch {
+    return undefined;
+  }
+}
+function isPidAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  if (pid === process.pid) return true; // our own run has finished; the lock is ours to clear
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    // EPERM means the process exists but this user may not signal it.
+    return error.code === 'EPERM';
+  }
+}
+function sleepSync(ms) {
+  if (ms <= 0) return;
+  const buffer = new Int32Array(new SharedArrayBuffer(4));
+  Atomics.wait(buffer, 0, 0, ms);
+}
+function removeDeployLock(resources, lock) {
+  for (let attempt = 0; attempt < 4; attempt++) {
+    try {
+      removeOwned(resources, lock);
+      return true;
+    } catch (error) {
+      if ((error.code === 'EPERM' || error.code === 'EBUSY') && attempt < 3) {
+        sleepSync(50 * (attempt + 1));
+        continue;
+      }
+      return false;
+    }
+  }
+  return false;
+}
 export async function deploy(options = {}, operations = {}) {
   const info = preflight(options);
   if (options.check)
@@ -471,11 +516,11 @@ export async function deploy(options = {}, operations = {}) {
   } catch {
     fail('DEPLOY_LOCKED', `Another deployment or an interrupted run owns ${lock}. Inspect it before retrying.`);
   }
-  fs.writeFileSync(lockFd, `pid=${process.pid}\n`);
   let staging;
   let keepStaging = false;
   let originalBackup;
   try {
+    fs.writeFileSync(lockFd, `pid=${process.pid}\n`);
     if (!equal(fingerprint(resources), current))
       fail('APP_CHANGED', 'The app changed during preflight. Close Antigravity and retry.');
     staging = fs.mkdtempSync(path.join(resources, '.antigravity-patch-'));
@@ -575,9 +620,35 @@ export async function deploy(options = {}, operations = {}) {
     keepStaging = Boolean(error.keepStaging);
     throw error;
   } finally {
-    fs.closeSync(lockFd);
-    if (staging && !keepStaging) removeOwned(resources, staging);
-    if (!keepStaging) removeOwned(resources, lock);
+    try {
+      fs.closeSync(lockFd);
+    } catch {
+      /* ignore close errors so cleanup continues */
+    }
+    if (staging && !keepStaging) {
+      try {
+        removeOwned(resources, staging);
+      } catch (cleanupError) {
+        console.warn(`Warning: could not remove staging directory ${staging}: ${cleanupError.message}`);
+      }
+    }
+    if (!keepStaging) {
+      try {
+        removeOwned(resources, lock);
+      } catch (lockCleanupError) {
+        console.warn(`Warning: could not remove deploy lock ${lock}: ${lockCleanupError.message}`);
+      }
+    }
+    // Post-condition: a lock must never survive merely because cleanup failed.
+    // Only a genuinely live deployment that is not this finished run may keep it.
+    if (exists(lock)) {
+      const pid = readDeployLockPid(lock);
+      if (pid !== process.pid && isPidAlive(pid)) {
+        console.warn(`Warning: deploy lock ${lock} is owned by live pid ${pid}; leaving it in place.`);
+      } else if (!removeDeployLock(resources, lock)) {
+        console.warn(`Warning: stale deploy lock ${lock} (pid=${pid ?? 'unknown'}) could not be removed; retry the deploy.`);
+      }
+    }
   }
 }
 export function parseArgs(argv) {

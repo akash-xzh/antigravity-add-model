@@ -145,12 +145,32 @@ app
     // from overriding the local proxy endpoint.
     // Redirect GetAvailableModels to our proxy so custom models are injected.
     session.defaultSession.webRequest.onBeforeRequest((details, callback) => {
-      if (details.url.includes('SetCloudCodeURL')) {
+      const lsPort = getLsPort();
+      if (!lsPort) {
+        callback({});
+        return;
+      }
+      let parsedUrl: URL;
+      try {
+        parsedUrl = new URL(details.url);
+      } catch {
+        callback({});
+        return;
+      }
+      if (
+        !['http:', 'https:'].includes(parsedUrl.protocol) ||
+        !['127.0.0.1', 'localhost'].includes(parsedUrl.hostname) ||
+        Number(parsedUrl.port) !== lsPort
+      ) {
+        callback({});
+        return;
+      }
+      if (/(?:\/|\.)LanguageServerService\/SetCloudCodeURL$/.test(parsedUrl.pathname)) {
         console.log(`[Proxy Intercept] Blocked SetCloudCodeURL: ${details.url}`);
         callback({ cancel: true });
         return;
       }
-      if (details.url.includes('LanguageServerService/GetAvailableModels')) {
+      if (/(?:\/|\.)LanguageServerService\/GetAvailableModels$/.test(parsedUrl.pathname)) {
         const proxyPort = (require('./proxy').getProxyPort as () => number)();
         if (proxyPort > 0) {
           const redirectTarget = `http://127.0.0.1:${proxyPort}/GetAvailableModels?ls=${encodeURIComponent(details.url)}`;
@@ -159,7 +179,7 @@ app
           return;
         }
       }
-      if (details.url.includes('CloudCode') || details.url.includes('LanguageServerService')) {
+      if (parsedUrl.pathname.includes('CloudCode') || parsedUrl.pathname.includes('LanguageServerService')) {
         console.log(`[Proxy Intercept] Request URL: ${details.url}`);
       }
       callback({});
@@ -173,6 +193,9 @@ app
       version: cl || undefined,
     });
 
+    // A corrupt settings file must not prevent the app from starting: quarantine
+    // it once at boot (strict reads/writes elsewhere still refuse to overwrite it).
+    await storageManager.quarantineCorruptFile();
     // Pre-onboarding: check if we should offer to re-install the IDE.
     // This runs before the LS starts so we can show a standalone wizard.
     if (!HEADLESS) {
@@ -255,13 +278,20 @@ app
 
     // Initial window — opened once after the LS has successfully started.
     if (!HEADLESS) {
+      const currentWindowUrl = () => `${WINDOW_ORIGIN}:${getLsPort() || handle.port}/`;
       setupApplicationMenu(url);
+      const appMenu = Menu.getApplicationMenu?.();
+      const fileSubmenu = appMenu?.items?.find((item) => item.label === 'File')?.submenu;
+      const newWinItem = fileSubmenu?.items?.find((item) => item.label === 'New Window');
+      if (newWinItem) {
+        newWinItem.click = () => createWindow(currentWindowUrl());
+      }
       const mainWindow = createWindow(url);
       if (app.dock) {
         const dockMenu = Menu.buildFromTemplate([
           {
             label: 'New Window',
-            click: () => createWindow(url),
+            click: () => createWindow(currentWindowUrl()),
           },
         ]);
         app.dock.setMenu(dockMenu);
@@ -331,7 +361,7 @@ app.on('before-quit', async (event) => {
     // Destroy all windows to terminate renderers and release keep-alive sockets
     const windows = BrowserWindow.getAllWindows();
     for (const win of windows) {
-      win.destroy();
+      if (!win.isDestroyed()) win.destroy();
     }
     // Close all active connections and kill the language server in parallel
     await Promise.all([
@@ -345,7 +375,10 @@ app.on('before-quit', async (event) => {
   }
   // Show a confirmation dialog before quitting
   event.preventDefault();
-  const win = BrowserWindow.getFocusedWindow() || BrowserWindow.getAllWindows()[0];
+  const focused = BrowserWindow.getFocusedWindow();
+  const win =
+    (focused && !focused.isDestroyed() ? focused : undefined) ||
+    BrowserWindow.getAllWindows().find((w) => !w.isDestroyed());
   const options: Electron.MessageBoxOptions = {
     type: 'question',
     buttons: ['Cancel', 'Quit'],
@@ -356,14 +389,24 @@ app.on('before-quit', async (event) => {
     detail: 'There may be agents or background tasks running.',
   };
   setShowQuitConfirmation(false);
-  if (win) {
-    void dialog.showMessageBox(win, options).then((result) => {
+  if (!win) {
+    // No live window to attach a confirmation dialog; retrigger graceful quit immediately.
+    app.quit();
+    return;
+  }
+  void dialog
+    .showMessageBox(win, options)
+    .then((result) => {
       if (result.response === 1) {
         // Quit - this will retrigger 'before-quit'
         app.quit();
+      } else {
+        setShowQuitConfirmation(true);
       }
+    })
+    .catch(() => {
+      app.quit();
     });
-  }
 });
 
 /**

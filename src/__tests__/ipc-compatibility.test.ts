@@ -18,7 +18,7 @@ type State = { type: string; update?: { version: string } };
 // Execute the production CommonJS modules with an explicit Electron boundary.
 // No app, updater, shell or network operation runs here; model files use isolated temporary homes.
 const compiled = new Map(
-  ['updater', 'ipcHandlers', 'customIpc', 'preload', 'customPreload', 'contextUsagePreload'].map((name) => [
+  ['updater', 'ipcHandlers', 'customIpc', 'customScheme', 'preload', 'customPreload', 'contextUsagePreload'].map((name) => [
     name,
     ts.transpileModule(readFileSync(path.resolve('src', `${name}.ts`), 'utf8'), {
       compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020, esModuleInterop: true },
@@ -58,6 +58,8 @@ function createFixture(customOnly = false) {
   const mkdir = vi.fn();
   const showOpenDialog = vi.fn();
   const showItemInFolder = vi.fn();
+  const openExternal = vi.fn().mockResolvedValue(undefined);
+  const extensionAuthorities = new Map<string, string>();
   let responseStatus = 200;
   const request = vi.fn((_options: unknown, onResponse: (response: unknown) => void) => ({
     setTimeout: vi.fn(),
@@ -72,7 +74,7 @@ function createFixture(customOnly = false) {
     app: { isPackaged: false, getPath: () => homePath },
     BrowserWindow: { getAllWindows: () => [{ webContents: { send } }] },
     dialog: { showOpenDialog },
-    shell: { showItemInFolder },
+    shell: { showItemInFolder, openExternal },
     ipcMain: { handle: (channel: string, handler: Handler) => handlers.set(channel, handler) },
     ipcRenderer: {
       invoke: async (channel: string, ...args: unknown[]) => {
@@ -109,7 +111,7 @@ function createFixture(customOnly = false) {
       encryptString: (value: string) => `encrypted:${value}`,
       decryptString: (value: string) => value.replace(/^encrypted:/, ''),
     },
-    './customScheme': { extensionAuthorities: new Map() },
+    './customScheme': { extensionAuthorities },
     './tray': {},
     './ideInstall/constants': { getIdeInstallPath: () => idePath },
   };
@@ -137,6 +139,8 @@ function createFixture(customOnly = false) {
     stat,
     showOpenDialog,
     showItemInFolder,
+    openExternal,
+    extensionAuthorities,
     idePath,
     send,
     request,
@@ -278,6 +282,13 @@ describe('standalone custom model addon', () => {
       'storage:get-diagnostics',
       'storage:clear-diagnostics',
       'storage:get-chat-context-usage',
+      'storage:get-prompt-sections',
+      'storage:save-prompt-sections',
+      'storage:reset-prompt-sections',
+      'storage:get-model-health',
+      'storage:check-model-health',
+      'storage:get-display-settings',
+      'storage:save-display-settings',
     ]);
     expect(fixture.exposed).toEqual({});
   });
@@ -321,5 +332,129 @@ describe('standalone custom model addon', () => {
         provider: 'openai',
       }),
     ).resolves.toMatchObject({ success: false, error: expect.stringContaining('HTTP(S)') });
+  });
+
+  it('handles thrown non-object primitives safely in customIpc without crashing', async () => {
+    const handlers = new Map<string, Handler>();
+    const tempHome = mkdtempSync(path.join(tmpdir(), 'antigravity-ipc-prim-'));
+    fixtureHomes.push(tempHome);
+    const electron = {
+      app: { getPath: () => tempHome },
+      ipcMain: { handle: (channel: string, handler: Handler) => handlers.set(channel, handler) },
+      shell: { openExternal: vi.fn() },
+    };
+    const customIpc = loadModule('customIpc', {
+      electron,
+      'node:path': path,
+      './cryptoStore': {},
+      './modelManagement': { createModelManager: () => ({}) },
+      './modelActions': {
+        createModelActions: () => ({
+          'storage:save-custom-model': () => {
+            throw 'plain-string-error';
+          },
+          'storage:delete-custom-model': () => {
+            throw null;
+          },
+        }),
+      },
+    });
+    customIpc.registerCustomModelHandlers();
+    await expect(handlers.get('storage:save-custom-model')!({})).resolves.toEqual({
+      success: false,
+      error: 'plain-string-error',
+    });
+    await expect(handlers.get('storage:delete-custom-model')!({})).resolves.toEqual({
+      success: false,
+      error: 'null',
+    });
+  });
+});
+
+describe('IPC and plugin:// custom scheme security hardening', () => {
+  it('validates extensionAuthorities strictly to loopback HTTP URLs and rejects SSRF targets', async () => {
+    const fixture = createFixture();
+    await fixture.invoke('extensions:send-authorities', {
+      ext1: 'http://127.0.0.1:41234',
+      ext2: 'http://localhost:41235/',
+    });
+    expect(fixture.extensionAuthorities.get('ext1')).toBe('http://127.0.0.1:41234');
+    expect(fixture.extensionAuthorities.get('ext2')).toBe('http://localhost:41235');
+
+    for (const bad of [
+      { ext: 'file:///etc/passwd' },
+      { ext: 'https://127.0.0.1:41234' },
+      { ext: 'http://169.254.169.254:80' },
+      { ext: 'http://evil.example:41234' },
+      { ext: 'http://user:pass@127.0.0.1:41234' },
+      { ext: 'http://127.0.0.1:41234/prefix' },
+      { ext: 'http://127.0.0.1' },
+      { ext: 12345 },
+      null,
+    ]) {
+      await expect(fixture.invoke('extensions:send-authorities', bad)).rejects.toThrow();
+    }
+    // Prior valid entries survive failed updates atomically.
+    expect(fixture.extensionAuthorities.get('ext1')).toBe('http://127.0.0.1:41234');
+  });
+
+  it('guards shell:open-external against non-strings and unsafe protocols', async () => {
+    const fixture = createFixture();
+    await fixture.invoke('shell:open-external', null);
+    await fixture.invoke('shell:open-external', 42);
+    await fixture.invoke('shell:open-external', 'file:///C:/Windows/win.ini');
+    await fixture.invoke('shell:open-external', 'javascript:alert(1)');
+    expect(fixture.openExternal).not.toHaveBeenCalled();
+
+    await fixture.invoke('shell:open-external', 'https://example.com/docs');
+    expect(fixture.openExternal).toHaveBeenCalledWith('https://example.com/docs');
+  });
+
+  it('blocks SSRF, non-loopback authorities, and malformed URLs in plugin:// scheme handler', async () => {
+    let schemeHandler!: (req: Request) => Promise<Response>;
+    const netFetch = vi.fn().mockResolvedValue(new Response('ok', { status: 200 }));
+    const customScheme = loadModule(
+      'customScheme',
+      {
+        electron: {
+          protocol: {
+            registerSchemesAsPrivileged: vi.fn(),
+            handle: (_scheme: string, fn: (req: Request) => Promise<Response>) => {
+              schemeHandler = fn;
+            },
+          },
+          net: { fetch: netFetch },
+        },
+      },
+      { Response, Request },
+    );
+    customScheme.registerCustomSchemeHandlers();
+    const authorities = customScheme.extensionAuthorities as unknown as Map<string, string>;
+
+    // Malformed request URL returns 400
+    const badReq = { url: 'http://[::1', method: 'GET', headers: new Headers(), body: null } as unknown as Request;
+    expect((await schemeHandler(badReq)).status).toBe(400);
+
+    // Non-loopback or file:// authority injected directly into map is rejected with 403
+    authorities.set('evil', 'file:///etc/passwd');
+    expect((await schemeHandler(new Request('plugin://evil/secret'))).status).toBe(403);
+    authorities.set('external', 'http://169.254.169.254:80');
+    expect((await schemeHandler(new Request('plugin://external/latest/meta-data'))).status).toBe(403);
+
+    // Protocol-relative pathname escape is rejected with 403
+    authorities.set('local', 'http://127.0.0.1:41234');
+    const protoRelReq = {
+      url: 'plugin://local//evil.example/steal',
+      method: 'GET',
+      headers: new Headers(),
+      body: null,
+    } as unknown as Request;
+    expect((await schemeHandler(protoRelReq)).status).toBe(403);
+    expect(netFetch).not.toHaveBeenCalled();
+
+    // Valid loopback request succeeds
+    const okRes = await schemeHandler(new Request('plugin://local/index.html?v=1'));
+    expect(okRes.status).toBe(200);
+    expect(netFetch).toHaveBeenCalledWith('http://127.0.0.1:41234/index.html?v=1', expect.any(Object));
   });
 });

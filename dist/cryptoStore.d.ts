@@ -1,9 +1,13 @@
 /** Set before reading credentials when running the owned Node proxy service. */
 export declare function configureCredentialDirectory(directory: string): void;
 /**
- * Creates a backup of the specified file with a .bak extension.
+ * Creates a backup of the specified file with a .bak extension and mode 0o600.
  */
 export declare function backupFile(filePath: string): void;
+/**
+ * Removes a previously created .bak backup file after successful migration.
+ */
+export declare function removeBackupFile(filePath: string): void;
 /**
  * Checks if Electron's safeStorage API is fully functional on the current system.
  */
@@ -24,10 +28,12 @@ interface ModelWithKey {
 }
 /**
  * Iterates through a list of custom models and encrypts their API keys.
+ * Checks ciphertext prefixes so already-encrypted values are never double-encrypted.
  */
 export declare function encryptModels(models: ModelWithKey[] | null): ModelWithKey[];
 /**
  * Iterates through a list of custom models and decrypts their API keys for in-memory use.
+ * Decrypts any value carrying a ciphertext prefix even if the encrypted flag is falsy.
  */
 export declare function decryptModels(models: ModelWithKey[] | null): ModelWithKey[];
 export {};

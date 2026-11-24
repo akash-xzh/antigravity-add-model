@@ -128,4 +128,27 @@ describe('per-model system prompt (issue #36)', () => {
     expect(JSON.stringify(captured[1].messages)).toContain('FALLBACK_PROMPT');
     expect(JSON.stringify(captured[1].messages)).not.toContain('PRIMARY_PROMPT');
   });
+
+  it('retries without stream_options.include_usage even when maxRetries is 0', async () => {
+    const captured: Record<string, unknown>[] = [];
+    const upstream = await serve(async (req, res) => {
+      const body = await readBody(req);
+      captured.push(body);
+      if (body.stream_options) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: { message: 'Unsupported parameter: stream_options.include_usage' } }));
+        return;
+      }
+      res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+      res.end('data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n');
+    });
+    const config = model({ name: 'models/usage-optout-test', apiUrl: upstream, maxRetries: 0 });
+    const proxy = await serve((_req, res) => {
+      void runCustomModelRequest(res, config, request(), true, [config], false);
+    });
+    expect((await fetch(proxy)).status).toBe(200);
+    expect(captured).toHaveLength(2);
+    expect(captured[0].stream_options).toEqual({ include_usage: true });
+    expect(captured[1].stream_options).toBeUndefined();
+  });
 });

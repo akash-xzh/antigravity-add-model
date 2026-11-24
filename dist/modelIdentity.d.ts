@@ -15,7 +15,8 @@ export declare function legacyPlaceholderId(model: IdentityModel): string;
 export declare function placeholderIndex(value: unknown): number | undefined;
 /**
  * Persist enum ownership independently of model ordering, display labels and secrets.
- * Removed models retain their assignment so cached IDE selections never select a different model.
+ * Removed models retain their assignment while free slots remain; if the 651-slot pool
+ * is exhausted, oldest inactive assignments are reclaimed before failing.
  * Native enum reservations survive offline catalog fallback; a newly observed native owner wins.
  */
 export declare function allocateModelIdentities(dataDirectory: string, models: IdentityModel[], upstream?: unknown): ModelIdentity[];

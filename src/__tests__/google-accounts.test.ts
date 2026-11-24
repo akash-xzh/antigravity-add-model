@@ -779,4 +779,89 @@ describe('Google account selection and quota', () => {
     expect(geminiLease.account.id).toBe('multi-b');
     geminiLease.release();
   });
+
+  it('isolates transient persistAccount disk errors without discarding the refreshed token or poisoning the account', async () => {
+    const endpoint = await serve((_req, res) => {
+      res.end(JSON.stringify({ access_token: 'fresh-token', refresh_token: 'rt-2', expires_in: 3600 }));
+    });
+    const persist = vi.fn().mockRejectedValue(new Error('EBUSY: disk busy'));
+    configureGoogleAccountPersistence(persist);
+    const acc: GoogleAccount = {
+      id: 'persist-err',
+      clientId: 'app-id',
+      refreshToken: 'rt-1',
+      accessToken: 'expired-token',
+      expiresAt: 1,
+    };
+    const lease = await acquireGoogleAccount('models/test', [acc], {}, undefined, undefined, undefined, endpoint);
+    expect(lease.account.accessToken).toBe('fresh-token');
+    expect(persist).toHaveBeenCalledOnce();
+    lease.release({ status: 200 });
+    expect(getGooglePoolStatus().find((s) => s.id === 'persist-err')).toMatchObject({
+      status: 'ready',
+      succeeded: 1,
+      failed: 0,
+    });
+  });
+
+  it('attempts one forced refresh on HTTP 401 before marking a refreshable account unauthorized', async () => {
+    let refreshCalls = 0;
+    const endpoint = await serve((_req, res) => {
+      refreshCalls += 1;
+      res.end(JSON.stringify({ access_token: `forced-token-${refreshCalls}`, expires_in: 3600 }));
+    });
+    const acc: GoogleAccount = {
+      id: 'revoked-early',
+      clientId: 'app-id',
+      refreshToken: 'valid-refresh',
+      accessToken: 'early-revoked-access',
+      expiresAt: Date.now() + 3_600_000,
+    };
+    const first = await acquireGoogleAccount('models/test', [acc], {}, undefined, undefined, undefined, endpoint);
+    expect(first.account.accessToken).toBe('early-revoked-access');
+    first.release({ status: 401 });
+    // Still eligible for one forced refresh (not yet locked out).
+    expect(getGooglePoolStatus().find((s) => s.id === 'revoked-early')?.status).toBe('ready');
+
+    const second = await acquireGoogleAccount('models/test', [acc], {}, undefined, undefined, undefined, endpoint);
+    expect(refreshCalls).toBe(1);
+    expect(second.account.accessToken).toBe('forced-token-1');
+    // If the refreshed token still fails 401, NOW lock out the account as unauthorized.
+    second.release({ status: 401 });
+    expect(getGooglePoolStatus().find((s) => s.id === 'revoked-early')?.status).toBe('unauthorized');
+    await expect(
+      acquireGoogleAccount('models/test', [acc], {}, undefined, undefined, undefined, endpoint),
+    ).rejects.toThrow(/eligible/);
+  });
+
+  it('invalidates in-flight refresh promises on resetGoogleAccountState so stale tokens cannot pollute cache', async () => {
+    let releaseFirstRefresh!: () => void;
+    let callCount = 0;
+    const endpoint = await serve((_req, res) => {
+      callCount += 1;
+      if (callCount === 1) {
+        releaseFirstRefresh = () => {
+          res.end(JSON.stringify({ access_token: 'stale-token-from-before-reset', expires_in: 3600 }));
+        };
+      } else {
+        res.end(JSON.stringify({ access_token: 'fresh-token-after-reset', expires_in: 3600 }));
+      }
+    });
+    const acc: GoogleAccount = {
+      id: 'reset-race',
+      clientId: 'app-id',
+      refreshToken: 'rt-1',
+      expiresAt: 1,
+    };
+    const stalePromise = refreshGoogleAccount(acc, endpoint);
+    await vi.waitFor(() => expect(callCount).toBe(1));
+    // User reconnects/resets account state while first refresh is in flight.
+    resetGoogleAccountState('reset-race');
+    releaseFirstRefresh();
+    await stalePromise;
+    // Next refresh must NOT reuse the stale pre-reset token from tokenCache.
+    const fresh = await refreshGoogleAccount(acc, endpoint);
+    expect(callCount).toBe(2);
+    expect(fresh.accessToken).toBe('fresh-token-after-reset');
+  });
 });
