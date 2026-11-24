@@ -198,6 +198,12 @@ window.addEventListener('DOMContentLoaded', () => {
       #agy-custom-models-section .agy-menu-list .agy-danger{color:#fca5a5}
       .agy-row[data-enabled="false"] .agy-row-info,.agy-row[data-enabled="false"] .agy-row-actions>.agy-btn{opacity:.6}
       .agy-effort-chip{display:inline-block;padding:0 5px;border-radius:4px;background:#27272c;color:#a1a1aa;font-size:10px;line-height:15px;white-space:nowrap}
+      .agy-effort-tabs{display:inline-flex;align-items:center;gap:3px;flex-shrink:0;flex-wrap:wrap}
+      .agy-effort-tab{appearance:none;padding:1px 6px;border-radius:4px;border:1px solid #32323a;background:#26262c;color:#a1a1aa;font-size:10px;font-weight:600;line-height:15px;white-space:nowrap;cursor:pointer;transition:background .12s,border-color .12s,color .12s,opacity .12s}
+      .agy-effort-tab:hover{background:#2f2f37;border-color:#52525b;color:#f4f4f5}
+      .agy-effort-tab[aria-pressed="true"]{background:rgba(59,130,246,.18);border-color:#60a5fa;color:#f4f4f5}
+      .agy-effort-tab[data-enabled="false"]{opacity:.45;text-decoration:line-through}
+      .agy-effort-tab[data-enabled="false"][aria-pressed="true"]{opacity:.75}
       .agy-sticky-bar{position:sticky;top:0;z-index:6;display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:0 0 8px;padding:8px 0;background:#18181b;border-bottom:1px solid #303036}
       .agy-sticky-bar .agy-field{margin:0;flex:1 1 220px}
       .agy-chip{appearance:none;font:inherit;font-size:11px;color:#a1a1aa;background:#202024;border:1px solid #303036;border-radius:9999px;padding:3px 9px;cursor:pointer;white-space:nowrap}
@@ -1147,6 +1153,8 @@ window.addEventListener('DOMContentLoaded', () => {
         restoreScroll();
     }
     let rowMenuDismissInstalled = false;
+    const selectedEffortByKey = new Map();
+    const EFFORT_ORDER = { minimal: 0, low: 1, medium: 2, high: 3, xhigh: 4, extra: 5 };
     function shouldSkipBackgroundRefresh(target) {
         if (!target.isConnected)
             return true;
@@ -1298,114 +1306,202 @@ window.addEventListener('DOMContentLoaded', () => {
                     continue;
                 }
                 const modelsList = element('div', 'agy-models');
+                const slots = [];
+                const effortSlots = new Map();
                 for (const model of modelsInGroup) {
                     const rawName = model.displayName || model.name;
                     const cleanName = rawName.replace(/^⭐\s*/u, '').replace(/^[🟢🔴⚪🟡⭐\s•·|-]+(?:\[[^\]]+\]\s*)?[•·|-]?\s*/u, '').trim();
-                    const health = healthMap ? healthMap[model.name] : undefined;
-                    const isRecent = Boolean(model.isRecent);
-                    const starPrefix = isRecent && showStatusEmoji ? '⭐ ' : '';
-                    const statusDot = !showStatusEmoji
-                        ? ''
-                        : health?.status === 'slow'
-                            ? '🟡 '
-                            : health?.status === 'cooldown'
-                                ? '🟡 '
-                                : !health || health.status === 'healthy'
-                                    ? '🟢 '
-                                    : '🔴 ';
-                    const latencyText = health?.latencyMs !== undefined ? ` · ${health.latencyMs}ms` : '';
-                    const statusNotice = health?.status === 'slow'
-                        ? ' · Slow'
-                        : health?.status === 'cooldown'
-                            ? ' · Cooldown (429)'
-                            : health?.error
-                                ? ` · [${health.error}]`
-                                : '';
-                    const row = element('div', 'agy-row');
-                    row.dataset.modelName = model.name;
-                    row.dataset.enabled = String(model.enabled !== false);
-                    const info = element('div', 'agy-row-info');
                     const effort = /\((minimal|low|medium|high|xhigh|extra)\)\s*$/i.exec(cleanName)?.[1];
                     const shortName = effort ? cleanName.slice(0, cleanName.length - effort.length - 2).trim() : cleanName;
-                    const titleEl = element('strong', '', `${starPrefix}${statusDot}${shortName}`);
-                    titleEl.title = health
-                        ? health.status === 'healthy'
-                            ? `Healthy${latencyText} · Checked ${new Date(health.checkedAt).toLocaleTimeString()}`
-                            : health.status === 'slow'
-                                ? `Slow response (${health.latencyMs}ms) · Checked ${new Date(health.checkedAt).toLocaleTimeString()}`
-                                : health.status === 'cooldown'
-                                    ? `Cooldown / Rate Limit (429) · Checked ${new Date(health.checkedAt).toLocaleTimeString()}`
-                                    : `Unhealthy: ${health.error || 'Failed'} · Checked ${new Date(health.checkedAt).toLocaleTimeString()}`
-                        : 'Status unknown';
-                    const title = element('div', 'agy-row-title');
-                    title.append(titleEl, ...(effort ? [element('span', 'agy-effort-chip', effort.toUpperCase())] : []));
-                    info.append(title, element('div', 'agy-muted agy-row-meta', `${model.externalModelName || ''}${latencyText}${statusNotice}${isRecent ? ' · Recent' : ''}`));
-                    if (model.nativePickerAvailable === false)
-                        info.append(element('div', 'agy-muted agy-row-meta', typeof model.nativePickerError === 'string' ? model.nativePickerError :
-                            'Not currently available in the native model picker. Direct API access remains available.'));
-                    const rowStatus = statusNode();
-                    info.append(rowStatus);
-                    const actions = element('div', 'agy-row-actions');
-                    const menuList = element('div', 'agy-menu-list');
-                    menuList.append(button('Check', async () => {
-                        setStatus(rowStatus, 'Checking…');
-                        try {
-                            const checkRes = await storageAPI.checkModelHealth(model.name);
-                            const mHealth = checkRes[model.name];
-                            if (mHealth?.status === 'healthy') {
-                                setStatus(rowStatus, `🟢 Healthy (${mHealth.latencyMs || 0}ms)`);
-                            }
-                            else {
-                                setStatus(rowStatus, `🔴 Unhealthy (${mHealth?.error || 'Failed'})`, true);
-                            }
-                            void renderCustomModelsList();
+                    const parsed = { model, cleanName, shortName, effort };
+                    if (effort) {
+                        const slotKey = `${shortName.toLowerCase()}\0${(model.externalModelName || '').toLowerCase()}\0${(model.apiUrl || '').toLowerCase()}`;
+                        const existingSlot = effortSlots.get(slotKey);
+                        if (existingSlot && !existingSlot.variants.some((v) => v.effort?.toLowerCase() === effort.toLowerCase())) {
+                            existingSlot.variants.push(parsed);
+                            continue;
                         }
-                        catch (e) {
-                            setStatus(rowStatus, e?.message || 'Check failed', true);
+                        if (!existingSlot) {
+                            const created = { key: slotKey, shortName, variants: [parsed] };
+                            effortSlots.set(slotKey, created);
+                            slots.push(created);
+                            continue;
                         }
-                    }, rowStatus), button('Test', async () => {
-                        setStatus(rowStatus, 'Testing…');
-                        const result = requireSuccess(await storageAPI.testModelConnection(model));
-                        setStatus(rowStatus, result.message || 'Connection successful.');
-                    }, rowStatus), button('Test generation', () => openGenerationTest(model), rowStatus), button('Edit', () => openModelModal(model, 'edit'), rowStatus), button('Duplicate', () => openModelModal(model, 'duplicate'), rowStatus), ...(model.supportsThinking === false
-                        ? []
-                        : [
-                            button('Effort variants', () => {
-                                const { body, status, close } = openModal('Create reasoning variants');
-                                body.append(element('p', 'agy-muted', 'Creates three copies with low, medium and high reasoning effort. The provider must support reasoning. For Google and Anthropic formats the thinking budgets are 1,024 / 4,096 / 8,192 tokens; output limits increase if needed to fit the budget. Existing models and credentials are preserved.'));
-                                body.append(button('Create three variants', async () => {
-                                    requireSuccess(await electron_1.ipcRenderer.invoke('storage:create-effort-variants', model.name));
-                                    close();
+                    }
+                    slots.push({ key: model.name, shortName, variants: [parsed] });
+                }
+                for (const slot of slots) {
+                    if (slot.variants.length > 1) {
+                        slot.variants.sort((a, b) => (EFFORT_ORDER[(a.effort || '').toLowerCase()] ?? 99) -
+                            (EFFORT_ORDER[(b.effort || '').toLowerCase()] ?? 99));
+                    }
+                    const isGrouped = slot.variants.length > 1;
+                    const pickInitialVariant = () => {
+                        if (!isGrouped)
+                            return slot.variants[0];
+                        const savedName = selectedEffortByKey.get(slot.key);
+                        return (slot.variants.find((v) => v.model.name === savedName) ||
+                            slot.variants.find((v) => v.effort?.toLowerCase() === 'medium' && v.model.enabled !== false) ||
+                            slot.variants.find((v) => v.model.enabled !== false) ||
+                            slot.variants[0]);
+                    };
+                    const row = element('div', 'agy-row');
+                    const renderSlotRow = (active) => {
+                        const { model, shortName, effort } = active;
+                        if (isGrouped)
+                            selectedEffortByKey.set(slot.key, model.name);
+                        const health = healthMap ? healthMap[model.name] : undefined;
+                        const isRecent = isGrouped
+                            ? slot.variants.some((v) => Boolean(v.model.isRecent))
+                            : Boolean(model.isRecent);
+                        const starPrefix = isRecent && showStatusEmoji ? '⭐ ' : '';
+                        const statusDot = !showStatusEmoji
+                            ? ''
+                            : health?.status === 'slow'
+                                ? '🟡 '
+                                : health?.status === 'cooldown'
+                                    ? '🟡 '
+                                    : !health || health.status === 'healthy'
+                                        ? '🟢 '
+                                        : '🔴 ';
+                        const latencyText = health?.latencyMs !== undefined ? ` · ${health.latencyMs}ms` : '';
+                        const statusNotice = health?.status === 'slow'
+                            ? ' · Slow'
+                            : health?.status === 'cooldown'
+                                ? ' · Cooldown (429)'
+                                : health?.error
+                                    ? ` · [${health.error}]`
+                                    : '';
+                        const enabledVariantsCount = slot.variants.filter((v) => v.model.enabled !== false).length;
+                        const allDisabled = enabledVariantsCount === 0;
+                        row.dataset.modelName = model.name;
+                        row.dataset.enabled = String(isGrouped ? !allDisabled : model.enabled !== false);
+                        const info = element('div', 'agy-row-info');
+                        const titleEl = element('strong', '', `${starPrefix}${statusDot}${shortName}`);
+                        titleEl.title = health
+                            ? health.status === 'healthy'
+                                ? `Healthy${latencyText} · Checked ${new Date(health.checkedAt).toLocaleTimeString()}`
+                                : health.status === 'slow'
+                                    ? `Slow response (${health.latencyMs}ms) · Checked ${new Date(health.checkedAt).toLocaleTimeString()}`
+                                    : health.status === 'cooldown'
+                                        ? `Cooldown / Rate Limit (429) · Checked ${new Date(health.checkedAt).toLocaleTimeString()}`
+                                        : `Unhealthy: ${health.error || 'Failed'} · Checked ${new Date(health.checkedAt).toLocaleTimeString()}`
+                            : 'Status unknown';
+                        const title = element('div', 'agy-row-title');
+                        title.append(titleEl);
+                        if (isGrouped) {
+                            const tabs = element('div', 'agy-effort-tabs');
+                            tabs.setAttribute('role', 'group');
+                            tabs.setAttribute('aria-label', `Reasoning effort variants for ${shortName}`);
+                            for (const variant of slot.variants) {
+                                const effLabel = (variant.effort || '').toUpperCase();
+                                const tab = document.createElement('button');
+                                tab.type = 'button';
+                                tab.className = 'agy-effort-tab';
+                                tab.textContent = effLabel;
+                                const isSelected = variant.model.name === model.name;
+                                const isVarEnabled = variant.model.enabled !== false;
+                                tab.setAttribute('aria-pressed', String(isSelected));
+                                tab.dataset.enabled = String(isVarEnabled);
+                                tab.dataset.modelName = variant.model.name;
+                                tab.title = `${shortName} (${variant.effort}) — ${isVarEnabled ? 'Enabled' : 'Disabled'}${isSelected ? ' (selected)' : '. Click to select'}`;
+                                tab.addEventListener('click', () => {
+                                    if (variant.model.name !== model.name)
+                                        renderSlotRow(variant);
+                                });
+                                tabs.append(tab);
+                            }
+                            title.append(tabs);
+                        }
+                        else if (effort) {
+                            title.append(element('span', 'agy-effort-chip', effort.toUpperCase()));
+                        }
+                        const groupCountText = isGrouped ? ` · ${enabledVariantsCount}/${slot.variants.length} enabled` : '';
+                        info.append(title, element('div', 'agy-muted agy-row-meta', `${model.externalModelName || ''}${latencyText}${statusNotice}${isRecent ? ' · Recent' : ''}${groupCountText}`));
+                        if (model.nativePickerAvailable === false)
+                            info.append(element('div', 'agy-muted agy-row-meta', typeof model.nativePickerError === 'string' ? model.nativePickerError :
+                                'Not currently available in the native model picker. Direct API access remains available.'));
+                        const rowStatus = statusNode();
+                        info.append(rowStatus);
+                        const actions = element('div', 'agy-row-actions');
+                        const menuList = element('div', 'agy-menu-list');
+                        menuList.append(button('Check', async () => {
+                            setStatus(rowStatus, 'Checking…');
+                            try {
+                                const checkRes = await storageAPI.checkModelHealth(model.name);
+                                const mHealth = checkRes[model.name];
+                                if (mHealth?.status === 'healthy') {
+                                    setStatus(rowStatus, `🟢 Healthy (${mHealth.latencyMs || 0}ms)`);
+                                }
+                                else {
+                                    setStatus(rowStatus, `🔴 Unhealthy (${mHealth?.error || 'Failed'})`, true);
+                                }
+                                void renderCustomModelsList();
+                            }
+                            catch (e) {
+                                setStatus(rowStatus, e?.message || 'Check failed', true);
+                            }
+                        }, rowStatus), button('Test', async () => {
+                            setStatus(rowStatus, 'Testing…');
+                            const result = requireSuccess(await storageAPI.testModelConnection(model));
+                            setStatus(rowStatus, result.message || 'Connection successful.');
+                        }, rowStatus), button('Test generation', () => openGenerationTest(model), rowStatus), button('Edit', () => openModelModal(model, 'edit'), rowStatus), button('Duplicate', () => openModelModal(model, 'duplicate'), rowStatus), ...(model.supportsThinking === false
+                            ? []
+                            : [
+                                button('Effort variants', () => {
+                                    const { body, status, close } = openModal('Create reasoning variants');
+                                    body.append(element('p', 'agy-muted', 'Creates three copies with low, medium and high reasoning effort. The provider must support reasoning. For Google and Anthropic formats the thinking budgets are 1,024 / 4,096 / 8,192 tokens; output limits increase if needed to fit the budget. Existing models and credentials are preserved.'));
+                                    body.append(button('Create three variants', async () => {
+                                        requireSuccess(await electron_1.ipcRenderer.invoke('storage:create-effort-variants', model.name));
+                                        close();
+                                        await modelsChanged();
+                                    }, status, true));
+                                }, rowStatus),
+                            ]), ...(isGrouped
+                            ? [
+                                button(allDisabled ? 'Enable all efforts' : 'Disable all efforts', async () => {
+                                    const targetEnabled = allDisabled;
+                                    for (const variant of slot.variants) {
+                                        if ((variant.model.enabled !== false) !== targetEnabled) {
+                                            requireSuccess(await storageAPI.saveCustomModel({ ...variant.model, enabled: targetEnabled }));
+                                        }
+                                    }
                                     await modelsChanged();
-                                }, status, true));
-                            }, rowStatus),
-                        ]));
-                    const menu = element('details', 'agy-menu');
-                    const menuSummary = element('summary', 'agy-menu-btn', '⋯');
-                    menuSummary.title = 'More actions';
-                    menuSummary.setAttribute('aria-label', `More actions for ${shortName}`);
-                    const deleteButton = button('Delete', () => openDeleteModelModal(model), rowStatus);
-                    deleteButton.classList.add('agy-danger');
-                    menuList.append(deleteButton);
-                    menu.append(menuSummary, menuList);
-                    // Picking an item closes the menu again; the summary is not a button and stays unaffected.
-                    menu.addEventListener('click', (event) => {
-                        if (event.target.closest('button'))
-                            menu.open = false;
-                    });
-                    menu.addEventListener('toggle', () => {
-                        if (!menu.open)
-                            return;
-                        for (const other of target.querySelectorAll('details.agy-menu[open]')) {
-                            if (other !== menu)
-                                other.open = false;
+                                }, rowStatus),
+                            ]
+                            : []));
+                        const menu = element('details', 'agy-menu');
+                        const menuSummary = element('summary', 'agy-menu-btn', '⋯');
+                        menuSummary.title = isGrouped && effort ? `More actions for ${shortName} (${effort})` : 'More actions';
+                        menuSummary.setAttribute('aria-label', `More actions for ${shortName}${isGrouped && effort ? ` (${effort})` : ''}`);
+                        const deleteButton = button('Delete', () => openDeleteModelModal(model), rowStatus);
+                        deleteButton.classList.add('agy-danger');
+                        menuList.append(deleteButton);
+                        menu.append(menuSummary, menuList);
+                        // Picking an item closes the menu again; the summary is not a button and stays unaffected.
+                        menu.addEventListener('click', (event) => {
+                            if (event.target.closest('button'))
+                                menu.open = false;
+                        });
+                        menu.addEventListener('toggle', () => {
+                            if (!menu.open)
+                                return;
+                            for (const other of target.querySelectorAll('details.agy-menu[open]')) {
+                                if (other !== menu)
+                                    other.open = false;
+                            }
+                        });
+                        const toggleButton = button(model.enabled === false ? 'Enable' : 'Disable', async () => {
+                            requireSuccess(await storageAPI.saveCustomModel({ ...model, enabled: model.enabled === false }));
+                            await modelsChanged();
+                        }, rowStatus);
+                        if (isGrouped && effort) {
+                            toggleButton.title = `${model.enabled === false ? 'Enable' : 'Disable'} ${effort.toUpperCase()} effort`;
                         }
-                    });
-                    actions.append(button(model.enabled === false ? 'Enable' : 'Disable', async () => {
-                        requireSuccess(await storageAPI.saveCustomModel({ ...model, enabled: model.enabled === false }));
-                        await modelsChanged();
-                    }, rowStatus), menu);
-                    row.append(info, actions);
+                        actions.append(toggleButton, menu);
+                        row.replaceChildren(info, actions);
+                    };
+                    renderSlotRow(pickInitialVariant());
                     modelsList.append(row);
                 }
                 group.append(modelsList);
