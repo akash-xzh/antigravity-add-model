@@ -201,8 +201,9 @@ window.addEventListener('DOMContentLoaded', () => {
       .agy-models[data-layout="linear"] .agy-row:only-child,.agy-models[data-layout="split"] .agy-row:only-child,.agy-models[data-layout="accordion"] .agy-row:only-child{border-radius:9px}
       .agy-models[data-layout="linear"] .agy-row:hover,.agy-models[data-layout="split"] .agy-row:hover,.agy-models[data-layout="accordion"] .agy-row:hover{background:rgba(255,255,255,.03)}
       .agy-models[data-layout="split"] .agy-row{flex-direction:column;align-items:stretch;gap:5px}
+      .agy-models[data-layout="split"] .agy-row-info,.agy-models[data-layout="accordion"] .agy-row-info,.agy-models[data-layout="grid"] .agy-row-info{flex:0 0 auto;overflow:visible}
       .agy-split-top,.agy-split-bot{display:flex;align-items:center;justify-content:space-between;gap:8px;min-width:0}
-      .agy-split-bot{padding-left:13px}
+      .agy-split-bot{padding-left:0}
       .agy-models[data-layout="grid"]{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}
       .agy-models[data-layout="grid"] .agy-row{flex-direction:column;align-items:stretch;justify-content:space-between;gap:8px;padding:9px 10px;border:1px solid #2b2b32;border-radius:10px;background:#1c1c20;transition:border-color .14s ease,background .14s ease}
       .agy-models[data-layout="grid"] .agy-row:hover{border-color:#3f3f47;background:#202026}
@@ -1486,12 +1487,6 @@ window.addEventListener('DOMContentLoaded', () => {
                         const meta = element('div', 'agy-muted agy-row-meta');
                         if (model.externalModelName)
                             meta.append(element('span', 'agy-row-slug', model.externalModelName));
-                        if (latencyText || statusLabel) {
-                            if (meta.childNodes.length)
-                                meta.append(document.createTextNode(' · '));
-                            const statusSpan = element('span', statusClass, [latencyText, statusLabel].filter(Boolean).join(' '));
-                            meta.append(statusSpan);
-                        }
                         if (isRecent) {
                             if (meta.childNodes.length)
                                 meta.append(document.createTextNode(' · '));
@@ -1629,7 +1624,7 @@ window.addEventListener('DOMContentLoaded', () => {
                         if (layoutMode === 'split') {
                             const splitTop = element('div', 'agy-split-top');
                             const splitTitle = element('div', 'agy-row-title');
-                            splitTitle.append(dotEl, titleEl);
+                            splitTitle.append(titleEl);
                             actions.append(toggleButton, menu);
                             splitTop.append(splitTitle, actions);
                             const splitBot = element('div', 'agy-split-bot');
@@ -1644,7 +1639,7 @@ window.addEventListener('DOMContentLoaded', () => {
                         else if (layoutMode === 'grid') {
                             const gridTop = element('div', 'agy-grid-top');
                             const gridTitle = element('div', 'agy-row-title');
-                            gridTitle.append(dotEl, titleEl);
+                            gridTitle.append(titleEl);
                             gridTop.append(gridTitle, menu);
                             const gridFoot = element('div', 'agy-grid-foot');
                             actions.append(toggleButton);
@@ -1662,17 +1657,14 @@ window.addEventListener('DOMContentLoaded', () => {
                             const head = element('div', 'agy-acc-head');
                             const left = element('div', 'agy-row-title');
                             const chev = element('span', 'agy-acc-chev', isGrouped ? '▸' : '');
-                            left.append(chev, dotEl, titleEl);
+                            left.append(chev, titleEl);
                             if (isGrouped) {
                                 left.append(element('span', 'agy-acc-count', `${enabledVariantsCount}/${slot.variants.length}`));
                             }
                             else if (effort) {
                                 left.append(element('span', 'agy-effort-chip', formatEffortLabel(effort)));
                             }
-                            const rightMeta = latencyText || statusLabel
-                                ? element('span', `agy-muted ${statusClass}`, [latencyText, statusLabel].filter(Boolean).join(' '))
-                                : null;
-                            actions.append(...(rightMeta ? [rightMeta] : []), ...(isGrouped ? [] : [toggleButton]), menu);
+                            actions.append(...(isGrouped ? [] : [toggleButton]), menu);
                             actions.addEventListener('click', (e) => e.stopPropagation());
                             head.append(left, actions);
                             if (isGrouped) {
@@ -1691,17 +1683,11 @@ window.addEventListener('DOMContentLoaded', () => {
                                 const accInner = element('div', 'agy-acc-inner');
                                 const accList = element('div', 'agy-acc-list');
                                 for (const variant of slot.variants) {
-                                    const vHealth = healthMap ? healthMap[variant.model.name] : undefined;
-                                    const vLat = vHealth?.latencyMs !== undefined
-                                        ? vHealth.latencyMs >= 1000
-                                            ? `${(vHealth.latencyMs / 1000).toFixed(1)}s`
-                                            : `${vHealth.latencyMs}ms`
-                                        : vHealth?.error || '';
                                     const item = element('div', 'agy-acc-item');
                                     item.dataset.enabled = String(variant.model.enabled !== false);
                                     const itemLeft = element('div');
                                     itemLeft.style.cssText = 'display:flex;align-items:center;gap:8px;min-width:0';
-                                    itemLeft.append(element('span', 'agy-acc-item-name', formatEffortLabel(variant.effort || '')), ...(vLat ? [element('span', 'agy-row-slug', vLat)] : []));
+                                    itemLeft.append(element('span', 'agy-acc-item-name', formatEffortLabel(variant.effort || '')), ...(variant.model.externalModelName ? [element('span', 'agy-row-slug', variant.model.externalModelName)] : []));
                                     const itemRight = element('div');
                                     itemRight.style.cssText = 'display:flex;align-items:center;gap:6px;flex-shrink:0';
                                     const editBtn = document.createElement('button');
@@ -1726,9 +1712,9 @@ window.addEventListener('DOMContentLoaded', () => {
                             row.replaceChildren(info);
                         }
                         else {
-                            // Default: 'linear' — clean divided row with dot + title + slug + segmented effort + switch + menu
+                            // Default: 'linear' — clean divided row with title + slug + segmented effort + switch + menu
                             const linTitle = element('div', 'agy-row-title');
-                            linTitle.append(dotEl, titleEl);
+                            linTitle.append(titleEl);
                             info.replaceChildren(linTitle, meta);
                             if (model.nativePickerAvailable === false)
                                 info.append(element('div', 'agy-muted agy-row-meta', typeof model.nativePickerError === 'string' ? model.nativePickerError :
