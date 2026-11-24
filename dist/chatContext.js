@@ -378,12 +378,12 @@ async function getContextInformation(payload, dataDirectory, models) {
             }
         }
         else if (result.actualTokens) {
-            // Timing-only native entry: ensure we do not divide Turn 2's decodeMs into Turn 1's outputTokens
-            // when transcript.jsonl has not yet flushed Turn 2.
-            // A timing record newer than the transcript's last usage belongs to a turn
-            // that has not been annotated yet: its decodeMs must not be divided by the
-            // previous turn's output tokens. No arbitrary time tolerance.
-            const staleForTranscriptTurn = snapshot.lastUsageAt !== undefined && recorded.updatedAt > snapshot.lastUsageAt;
+            // Timing-only native entry: `entry.created_at` is the step start time (always earlier
+            // than stream-end `recorded.updatedAt`), while `snapshot.mtimeMs` records when the
+            // language server flushed the finished turn. Allow a 2s flush grace so native t/s shows
+            // reliably while still rejecting genuinely stale Turn 1 transcripts.
+            const transcriptFlushedAt = Math.max(snapshot.lastUsageAt ?? 0, snapshot.mtimeMs);
+            const staleForTranscriptTurn = transcriptFlushedAt > 0 && recorded.updatedAt > transcriptFlushedAt + 2000;
             if (!staleForTranscriptTurn) {
                 const speed = (0, conversationUsage_1.tokensPerSecond)(result.actualOutputTokens, recorded.decodeMs);
                 if (speed !== undefined)

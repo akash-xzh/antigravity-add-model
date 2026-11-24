@@ -14,9 +14,13 @@ window.addEventListener('DOMContentLoaded', () => {
     style.textContent =
         '[data-agy-context-toolbar]:has(> [data-agy-context-ring]){display:inline-flex!important;align-items:center;gap:4px;max-width:100%}' +
             '[data-agy-context-toolbar]>[data-testid="model-selector-trigger"]{min-width:0;flex:0 1 auto}' +
-            '[data-agy-context-ring]{display:inline-flex;align-items:center;gap:5px;flex:none;height:24px;padding:0 6px;border-radius:6px;border:1px solid transparent;background:transparent;color:var(--muted-foreground,inherit);font-size:11px;line-height:1;font-variant-numeric:tabular-nums;cursor:pointer;white-space:nowrap;outline:none;transition:background .12s,color .12s}' +
-            '[data-agy-context-ring]:hover,[data-agy-context-ring]:focus-visible{background:var(--secondary,color-mix(in srgb,currentColor 9%,transparent));color:var(--foreground,inherit)}' +
+            '[data-agy-context-ring]{display:inline-flex;align-items:center;gap:5px;flex:none;height:22px;padding:0 8px 0 5px;border-radius:9999px;border:1px solid var(--border,color-mix(in srgb,currentColor 18%,transparent));background:color-mix(in srgb,currentColor 4%,transparent);color:var(--muted-foreground,inherit);font-size:11px;line-height:1;font-variant-numeric:tabular-nums;cursor:pointer;white-space:nowrap;outline:none;transition:background .12s,border-color .12s,color .12s,box-shadow .2s}' +
+            '[data-agy-context-ring]:hover,[data-agy-context-ring]:focus-visible{background:var(--secondary,color-mix(in srgb,currentColor 9%,transparent));border-color:color-mix(in srgb,currentColor 28%,transparent);color:var(--foreground,inherit)}' +
+            '[data-agy-context-ring][data-agy-compacted="1"]{border-color:#34d399;box-shadow:0 0 0 2px rgba(52,211,153,.22)}' +
             '[data-agy-context-ring] svg{flex-shrink:0}' +
+            '.agy-compact-toast{position:fixed;right:18px;bottom:18px;z-index:9999999;max-width:300px;padding:10px 13px;border-radius:10px;background:var(--popover,var(--card,#18181b));border:1px solid color-mix(in srgb,#34d399 45%,var(--border,rgba(128,128,128,.25)));box-shadow:0 12px 32px rgba(0,0,0,.45);color:var(--popover-foreground,var(--foreground,#e4e4e7));font:12px/1.4 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;cursor:pointer;display:flex;flex-direction:column;gap:2px}' +
+            '.agy-compact-toast-title{font-weight:600;font-size:12px;color:#34d399;display:flex;align-items:center;gap:6px}' +
+            '.agy-compact-toast-sub{font-size:11px;color:var(--muted-foreground,#a1a1aa);font-variant-numeric:tabular-nums}' +
             '.agy-ctx-popover{position:fixed;z-index:9999999;width:288px;padding:12px 14px;border-radius:10px;background:var(--popover,var(--card,#18181b));border:1px solid var(--border,rgba(128,128,128,.22));box-shadow:0 12px 32px rgba(0,0,0,.45);color:var(--popover-foreground,var(--foreground,#e4e4e7));font:12px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;pointer-events:none}' +
             '.agy-ctx-pop-head{display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:10px;font-weight:600;color:var(--foreground,#fafafa)}' +
             '.agy-ctx-pop-badge{font-size:10px;font-weight:500;padding:2px 7px;border-radius:9999px;background:var(--secondary,color-mix(in srgb,currentColor 10%,transparent));color:var(--muted-foreground,#a1a1aa);flex-shrink:0}' +
@@ -120,6 +124,72 @@ window.addEventListener('DOMContentLoaded', () => {
     }
     let activePopover;
     let activePopoverState;
+    let activeToast;
+    let toastTimer;
+    const seenCompactions = new Map();
+    const playCompactChime = () => {
+        try {
+            const AudioCtx = window.AudioContext || window.webkitAudioContext;
+            if (!AudioCtx)
+                return;
+            const ctx = new AudioCtx();
+            const now = ctx.currentTime;
+            const tone = (freq, start, dur) => {
+                const osc = ctx.createOscillator();
+                const gain = ctx.createGain();
+                osc.type = 'sine';
+                osc.frequency.setValueAtTime(freq, start);
+                gain.gain.setValueAtTime(0.0001, start);
+                gain.gain.exponentialRampToValueAtTime(0.055, start + 0.02);
+                gain.gain.exponentialRampToValueAtTime(0.0001, start + dur);
+                osc.connect(gain);
+                gain.connect(ctx.destination);
+                osc.start(start);
+                osc.stop(start + dur);
+            };
+            tone(587.33, now, 0.14); // D5
+            tone(880.0, now + 0.11, 0.22); // A5
+            setTimeout(() => { void ctx.close().catch(() => { }); }, 500);
+        }
+        catch {
+            /* Audio playback unavailable or blocked */
+        }
+    };
+    const showCompactToast = (compactions, beforeTokens, afterTokens, ring) => {
+        if (toastTimer)
+            clearTimeout(toastTimer);
+        activeToast?.remove();
+        const toast = document.createElement('div');
+        toast.className = 'agy-compact-toast';
+        toast.setAttribute('role', 'status');
+        toast.setAttribute('aria-live', 'polite');
+        const detail = typeof beforeTokens === 'number' && typeof afterTokens === 'number' && beforeTokens > afterTokens
+            ? `Context freed: ${formatCompactTokens(beforeTokens)} → ${formatCompactTokens(afterTokens)} tokens`
+            : 'Earlier messages were summarized to free context space.';
+        toast.innerHTML =
+            `<div class="agy-compact-toast-title"><span>●</span><span>Context compacted (#${compactions})</span></div>` +
+                `<div class="agy-compact-toast-sub">${detail}</div>`;
+        toast.addEventListener('click', () => {
+            toast.remove();
+            if (activeToast === toast)
+                activeToast = undefined;
+        });
+        document.body.append(toast);
+        activeToast = toast;
+        toastTimer = setTimeout(() => {
+            toast.remove();
+            if (activeToast === toast)
+                activeToast = undefined;
+        }, 6000);
+        if (ring && ring.isConnected) {
+            ring.dataset.agyCompacted = '1';
+            setTimeout(() => {
+                if (ring.isConnected)
+                    delete ring.dataset.agyCompacted;
+            }, 2500);
+        }
+        playCompactChime();
+    };
     const formatCompactTokens = (value) => {
         if (value >= 1000000)
             return `${(value / 1000000).toFixed(1)}M`;
@@ -332,6 +402,14 @@ window.addEventListener('DOMContentLoaded', () => {
                 const cached = limits.get(requested.modelName);
                 if (cached && Date.now() < cached.expires)
                     Object.assign(usage, { maxTokens: cached.maxTokens, limitSource: cached.limitSource });
+            }
+            if (usage.conversationId && typeof usage.compactions === 'number') {
+                const currentCount = usage.actualTokens ?? usage.currentTokens;
+                const prev = seenCompactions.get(usage.conversationId);
+                if (prev && usage.compactions > prev.count) {
+                    showCompactToast(usage.compactions, prev.tokens, currentCount, state.ring);
+                }
+                seenCompactions.set(usage.conversationId, { count: usage.compactions, tokens: currentCount });
             }
             state.usage = usage;
             render(state);
