@@ -143,7 +143,19 @@ window.addEventListener('DOMContentLoaded', () => {
   let listPollTimer: ReturnType<typeof setInterval> | undefined;
   let searchTerm = '';
   type ModelFilter = 'all' | 'enabled' | 'disabled' | 'unhealthy';
+  type ModelLayout = 'linear' | 'split' | 'accordion' | 'grid';
+  const LAYOUT_STORAGE_KEY = 'agy-model-layout';
+  const loadSavedLayout = (): ModelLayout => {
+    try {
+      const saved = window.localStorage?.getItem(LAYOUT_STORAGE_KEY);
+      if (saved === 'linear' || saved === 'split' || saved === 'accordion' || saved === 'grid') return saved;
+    } catch {}
+    return 'linear';
+  };
   let filterMode: ModelFilter = 'all';
+  let layoutMode: ModelLayout = loadSavedLayout();
+  let animateNextLayout = false;
+  const expandedAccordions = new Set<string>();
   const collapsedGroups = new Set<string>();
   let cancelModalOperation: (() => void) | undefined;
   const requireSuccess = (result: ActionResult): ActionResult => {
@@ -304,7 +316,54 @@ window.addEventListener('DOMContentLoaded', () => {
       .agy-group-heading{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:8px;padding:2px 0;flex-wrap:nowrap}
       .agy-group-heading .agy-actions{margin:0;justify-content:flex-end}
       #agy-custom-models-section .agy-group-heading .agy-disclosure{padding:0;width:23px;height:23px;justify-content:center;background:transparent;border-color:#3f3f46}
-      .agy-models{display:flex;flex-direction:column;gap:4px;margin-top:8px}
+      @keyframes agyLayoutFade{from{opacity:0;transform:translateY(3px)}to{opacity:1;transform:none}}
+      .agy-sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
+      .agy-models{display:flex;flex-direction:column;gap:4px;margin-top:8px;transition:opacity .16s ease}
+      .agy-models.agy-layout-anim{animation:agyLayoutFade .18s cubic-bezier(.22,1,.36,1)}
+      .agy-models[data-layout="linear"],.agy-models[data-layout="split"],.agy-models[data-layout="accordion"]{gap:0;border:1px solid #2b2b32;border-radius:10px;background:#1c1c20}
+      .agy-models[data-layout="linear"] .agy-row,.agy-models[data-layout="split"] .agy-row,.agy-models[data-layout="accordion"] .agy-row{border:0;border-bottom:1px solid #26262c;border-radius:0;background:transparent;padding:7px 11px;transition:background .14s ease}
+      .agy-models[data-layout="linear"] .agy-row:first-child,.agy-models[data-layout="split"] .agy-row:first-child,.agy-models[data-layout="accordion"] .agy-row:first-child{border-radius:9px 9px 0 0}
+      .agy-models[data-layout="linear"] .agy-row:last-child,.agy-models[data-layout="split"] .agy-row:last-child,.agy-models[data-layout="accordion"] .agy-row:last-child{border-bottom:0;border-radius:0 0 9px 9px}
+      .agy-models[data-layout="linear"] .agy-row:only-child,.agy-models[data-layout="split"] .agy-row:only-child,.agy-models[data-layout="accordion"] .agy-row:only-child{border-radius:9px}
+      .agy-models[data-layout="linear"] .agy-row:hover,.agy-models[data-layout="split"] .agy-row:hover,.agy-models[data-layout="accordion"] .agy-row:hover{background:rgba(255,255,255,.03)}
+      .agy-models[data-layout="split"] .agy-row{flex-direction:column;align-items:stretch;gap:5px}
+      .agy-split-top,.agy-split-bot{display:flex;align-items:center;justify-content:space-between;gap:8px;min-width:0}
+      .agy-split-bot{padding-left:13px}
+      .agy-models[data-layout="grid"]{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}
+      .agy-models[data-layout="grid"] .agy-row{flex-direction:column;align-items:stretch;justify-content:space-between;gap:8px;padding:9px 10px;border:1px solid #2b2b32;border-radius:10px;background:#1c1c20;transition:border-color .14s ease,background .14s ease}
+      .agy-models[data-layout="grid"] .agy-row:hover{border-color:#3f3f47;background:#202026}
+      .agy-grid-top{display:flex;align-items:center;justify-content:space-between;gap:6px;min-width:0}
+      .agy-grid-foot{display:flex;align-items:center;justify-content:space-between;gap:6px;padding-top:6px;border-top:1px solid #26262c}
+      .agy-models[data-layout="accordion"] .agy-row{flex-direction:column;align-items:stretch;gap:0;padding:0}
+      .agy-acc-head{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:7px 11px;cursor:pointer;user-select:none;min-width:0}
+      .agy-acc-chev{display:inline-flex;align-items:center;justify-content:center;width:14px;font-size:10px;color:#8e8e98;transition:transform .18s cubic-bezier(.22,1,.36,1);flex-shrink:0}
+      .agy-row[data-expanded="true"] .agy-acc-chev{transform:rotate(90deg);color:#e4e4e7}
+      .agy-acc-body{display:grid;grid-template-rows:0fr;opacity:0;transition:grid-template-rows .2s cubic-bezier(.22,1,.36,1),opacity .18s ease}
+      .agy-row[data-expanded="true"] .agy-acc-body{grid-template-rows:1fr;opacity:1}
+      .agy-acc-inner{overflow:hidden}
+      .agy-acc-list{background:#151519;border-top:1px solid #26262c;padding:4px 11px 4px 30px;display:flex;flex-direction:column}
+      .agy-acc-item{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:5px 0;border-bottom:1px solid rgba(255,255,255,.04);font-size:11.5px}
+      .agy-acc-item:last-child{border-bottom:0}
+      .agy-acc-item-name{font-weight:500;min-width:44px;color:#e4e4e7}
+      .agy-acc-item[data-enabled="false"] .agy-acc-item-name{opacity:.45;text-decoration:line-through}
+      .agy-acc-link{appearance:none;border:0;background:transparent;color:#8e8e98;font-size:11px;padding:2px 5px;border-radius:4px;cursor:pointer;transition:color .12s,background .12s}
+      .agy-acc-link:hover{color:#fafafa;background:rgba(255,255,255,.06)}
+      .agy-acc-count{font-size:10.5px;padding:1px 6px;border-radius:5px;background:#26262c;color:#a1a1aa;white-space:nowrap;flex-shrink:0}
+      .agy-status-dot{width:6px;height:6px;border-radius:9999px;flex-shrink:0;display:inline-block}
+      .agy-status-dot[data-s="ok"]{background:#34d399}
+      .agy-status-dot[data-s="warn"]{background:#fbbf24}
+      .agy-status-dot[data-s="err"]{background:#f87171}
+      .agy-status-dot[data-s="idle"]{background:#52525b}
+      #agy-custom-models-section .agy-switch{position:relative;display:inline-flex;align-items:center;width:30px;height:17px;padding:0;border-radius:9999px;border:1px solid transparent;background:#3a3a42;cursor:pointer;flex-shrink:0;transition:background .18s cubic-bezier(.22,1,.36,1),border-color .18s ease}
+      #agy-custom-models-section .agy-switch[aria-checked="true"]{background:#22c55e}
+      #agy-custom-models-section .agy-switch:hover{filter:brightness(1.08)}
+      .agy-switch-dot{width:13px;height:13px;border-radius:9999px;background:#fff;box-shadow:0 1px 2px rgba(0,0,0,.4);transform:translateX(1px);transition:transform .18s cubic-bezier(.22,1,.36,1);pointer-events:none}
+      #agy-custom-models-section .agy-switch[aria-checked="true"] .agy-switch-dot{transform:translateX(14px)}
+      .agy-layout-switcher{display:inline-flex;align-items:center;gap:2px;padding:2px;border-radius:7px;background:#141417;border:1px solid #2b2b33;margin-left:auto;flex-shrink:0}
+      .agy-layout-btn{appearance:none;border:0;background:transparent;color:#8e8e98;font:inherit;font-size:11px;font-weight:500;padding:3px 7px;border-radius:5px;cursor:pointer;white-space:nowrap;transition:background .14s ease,color .14s ease}
+      .agy-layout-btn:hover{color:#e4e4e7}
+      .agy-layout-btn[aria-pressed="true"]{background:#2c2c34;color:#fafafa;font-weight:600;box-shadow:0 1px 2px rgba(0,0,0,.35)}
+      @media(max-width:520px){.agy-models[data-layout="grid"]{grid-template-columns:1fr}}
       .agy-row{display:flex;flex-wrap:wrap;align-items:center;gap:5px 10px;border:1px solid #2b2b31;border-radius:8px;padding:6px 9px 6px 11px;margin-top:0;background:#202024;min-width:0;font-size:12px}
       .agy-row:hover{background:#242429;border-color:#3f3f46}
       .agy-row .agy-btn{padding:3px 8px;font-size:11px;border-radius:6px}
@@ -1413,6 +1472,7 @@ window.addEventListener('DOMContentLoaded', () => {
         showStatusEmoji,
         searchTerm,
         filterMode,
+        layoutMode,
         collapsed: Array.from(collapsedGroups).sort(),
       });
       if (background && snapshot === lastRenderedSnapshot) return;
@@ -1547,7 +1607,8 @@ window.addEventListener('DOMContentLoaded', () => {
           content.append(group);
           continue;
         }
-        const modelsList = element('div', 'agy-models');
+        const modelsList = element('div', animateNextLayout ? 'agy-models agy-layout-anim' : 'agy-models');
+        modelsList.dataset.layout = layoutMode;
         const formatEffortLabel = (eff: string): string => {
           const lower = eff.toLowerCase();
           if (lower === 'xhigh') return 'XHigh';
@@ -1668,33 +1729,6 @@ window.addEventListener('DOMContentLoaded', () => {
                 ? `Cooldown / Rate Limit (429) · Checked ${new Date(health.checkedAt).toLocaleTimeString()}`
                 : `Unhealthy: ${health.error || 'Failed'} · Checked ${new Date(health.checkedAt).toLocaleTimeString()}`
               : 'Status unknown';
-            const title = element('div', 'agy-row-title');
-            title.append(titleEl);
-            if (isGrouped) {
-              const tabs = element('div', 'agy-effort-tabs');
-              tabs.setAttribute('role', 'group');
-              tabs.setAttribute('aria-label', `Reasoning effort variants for ${shortName}`);
-              for (const variant of slot.variants) {
-                const effLabel = formatEffortLabel(variant.effort || '');
-                const tab = document.createElement('button');
-                tab.type = 'button';
-                tab.className = 'agy-effort-tab';
-                tab.textContent = effLabel;
-                const isSelected = variant.model.name === model.name;
-                const isVarEnabled = variant.model.enabled !== false;
-                tab.setAttribute('aria-pressed', String(isSelected));
-                tab.dataset.enabled = String(isVarEnabled);
-                tab.dataset.modelName = variant.model.name;
-                tab.title = `${shortName} (${variant.effort}) — ${isVarEnabled ? 'Enabled' : 'Disabled'}${isSelected ? ' (selected)' : '. Click to select'}`;
-                tab.addEventListener('click', () => {
-                  if (variant.model.name !== model.name) renderSlotRow(variant);
-                });
-                tabs.append(tab);
-              }
-              title.append(tabs);
-            } else if (effort) {
-              title.append(element('span', 'agy-effort-chip', formatEffortLabel(effort)));
-            }
             const meta = element('div', 'agy-muted agy-row-meta');
             if (model.externalModelName) meta.append(element('span', 'agy-row-slug', model.externalModelName));
             if (latencyText || statusLabel) {
@@ -1710,10 +1744,6 @@ window.addEventListener('DOMContentLoaded', () => {
               if (meta.childNodes.length) meta.append(document.createTextNode(' · '));
               meta.append(document.createTextNode(`${enabledVariantsCount}/${slot.variants.length} on`));
             }
-            info.append(title, meta);
-            if (model.nativePickerAvailable === false) info.append(element('div', 'agy-muted agy-row-meta',
-              typeof model.nativePickerError === 'string' ? model.nativePickerError :
-                'Not currently available in the native model picker. Direct API access remains available.'));
             const rowStatus = statusNode();
             info.append(rowStatus);
             const actions = element('div', 'agy-row-actions');
@@ -1816,19 +1846,180 @@ window.addEventListener('DOMContentLoaded', () => {
                 if (other !== menu) other.open = false;
               }
             });
-            const toggleButton = button(
-              model.enabled === false ? 'Enable' : 'Disable',
-              async () => {
-                requireSuccess(await storageAPI.saveCustomModel({ ...model, enabled: model.enabled === false }));
-                await modelsChanged();
-              },
-              rowStatus,
-            );
-            if (isGrouped && effort) {
-              toggleButton.title = `${model.enabled === false ? 'Enable' : 'Disable'} ${effort.toUpperCase()} effort`;
+            const makeSwitch = (
+              targetModel: CustomModelEntry,
+              statusTarget: HTMLElement,
+              labelSuffix?: string,
+            ): HTMLButtonElement => {
+              const isOn = targetModel.enabled !== false;
+              const btn = button(
+                isOn ? 'Disable' : 'Enable',
+                async () => {
+                  // Optimistically animate the switch thumb immediately before IPC settles.
+                  btn.setAttribute('aria-checked', String(!isOn));
+                  requireSuccess(await storageAPI.saveCustomModel({ ...targetModel, enabled: !isOn }));
+                  await modelsChanged();
+                },
+                statusTarget,
+              );
+              btn.classList.add('agy-switch');
+              btn.setAttribute('role', 'switch');
+              btn.setAttribute('aria-checked', String(isOn));
+              const srText = element('span', 'agy-sr-only', isOn ? 'Disable' : 'Enable');
+              const dot = element('span', 'agy-switch-dot');
+              btn.replaceChildren(srText, dot);
+              btn.title = `${isOn ? 'Disable' : 'Enable'}${labelSuffix ? ` ${labelSuffix}` : ''}`;
+              return btn;
+            };
+
+            const dotState =
+              health?.status === 'healthy'
+                ? 'ok'
+                : health?.status === 'slow' || health?.status === 'cooldown'
+                  ? 'warn'
+                  : health?.error
+                    ? 'err'
+                    : 'idle';
+            const dotEl = element('span', 'agy-status-dot');
+            dotEl.dataset.s = dotState;
+
+            const buildEffortTabs = (): HTMLElement | null => {
+              if (!isGrouped) return effort ? element('span', 'agy-effort-chip', formatEffortLabel(effort)) : null;
+              const tabs = element('div', 'agy-effort-tabs');
+              tabs.setAttribute('role', 'group');
+              tabs.setAttribute('aria-label', `Reasoning effort variants for ${shortName}`);
+              for (const variant of slot.variants) {
+                const effLabel = formatEffortLabel(variant.effort || '');
+                const tab = document.createElement('button');
+                tab.type = 'button';
+                tab.className = 'agy-effort-tab';
+                tab.textContent = effLabel;
+                const isSelected = variant.model.name === model.name;
+                const isVarEnabled = variant.model.enabled !== false;
+                tab.setAttribute('aria-pressed', String(isSelected));
+                tab.dataset.enabled = String(isVarEnabled);
+                tab.dataset.modelName = variant.model.name;
+                tab.title = `${shortName} (${variant.effort}) — ${isVarEnabled ? 'Enabled' : 'Disabled'}${isSelected ? ' (selected)' : '. Click to select'}`;
+                tab.addEventListener('click', () => {
+                  if (variant.model.name !== model.name) renderSlotRow(variant);
+                });
+                tabs.append(tab);
+              }
+              return tabs;
+            };
+
+            const toggleButton = makeSwitch(model, rowStatus, isGrouped && effort ? effort.toUpperCase() : undefined);
+            const effortControl = buildEffortTabs();
+
+            if (layoutMode === 'split') {
+              const splitTop = element('div', 'agy-split-top');
+              const splitTitle = element('div', 'agy-row-title');
+              splitTitle.append(dotEl, titleEl);
+              actions.append(toggleButton, menu);
+              splitTop.append(splitTitle, actions);
+              const splitBot = element('div', 'agy-split-bot');
+              splitBot.append(meta, ...(effortControl ? [effortControl] : []));
+              info.replaceChildren(splitTop, splitBot);
+              if (model.nativePickerAvailable === false) info.append(element('div', 'agy-muted agy-row-meta',
+                typeof model.nativePickerError === 'string' ? model.nativePickerError :
+                  'Not currently available in the native model picker. Direct API access remains available.'));
+              info.append(rowStatus);
+              row.replaceChildren(info);
+            } else if (layoutMode === 'grid') {
+              const gridTop = element('div', 'agy-grid-top');
+              const gridTitle = element('div', 'agy-row-title');
+              gridTitle.append(dotEl, titleEl);
+              gridTop.append(gridTitle, menu);
+              const gridFoot = element('div', 'agy-grid-foot');
+              actions.append(toggleButton);
+              gridFoot.append(effortControl || element('span', 'agy-muted', 'Default'), actions);
+              info.replaceChildren(gridTop, meta);
+              if (model.nativePickerAvailable === false) info.append(element('div', 'agy-muted agy-row-meta',
+                typeof model.nativePickerError === 'string' ? model.nativePickerError :
+                  'Not currently available in the native model picker. Direct API access remains available.'));
+              info.append(rowStatus);
+              row.replaceChildren(info, gridFoot);
+            } else if (layoutMode === 'accordion') {
+              const isExpanded = isGrouped && expandedAccordions.has(slot.key);
+              row.dataset.expanded = String(isExpanded);
+              const head = element('div', 'agy-acc-head');
+              const left = element('div', 'agy-row-title');
+              const chev = element('span', 'agy-acc-chev', isGrouped ? '▸' : '');
+              left.append(chev, dotEl, titleEl);
+              if (isGrouped) {
+                left.append(element('span', 'agy-acc-count', `${enabledVariantsCount}/${slot.variants.length}`));
+              } else if (effort) {
+                left.append(element('span', 'agy-effort-chip', formatEffortLabel(effort)));
+              }
+              const rightMeta = latencyText || statusLabel
+                ? element('span', `agy-muted ${statusClass}`, [latencyText, statusLabel].filter(Boolean).join(' '))
+                : null;
+              actions.append(...(rightMeta ? [rightMeta] : []), ...(isGrouped ? [] : [toggleButton]), menu);
+              actions.addEventListener('click', (e) => e.stopPropagation());
+              head.append(left, actions);
+              if (isGrouped) {
+                head.addEventListener('click', () => {
+                  const next = !expandedAccordions.has(slot.key);
+                  if (next) expandedAccordions.add(slot.key);
+                  else expandedAccordions.delete(slot.key);
+                  row.dataset.expanded = String(next);
+                });
+              }
+              const children: HTMLElement[] = [head];
+              if (isGrouped) {
+                const accBody = element('div', 'agy-acc-body');
+                const accInner = element('div', 'agy-acc-inner');
+                const accList = element('div', 'agy-acc-list');
+                for (const variant of slot.variants) {
+                  const vHealth = healthMap ? healthMap[variant.model.name] : undefined;
+                  const vLat =
+                    vHealth?.latencyMs !== undefined
+                      ? vHealth.latencyMs >= 1000
+                        ? `${(vHealth.latencyMs / 1000).toFixed(1)}s`
+                        : `${vHealth.latencyMs}ms`
+                      : vHealth?.error || '';
+                  const item = element('div', 'agy-acc-item');
+                  item.dataset.enabled = String(variant.model.enabled !== false);
+                  const itemLeft = element('div');
+                  itemLeft.style.cssText = 'display:flex;align-items:center;gap:8px;min-width:0';
+                  itemLeft.append(
+                    element('span', 'agy-acc-item-name', formatEffortLabel(variant.effort || '')),
+                    ...(vLat ? [element('span', 'agy-row-slug', vLat)] : []),
+                  );
+                  const itemRight = element('div');
+                  itemRight.style.cssText = 'display:flex;align-items:center;gap:6px;flex-shrink:0';
+                  const editBtn = document.createElement('button');
+                  editBtn.type = 'button';
+                  editBtn.className = 'agy-acc-link';
+                  editBtn.textContent = 'Edit';
+                  editBtn.addEventListener('click', () => openModelModal(variant.model, 'edit'));
+                  const testBtn = document.createElement('button');
+                  testBtn.type = 'button';
+                  testBtn.className = 'agy-acc-link';
+                  testBtn.textContent = 'Test';
+                  testBtn.addEventListener('click', () => openGenerationTest(variant.model));
+                  itemRight.append(editBtn, testBtn, makeSwitch(variant.model, rowStatus, variant.effort));
+                  item.append(itemLeft, itemRight);
+                  accList.append(item);
+                }
+                accInner.append(accList);
+                accBody.append(accInner);
+                children.push(accBody);
+              }
+              info.replaceChildren(...children, rowStatus);
+              row.replaceChildren(info);
+            } else {
+              // Default: 'linear' — clean divided row with dot + title + slug + segmented effort + switch + menu
+              const linTitle = element('div', 'agy-row-title');
+              linTitle.append(dotEl, titleEl);
+              info.replaceChildren(linTitle, meta);
+              if (model.nativePickerAvailable === false) info.append(element('div', 'agy-muted agy-row-meta',
+                typeof model.nativePickerError === 'string' ? model.nativePickerError :
+                  'Not currently available in the native model picker. Direct API access remains available.'));
+              info.append(rowStatus);
+              actions.append(...(effortControl ? [effortControl] : []), toggleButton, menu);
+              row.replaceChildren(info, actions);
             }
-            actions.append(toggleButton, menu);
-            row.replaceChildren(info, actions);
           };
 
           renderSlotRow(pickInitialVariant());
@@ -1837,6 +2028,7 @@ window.addEventListener('DOMContentLoaded', () => {
         group.append(modelsList);
         content.append(group);
       }
+      animateNextLayout = false;
       target.replaceChildren(content);
       lastRenderedSnapshot = snapshot;
       restoreScroll();
@@ -3073,7 +3265,35 @@ window.addEventListener('DOMContentLoaded', () => {
       chipButtons.set(mode, chip);
       chips.append(chip);
     }
-    bar.append(chips);
+    const layoutBar = element('div', 'agy-layout-switcher');
+    layoutBar.setAttribute('role', 'group');
+    layoutBar.setAttribute('aria-label', 'Model list layout');
+    const layouts: Array<[ModelLayout, string, string]> = [
+      ['linear', 'List', 'Linear list'],
+      ['split', 'Split', '2-line split'],
+      ['accordion', 'Fold', 'Accordion rows'],
+      ['grid', 'Grid', '2-column grid'],
+    ];
+    const layoutButtons = new Map<ModelLayout, HTMLButtonElement>();
+    for (const [mode, label, tip] of layouts) {
+      const btn = element('button', 'agy-layout-btn', label);
+      btn.type = 'button';
+      btn.title = tip;
+      btn.setAttribute('aria-pressed', String(layoutMode === mode));
+      btn.addEventListener('click', () => {
+        if (layoutMode === mode) return;
+        layoutMode = mode;
+        try {
+          window.localStorage?.setItem(LAYOUT_STORAGE_KEY, mode);
+        } catch {}
+        for (const [key, node] of layoutButtons) node.setAttribute('aria-pressed', String(key === mode));
+        animateNextLayout = true;
+        void renderCustomModelsList();
+      });
+      layoutButtons.set(mode, btn);
+      layoutBar.append(btn);
+    }
+    bar.append(chips, layoutBar);
     const content = element('div');
     content.id = 'agy-custom-models-content';
     const fleet = element('div', 'agy-fleet');
