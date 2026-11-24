@@ -210,10 +210,10 @@ describe('reactive context ring', () => {
     f.ring().dispatchEvent(new f.dom.window.Event('pointerenter'));
     const pop = f.dom.window.document.querySelector('.agy-ctx-popover');
     expect(pop?.textContent).toContain('94,466 / 200,000 (47.2%)');
-    expect(pop?.textContent).toContain('Before compact (80%)');
-    expect(pop?.textContent).toContain('65,534 left · ~6 turns');
-    expect(pop?.textContent).toContain('System prompt, tools & images90.4K');
-    expect(pop?.textContent).toContain('90.4K cached (96% hit)');
+    expect(pop?.textContent).toContain('Auto-compact (80%)');
+    expect(pop?.textContent).toContain('65.5K left · ~6 turns');
+    expect(pop?.textContent).toContain('Tools, files & system90.4K');
+    expect(pop?.textContent).toContain('90.4K cached (96%)');
     expect(pop?.textContent).toContain('1.3M in · 41.3K out');
     expect(pop?.textContent).not.toContain('Real provider usage');
     f.ring().dispatchEvent(new f.dom.window.Event('pointerleave'));
@@ -230,8 +230,8 @@ describe('reactive context ring', () => {
     await settle();
     f.ring().dispatchEvent(new f.dom.window.Event('pointerenter'));
     const pop = f.dom.window.document.querySelector('.agy-ctx-popover');
-    expect(pop?.textContent).toContain('Before compactIDE default · ~50K new tokens');
-    expect(pop?.textContent).not.toContain('Before compact (');
+    expect(pop?.textContent).toContain('Auto-compactAutomatic (Antigravity)');
+    expect(pop?.textContent).not.toContain('Auto-compact (');
     f.ring().dispatchEvent(new f.dom.window.Event('pointerleave'));
   });
 
@@ -257,7 +257,7 @@ describe('reactive context ring', () => {
     expect(f.ring().title).toContain('last generation 48 t/s (first token 1.20s)');
     f.ring().dispatchEvent(new f.dom.window.Event('pointerenter'));
     const pop = f.dom.window.document.querySelector('.agy-ctx-popover');
-    expect(pop?.textContent).toContain('Last generation48 t/s · 1.20s first token');
+    expect(pop?.textContent).toContain('Speed48 t/s · 1.20s TTFT');
     f.ring().dispatchEvent(new f.dom.window.Event('pointerleave'));
     expect(f.dom.window.document.querySelector('.agy-ctx-popover')).toBeNull();
   });

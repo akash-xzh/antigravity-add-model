@@ -14,17 +14,19 @@ window.addEventListener('DOMContentLoaded', () => {
     style.textContent =
         '[data-agy-context-toolbar]:has(> [data-agy-context-ring]){display:inline-flex!important;align-items:center;gap:4px;max-width:100%}' +
             '[data-agy-context-toolbar]>[data-testid="model-selector-trigger"]{min-width:0;flex:0 1 auto}' +
-            '[data-agy-context-ring]{display:inline-flex;align-items:center;gap:5px;flex:none;height:22px;padding:0 8px 0 5px;border-radius:9999px;border:1px solid rgba(255,255,255,.12);background:rgba(255,255,255,.04);color:inherit;font-size:11px;line-height:1;font-variant-numeric:tabular-nums;cursor:pointer;white-space:nowrap;transition:background .12s,border-color .12s}' +
-            '[data-agy-context-ring]:hover{background:rgba(255,255,255,.09);border-color:rgba(255,255,255,.22)}' +
-            '.agy-ctx-popover{position:fixed;z-index:9999999;width:276px;padding:10px 12px;border-radius:10px;background:#18181b;border:1px solid rgba(255,255,255,.14);box-shadow:0 14px 36px rgba(0,0,0,.6);color:#e4e4e7;font:12px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;pointer-events:none}' +
-            '.agy-ctx-pop-head{display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:8px;font-weight:600;color:#fafafa}' +
-            '.agy-ctx-pop-badge{font-size:10px;font-weight:500;padding:1px 6px;border-radius:9999px;background:#27272c;color:#a1a1aa;flex-shrink:0}' +
-            '.agy-ctx-pop-bar{position:relative;height:6px;border-radius:9999px;background:rgba(255,255,255,.1);overflow:hidden;margin:6px 0}' +
+            '[data-agy-context-ring]{display:inline-flex;align-items:center;gap:5px;flex:none;height:24px;padding:0 6px;border-radius:6px;border:1px solid transparent;background:transparent;color:var(--muted-foreground,inherit);font-size:11px;line-height:1;font-variant-numeric:tabular-nums;cursor:pointer;white-space:nowrap;outline:none;transition:background .12s,color .12s}' +
+            '[data-agy-context-ring]:hover,[data-agy-context-ring]:focus-visible{background:var(--secondary,color-mix(in srgb,currentColor 9%,transparent));color:var(--foreground,inherit)}' +
+            '[data-agy-context-ring] svg{flex-shrink:0}' +
+            '.agy-ctx-popover{position:fixed;z-index:9999999;width:288px;padding:12px 14px;border-radius:10px;background:var(--popover,var(--card,#18181b));border:1px solid var(--border,rgba(128,128,128,.22));box-shadow:0 12px 32px rgba(0,0,0,.45);color:var(--popover-foreground,var(--foreground,#e4e4e7));font:12px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;pointer-events:none}' +
+            '.agy-ctx-pop-head{display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:10px;font-weight:600;color:var(--foreground,#fafafa)}' +
+            '.agy-ctx-pop-badge{font-size:10px;font-weight:500;padding:2px 7px;border-radius:9999px;background:var(--secondary,color-mix(in srgb,currentColor 10%,transparent));color:var(--muted-foreground,#a1a1aa);flex-shrink:0}' +
+            '.agy-ctx-pop-bar{position:relative;height:6px;border-radius:9999px;background:color-mix(in srgb,currentColor 12%,transparent);overflow:hidden;margin:6px 0 8px}' +
             '.agy-ctx-pop-fill{height:100%;border-radius:9999px;transition:width .15s}' +
-            '.agy-ctx-pop-row{display:flex;justify-content:space-between;gap:8px;font-size:11px;color:#d4d4d8;margin-top:4px}' +
-            '.agy-ctx-pop-row span:first-child{color:#a1a1aa}' +
-            '.agy-ctx-pop-section{margin-top:8px;padding-top:6px;border-top:1px solid rgba(255,255,255,.08)}' +
-            '.agy-ctx-pop-muted{font-size:10px;color:#a1a1aa;margin-top:7px;line-height:1.35}';
+            '.agy-ctx-pop-row{display:flex;justify-content:space-between;align-items:baseline;gap:10px;font-size:11.5px;color:var(--foreground,#e4e4e7);margin-top:4px;font-variant-numeric:tabular-nums}' +
+            '.agy-ctx-pop-row span:first-child{color:var(--muted-foreground,#9ca3af);flex-shrink:0}' +
+            '.agy-ctx-pop-row span:last-child{text-align:right}' +
+            '.agy-ctx-pop-section{margin-top:9px;padding-top:7px;border-top:1px solid var(--border,color-mix(in srgb,currentColor 10%,transparent))}' +
+            '.agy-ctx-pop-muted{font-size:10.5px;color:var(--muted-foreground,#9ca3af);margin-top:8px;line-height:1.35}';
     document.head.append(style);
     const limits = new Map();
     let stopped = false;
@@ -165,52 +167,53 @@ window.addEventListener('DOMContentLoaded', () => {
         const pop = reuse ? activePopover : document.createElement('div');
         if (!reuse)
             pop.className = 'agy-ctx-popover';
-        const badge = actual ? 'Actual' : known ? 'Estimate' : 'Unavailable';
+        const badge = actual ? 'Live' : known ? 'Estimate' : 'Unavailable';
         const usageLine = known
             ? limit
                 ? `${actual ? '' : '~'}${num(count)} / ${num(limit)} (${pct}%)`
                 : `${actual ? '' : '~'}${num(count)} tokens`
             : 'Unavailable';
-        const overhead = typeof usage?.overheadTokens === 'number'
-            ? `<div class="agy-ctx-pop-row"><span>System prompt, tools &amp; images</span><span>${cnum(usage.overheadTokens)}</span></div>`
-            : '';
         const visibleLine = actual && typeof usage?.currentTokens === 'number'
-            ? `<div class="agy-ctx-pop-row"><span>Visible conversation</span><span>~${cnum(usage.currentTokens)}</span></div>`
+            ? `<div class="agy-ctx-pop-row"><span>Chat messages</span><span>~${cnum(usage.currentTokens)}</span></div>`
+            : '';
+        const overhead = typeof usage?.overheadTokens === 'number'
+            ? `<div class="agy-ctx-pop-row"><span>Tools, files &amp; system</span><span>${cnum(usage.overheadTokens)}</span></div>`
             : '';
         const compactLine = typeof untilCompact === 'number'
             ? untilCompact > 0
-                ? `<div class="agy-ctx-pop-row"><span>Before compact (${compactPct ?? 80}%)</span><span style="color:${accent};font-weight:600">${num(untilCompact)} left${typeof usage?.turnsUntilCompaction === 'number' ? ` · ~${usage.turnsUntilCompaction} turns` : ''}</span></div>`
-                : `<div class="agy-ctx-pop-row"><span>Before compact (${compactPct ?? 80}%)</span><span style="color:#f87171;font-weight:600">Threshold reached</span></div>`
+                ? `<div class="agy-ctx-pop-row"><span>Auto-compact (${compactPct ?? 80}%)</span><span style="color:${accent};font-weight:600">${cnum(untilCompact)} left${typeof usage?.turnsUntilCompaction === 'number' ? ` · ~${usage.turnsUntilCompaction} turns` : ''}</span></div>`
+                : `<div class="agy-ctx-pop-row"><span>Auto-compact (${compactPct ?? 80}%)</span><span style="color:#f87171;font-weight:600">Ready on next turn</span></div>`
             : usage?.compactionSource === 'ide'
-                ? `<div class="agy-ctx-pop-row"><span>Before compact</span><span>IDE default · ~50K new tokens</span></div>`
+                ? `<div class="agy-ctx-pop-row"><span>Auto-compact</span><span>Automatic (Antigravity)</span></div>`
                 : '';
         const cachedPct = actual && typeof usage?.actualCachedTokens === 'number' && count > 0
             ? Math.round((usage.actualCachedTokens / count) * 100)
             : undefined;
-        const lastTurnLine = actual
-            ? `<div class="agy-ctx-pop-section"></div>` +
-                `<div class="agy-ctx-pop-row"><span>Last prompt</span><span>${cnum(usage?.actualInputTokens)} new · ${cnum(usage?.actualCachedTokens)} cached${cachedPct === undefined ? '' : ` (${cachedPct}% hit)`}</span></div>` +
-                `<div class="agy-ctx-pop-row"><span>Last output</span><span>${cnum(usage?.actualOutputTokens)}</span></div>`
-            : '';
         const speed = formatSpeed(usage?.tokensPerSecond);
         const generationLine = speed
-            ? `<div class="agy-ctx-pop-row"><span>Last generation</span><span>${speed}${typeof usage?.ttftMs === 'number' ? ` · ${formatLatency(usage.ttftMs)} first token` : ''}</span></div>`
+            ? `<div class="agy-ctx-pop-row"><span>Speed</span><span>${speed}${typeof usage?.ttftMs === 'number' ? ` · ${formatLatency(usage.ttftMs)} TTFT` : ''}</span></div>`
             : '';
+        const lastTurnLine = actual
+            ? `<div class="agy-ctx-pop-section"></div>` +
+                generationLine +
+                `<div class="agy-ctx-pop-row"><span>Prompt cache</span><span>${cnum(usage?.actualInputTokens)} new · ${cnum(usage?.actualCachedTokens)} cached${cachedPct === undefined ? '' : ` (${cachedPct}%)`}</span></div>` +
+                `<div class="agy-ctx-pop-row"><span>Last reply</span><span>${cnum(usage?.actualOutputTokens)}</span></div>`
+            : generationLine;
         const sessionLine = actual && (typeof usage?.sessionInputTokens === 'number' || typeof usage?.sessionOutputTokens === 'number')
             ? `<div class="agy-ctx-pop-section"></div>` +
-                `<div class="agy-ctx-pop-row"><span>Burned this session</span><span>${cnum((usage?.sessionInputTokens ?? 0) + (usage?.sessionCachedTokens ?? 0))} in · ${cnum(usage?.sessionOutputTokens)} out</span></div>` +
-                `<div class="agy-ctx-pop-row"><span>Turns · compactions</span><span>${num(usage?.turns)} · ${num(usage?.compactions ?? 0)}</span></div>`
+                `<div class="agy-ctx-pop-row"><span>Session total</span><span>${cnum((usage?.sessionInputTokens ?? 0) + (usage?.sessionCachedTokens ?? 0))} in · ${cnum(usage?.sessionOutputTokens)} out</span></div>` +
+                `<div class="agy-ctx-pop-row"><span>Turns · Compactions</span><span>${num(usage?.turns)} · ${num(usage?.compactions ?? 0)}</span></div>`
             : '';
+        const footerNote = `${!target.conversationId ? 'Open conversation could not be identified. ' : ''}${!limit ? 'Click to look up model limit.' : ''}`.trim();
         pop.innerHTML =
             `<div class="agy-ctx-pop-head"><span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escapeHtml(target.modelName)}</span><span class="agy-ctx-pop-badge">${badge}</span></div>` +
-                `<div class="agy-ctx-pop-row"><span>Context used</span><span>${usageLine}</span></div>` +
+                `<div class="agy-ctx-pop-row"><span>Context window</span><span>${usageLine}</span></div>` +
                 (limit ? `<div class="agy-ctx-pop-bar"><div class="agy-ctx-pop-fill" style="width:${(fraction * 100).toFixed(1)}%;background:${accent}"></div></div>` : '') +
                 compactLine +
-                (actual ? overhead + visibleLine : '') +
-                generationLine +
+                (actual ? visibleLine + overhead : '') +
                 lastTurnLine +
                 sessionLine +
-                `<div class="agy-ctx-pop-muted">${!target.conversationId ? 'Open conversation could not be identified. ' : ''}${!limit ? 'Click pill to look up limit in public catalog.' : ''}</div>`;
+                (footerNote ? `<div class="agy-ctx-pop-muted">${footerNote}</div>` : '');
         if (!reuse)
             document.body.append(pop);
         activePopover = pop;
@@ -271,8 +274,8 @@ window.addEventListener('DOMContentLoaded', () => {
         const pillLabel = known
             ? `${actual ? '' : '~'}${formatCompactTokens(count)}${limit ? ` / ${formatCompactTokens(limit)}` : ''}${speed ? ` · ${speed}` : ''}`
             : '?';
-        const html = `<svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true">` +
-            `<circle cx="8" cy="8" r="6" fill="none" stroke="currentColor" opacity=".2" stroke-width="2"/>` +
+        const html = `<svg width="14" height="14" viewBox="0 0 16 16" aria-hidden="true">` +
+            `<circle cx="8" cy="8" r="6" fill="none" stroke="currentColor" opacity=".22" stroke-width="2"/>` +
             `<circle cx="8" cy="8" r="6" fill="none" stroke="${strokeColor}" stroke-width="2" stroke-linecap="round" transform="rotate(-90 8 8)" stroke-dasharray="${circ}" stroke-dashoffset="${(circ * (1 - fraction)).toFixed(2)}"/>` +
             `</svg><span>${pillLabel}</span>`;
         if (ring.innerHTML !== html)
