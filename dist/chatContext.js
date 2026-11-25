@@ -120,6 +120,10 @@ async function readChatContextSnapshot(conversationId, dataDirectory) {
         const cached = transcriptCache.get(filename);
         if (cached?.stamp === stamp)
             return { ...cached.snapshot, result: { ...cached.snapshot.result } };
+        // If transcript.jsonl shrunk (e.g. Antigravity "Undo to this point"), discard any
+        // in-memory pre-undo usage recorded for the reverted turns so the pill drops immediately.
+        if (cached && stat.size < cached.size)
+            (0, conversationUsage_1.clearConversationUsage)(id);
         const pending = pendingTranscripts.get(filename);
         if (pending) {
             const resolved = await pending;
@@ -246,7 +250,7 @@ async function readChatContextSnapshot(conversationId, dataDirectory) {
             const snapshot = { result, mtimeMs: stat.mtimeMs, lastCheckpointAt, lastUsageAt };
             if (transcriptCache.size >= 100)
                 transcriptCache.delete(transcriptCache.keys().next().value);
-            transcriptCache.set(filename, { stamp, snapshot });
+            transcriptCache.set(filename, { stamp, size: stat.size, snapshot });
             return { ...snapshot, result: { ...result } };
         };
         const promise = read();

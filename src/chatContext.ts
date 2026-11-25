@@ -2,7 +2,7 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as readline from 'node:readline';
-import { getConversationUsage, tokensPerSecond } from './proxy/conversationUsage';
+import { clearConversationUsage, getConversationUsage, tokensPerSecond } from './proxy/conversationUsage';
 import { findNativeLimit } from './proxy/nativeLimits';
 import {
   DEFAULT_COMPACTION_THRESHOLD_PERCENT,
@@ -73,7 +73,7 @@ interface TranscriptSnapshot {
   lastCheckpointAt?: number;
   lastUsageAt?: number;
 }
-const transcriptCache = new Map<string, { stamp: string; snapshot: TranscriptSnapshot }>();
+const transcriptCache = new Map<string, { stamp: string; size: number; snapshot: TranscriptSnapshot }>();
 const pendingTranscripts = new Map<string, Promise<TranscriptSnapshot>>();
 const validLimit = (value: unknown): value is number =>
   typeof value === 'number' && Number.isSafeInteger(value) && value > 0;
@@ -145,6 +145,9 @@ async function readChatContextSnapshot(
     const stamp = `${stat.mtimeMs}:${stat.ctimeMs}:${stat.size}`;
     const cached = transcriptCache.get(filename);
     if (cached?.stamp === stamp) return { ...cached.snapshot, result: { ...cached.snapshot.result } };
+    // If transcript.jsonl shrunk (e.g. Antigravity "Undo to this point"), discard any
+    // in-memory pre-undo usage recorded for the reverted turns so the pill drops immediately.
+    if (cached && stat.size < cached.size) clearConversationUsage(id);
     const pending = pendingTranscripts.get(filename);
     if (pending) {
       const resolved = await pending;
@@ -258,7 +261,7 @@ async function readChatContextSnapshot(
       }
       const snapshot: TranscriptSnapshot = { result, mtimeMs: stat.mtimeMs, lastCheckpointAt, lastUsageAt };
       if (transcriptCache.size >= 100) transcriptCache.delete(transcriptCache.keys().next().value!);
-      transcriptCache.set(filename, { stamp, snapshot });
+      transcriptCache.set(filename, { stamp, size: stat.size, snapshot });
       return { ...snapshot, result: { ...result } };
     };
     const promise = read();

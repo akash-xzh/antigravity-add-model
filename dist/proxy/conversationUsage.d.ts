@@ -37,4 +37,6 @@ export declare function recordConversationTiming(conversationId: unknown, value:
     decodeMs?: number;
 }): void;
 export declare function getConversationUsage(conversationId: unknown): RecordedConversationUsage | undefined;
+/** Clear cached per-conversation usage/timing (e.g. when Undo truncates transcript.jsonl). */
+export declare function clearConversationUsage(conversationId: unknown): void;
 //# sourceMappingURL=conversationUsage.d.ts.map

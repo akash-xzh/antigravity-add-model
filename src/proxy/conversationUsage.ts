@@ -91,3 +91,9 @@ export function getConversationUsage(conversationId: unknown): RecordedConversat
   if (typeof conversationId !== 'string') return undefined;
   return usage.get(conversationId);
 }
+
+/** Clear cached per-conversation usage/timing (e.g. when Undo truncates transcript.jsonl). */
+export function clearConversationUsage(conversationId: unknown): void {
+  if (typeof conversationId !== 'string') return;
+  usage.delete(conversationId);
+}

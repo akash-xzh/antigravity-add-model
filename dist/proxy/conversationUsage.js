@@ -4,6 +4,7 @@ exports.tokensPerSecond = tokensPerSecond;
 exports.recordConversationUsage = recordConversationUsage;
 exports.recordConversationTiming = recordConversationTiming;
 exports.getConversationUsage = getConversationUsage;
+exports.clearConversationUsage = clearConversationUsage;
 const MAX_CONVERSATIONS = 200;
 const UUID = /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i;
 // A sub-50ms decode or a single-token jitter has no meaningful decode interval to divide by.
@@ -73,5 +74,11 @@ function getConversationUsage(conversationId) {
     if (typeof conversationId !== 'string')
         return undefined;
     return usage.get(conversationId);
+}
+/** Clear cached per-conversation usage/timing (e.g. when Undo truncates transcript.jsonl). */
+function clearConversationUsage(conversationId) {
+    if (typeof conversationId !== 'string')
+        return;
+    usage.delete(conversationId);
 }
 //# sourceMappingURL=conversationUsage.js.map
