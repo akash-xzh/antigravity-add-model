@@ -154,46 +154,50 @@ window.addEventListener('DOMContentLoaded', () => {
   let activeToast: HTMLElement | undefined;
   let toastTimer: ReturnType<typeof setTimeout> | undefined;
   const seenCompactions = new Map<string, { count: number; tokens?: number }>();
+  let lastRealtimeToastAt = 0;
   const playCompactChime = () => {
     try {
       const AudioCtx = window.AudioContext || (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
       if (!AudioCtx) return;
       const ctx = new AudioCtx();
-      const now = ctx.currentTime;
-      const tone = (freq: number, start: number, dur: number) => {
-        const osc = ctx.createOscillator();
-        const gain = ctx.createGain();
-        osc.type = 'sine';
-        osc.frequency.setValueAtTime(freq, start);
-        gain.gain.setValueAtTime(0.0001, start);
-        gain.gain.exponentialRampToValueAtTime(0.055, start + 0.02);
-        gain.gain.exponentialRampToValueAtTime(0.0001, start + dur);
-        osc.connect(gain);
-        gain.connect(ctx.destination);
-        osc.start(start);
-        osc.stop(start + dur);
+      const schedule = () => {
+        const now = ctx.currentTime;
+        const tone = (freq: number, start: number, dur: number) => {
+          const osc = ctx.createOscillator();
+          const gain = ctx.createGain();
+          osc.type = 'sine';
+          osc.frequency.setValueAtTime(freq, start);
+          gain.gain.setValueAtTime(0.0001, start);
+          gain.gain.exponentialRampToValueAtTime(0.18, start + 0.02);
+          gain.gain.exponentialRampToValueAtTime(0.0001, start + dur);
+          osc.connect(gain);
+          gain.connect(ctx.destination);
+          osc.start(start);
+          osc.stop(start + dur);
+        };
+        tone(587.33, now, 0.16); // D5
+        tone(880.0, now + 0.12, 0.26); // A5
+        setTimeout(() => { void ctx.close().catch(() => {}); }, 600);
       };
-      tone(587.33, now, 0.14); // D5
-      tone(880.0, now + 0.11, 0.22); // A5
-      setTimeout(() => { void ctx.close().catch(() => {}); }, 500);
+      if (ctx.state === 'suspended' && typeof ctx.resume === 'function') {
+        void ctx.resume().then(schedule, () => { void ctx.close().catch(() => {}); });
+      } else {
+        schedule();
+      }
     } catch {
       /* Audio playback unavailable or blocked */
     }
   };
-  const showCompactToast = (compactions: number, beforeTokens?: number, afterTokens?: number, ring?: HTMLElement) => {
+  const showCompactToast = (title: string, detail: string, ring?: HTMLElement) => {
     if (toastTimer) clearTimeout(toastTimer);
     activeToast?.remove();
     const toast = document.createElement('div');
     toast.className = 'agy-compact-toast';
     toast.setAttribute('role', 'status');
     toast.setAttribute('aria-live', 'polite');
-    const detail =
-      typeof beforeTokens === 'number' && typeof afterTokens === 'number' && beforeTokens > afterTokens
-        ? `Context freed: ${formatCompactTokens(beforeTokens)} → ${formatCompactTokens(afterTokens)} tokens`
-        : 'Earlier messages were summarized to free context space.';
     toast.innerHTML =
-      `<div class="agy-compact-toast-title"><span>●</span><span>Context compacted (#${compactions})</span></div>` +
-      `<div class="agy-compact-toast-sub">${detail}</div>`;
+      `<div class="agy-compact-toast-title"><span>●</span><span>${escapeHtml(title)}</span></div>` +
+      `<div class="agy-compact-toast-sub">${escapeHtml(detail)}</div>`;
     toast.addEventListener('click', () => {
       toast.remove();
       if (activeToast === toast) activeToast = undefined;
@@ -203,15 +207,34 @@ window.addEventListener('DOMContentLoaded', () => {
     toastTimer = setTimeout(() => {
       toast.remove();
       if (activeToast === toast) activeToast = undefined;
-    }, 6000);
+    }, 8000);
     if (ring && ring.isConnected) {
       ring.dataset.agyCompacted = '1';
       setTimeout(() => {
         if (ring.isConnected) delete ring.dataset.agyCompacted;
-      }, 2500);
+      }, 3000);
     }
     playCompactChime();
   };
+  const onRealtimeCompaction = (
+    _event: unknown,
+    info?: { conversationId?: string; modelName?: string; isCustom?: boolean },
+  ) => {
+    if (stopped) return;
+    lastRealtimeToastAt = Date.now();
+    const matchingState = info?.conversationId
+      ? Array.from(states.values()).find((s) => s.target.conversationId === info.conversationId)
+      : Array.from(states.values())[0];
+    const modelLabel = info?.modelName ? ` (${info.modelName})` : '';
+    showCompactToast(
+      'Auto-compacting context',
+      `Summarizing earlier messages${modelLabel} to free context space.`,
+      matchingState?.ring,
+    );
+  };
+  if (typeof ipcRenderer.on === 'function') {
+    ipcRenderer.on('agy:compaction-event', onRealtimeCompaction);
+  }
   const formatCompactTokens = (value: number): string => {
     if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(1)}M`;
     if (value >= 1_000) return `${(value / 1_000).toFixed(value >= 100_000 ? 0 : 1)}K`;
@@ -422,8 +445,12 @@ window.addEventListener('DOMContentLoaded', () => {
       if (usage.conversationId && typeof usage.compactions === 'number') {
         const currentCount = usage.actualTokens ?? usage.currentTokens;
         const prev = seenCompactions.get(usage.conversationId);
-        if (prev && usage.compactions > prev.count) {
-          showCompactToast(usage.compactions, prev.tokens, currentCount, state.ring);
+        if (prev && usage.compactions > prev.count && Date.now() - lastRealtimeToastAt > 20_000) {
+          const detail =
+            typeof prev.tokens === 'number' && typeof currentCount === 'number' && prev.tokens > currentCount
+              ? `Context freed: ${formatCompactTokens(prev.tokens)} → ${formatCompactTokens(currentCount)} tokens`
+              : 'Earlier messages were summarized to free context space.';
+          showCompactToast(`Context compacted (#${usage.compactions})`, detail, state.ring);
         }
         seenCompactions.set(usage.conversationId, { count: usage.compactions, tokens: currentCount });
       }
@@ -538,6 +565,11 @@ window.addEventListener('DOMContentLoaded', () => {
     window.removeEventListener('popstate', route);
     window.removeEventListener('hashchange', route);
     hidePopover();
+    if (toastTimer) clearTimeout(toastTimer);
+    activeToast?.remove();
+    if (typeof ipcRenderer.removeListener === 'function') {
+      ipcRenderer.removeListener('agy:compaction-event', onRealtimeCompaction);
+    }
     for (const state of states.values()) state.ring.remove();
     states.clear();
     for (const parent of toolbarParents) parent.removeAttribute('data-agy-context-toolbar');

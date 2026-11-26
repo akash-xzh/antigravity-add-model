@@ -38,6 +38,43 @@ import { reasoningReplayCache } from './reasoningReplay';
 import { recordConversationUsage } from './conversationUsage';
 
 const circuits = new CircuitBreaker();
+export interface CompactionEvent {
+  conversationId?: string;
+  modelName: string;
+  isCustom: boolean;
+  at: number;
+}
+let compactionNotifier: ((event: CompactionEvent) => void) | undefined;
+const lastCompactionNotifyAt = new Map<string, number>();
+
+export function setCompactionNotifier(fn?: (event: CompactionEvent) => void): void {
+  compactionNotifier = fn;
+}
+
+export function notifyCompactionIfNeeded(
+  body: unknown,
+  modelName: string,
+  isCustom: boolean,
+  conversationId?: string,
+): boolean {
+  if (!isAntigravityCompactionRequest(body as GeminiBody)) return false;
+  const now = Date.now();
+  const key = conversationId || modelName || 'default';
+  const prev = lastCompactionNotifyAt.get(key) || 0;
+  if (now - prev >= 15_000) {
+    lastCompactionNotifyAt.set(key, now);
+    if (lastCompactionNotifyAt.size > 200) {
+      const oldest = lastCompactionNotifyAt.keys().next().value;
+      if (oldest) lastCompactionNotifyAt.delete(oldest);
+    }
+    try {
+      compactionNotifier?.({ conversationId, modelName, isCustom, at: now });
+    } catch {
+      /* Notification hook must never disrupt generation. */
+    }
+  }
+  return true;
+}
 /**
  * Endpoints that rejected stream_options.include_usage. Scoped by model + endpoint + format and
  * time-limited: one old error must not silently disable usage telemetry for the process lifetime.
@@ -267,7 +304,13 @@ export async function runCustomModelRequest(
   }
   // Resolve once before trimming/translating; retries and fallback providers
   // must preserve the primary model's choice for this compaction operation.
-  const compactionEffort = isAntigravityCompactionRequest(originalBody) ? primary.compactionReasoningEffort : undefined;
+  const isCompaction = notifyCompactionIfNeeded(
+    originalBody,
+    primary.displayName || primary.name,
+    true,
+    prepared.context.conversationId,
+  );
+  const compactionEffort = isCompaction ? primary.compactionReasoningEffort : undefined;
   const toolSchemas = collectToolSchemas(originalBody);
   const artifactContext = collectArtifactContext(originalBody, toolSchemas);
   const controller = new AbortController();

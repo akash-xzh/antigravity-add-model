@@ -2,6 +2,14 @@ import * as http from 'http';
 import type { CustomModel } from '../proxy';
 import { GeminiBody } from './requestOptions';
 import { subagentRouting } from './subagentRouting';
+export interface CompactionEvent {
+    conversationId?: string;
+    modelName: string;
+    isCustom: boolean;
+    at: number;
+}
+export declare function setCompactionNotifier(fn?: (event: CompactionEvent) => void): void;
+export declare function notifyCompactionIfNeeded(body: unknown, modelName: string, isCustom: boolean, conversationId?: string): boolean;
 export declare function getProxyMetrics(): {
     circuits: {
         tracked: number;

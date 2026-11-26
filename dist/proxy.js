@@ -41,7 +41,7 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
     return (mod && mod.__esModule) ? mod : { "default": mod };
 };
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.getUiMitmToken = void 0;
+exports.getUiMitmToken = exports.setCompactionNotifier = void 0;
 exports.setLanguageServerPortResolver = setLanguageServerPortResolver;
 exports.loadCustomModels = loadCustomModels;
 exports.startProxy = startProxy;
@@ -121,6 +121,7 @@ const conversationUsage_1 = require("./proxy/conversationUsage");
 const modelIdentity_1 = require("./modelIdentity");
 // Custom request transport and model storage
 const customRequest_1 = require("./proxy/customRequest");
+Object.defineProperty(exports, "setCompactionNotifier", { enumerable: true, get: function () { return customRequest_1.setCompactionNotifier; } });
 const modelStore_1 = require("./modelStore");
 const listen_1 = require("./proxy/listen");
 const subagentRouting_1 = require("./proxy/subagentRouting");
@@ -1719,6 +1720,7 @@ function handleRequest(req, res) {
                     }
                     // Restore history and expose custom subagent selectors to native parents,
                     // preserving the original placement of Cloud Code envelope metadata.
+                    (0, customRequest_1.notifyCompactionIfNeeded)(actualGeminiBody, String(modelName || 'Antigravity'), false, prepared.context.conversationId);
                     const nativeBody = {
                         ...(reqJson.request || reqJson),
                         contents: prepared.body.contents,

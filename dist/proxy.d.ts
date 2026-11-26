@@ -57,6 +57,8 @@ export interface ProxyStartOptions {
     /** IDE account bootstrap uses PROD, then the account's declared Cloud Code tier. */
     ideCloudCodeRouting?: boolean;
 }
+import { setCompactionNotifier } from './proxy/customRequest';
+export { setCompactionNotifier };
 import { getUiMitmToken } from './proxy/loopbackSecurity';
 export { getUiMitmToken };
 /** Registered by the desktop with its own live language-server port getter. */

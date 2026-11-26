@@ -174,7 +174,14 @@ import { recordConversationTiming } from './proxy/conversationUsage';
 import { allocateModelIdentities, ModelIdentity } from './modelIdentity';
 
 // Custom request transport and model storage
-import { runCustomModelRequest, getProxyMetrics, stopCustomRequests } from './proxy/customRequest';
+import {
+  runCustomModelRequest,
+  getProxyMetrics,
+  stopCustomRequests,
+  notifyCompactionIfNeeded,
+  setCompactionNotifier,
+} from './proxy/customRequest';
+export { setCompactionNotifier };
 import { readModelConfig, writeJsonAtomic } from './modelStore';
 import { getRequiredProxyPort, listenProxy } from './proxy/listen';
 import { subagentRouting, nativeConversationId, SubagentRoutingError } from './proxy/subagentRouting';
@@ -1941,6 +1948,12 @@ function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): voi
           }
           // Restore history and expose custom subagent selectors to native parents,
           // preserving the original placement of Cloud Code envelope metadata.
+          notifyCompactionIfNeeded(
+            actualGeminiBody,
+            String(modelName || 'Antigravity'),
+            false,
+            prepared.context.conversationId,
+          );
           const nativeBody = {
             ...((reqJson.request || reqJson) as Record<string, unknown>),
             contents: prepared.body.contents,

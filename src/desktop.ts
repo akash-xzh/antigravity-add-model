@@ -1,7 +1,13 @@
 /** Custom-model integration installed alongside the current vendor desktop runtime. */
-import { app, dialog, session } from 'electron';
+import { app, BrowserWindow, dialog, Notification as ElectronNotification, session } from 'electron';
 import { registerCustomModelHandlers } from './customIpc';
-import { getProxyPort, getUiMitmToken, setLanguageServerPortResolver, stopProxy } from './proxy';
+import {
+  getProxyPort,
+  getUiMitmToken,
+  setCompactionNotifier,
+  setLanguageServerPortResolver,
+  stopProxy,
+} from './proxy';
 
 let installed = false;
 
@@ -9,6 +15,33 @@ export function install(getLanguageServerPort: () => number): void {
   if (installed) return;
   installed = true;
   setLanguageServerPortResolver(getLanguageServerPort);
+  if (typeof setCompactionNotifier === 'function') {
+    setCompactionNotifier((event) => {
+      const label = event.modelName || (event.isCustom ? 'Custom model' : 'Antigravity');
+      try {
+        const Notif = ElectronNotification as unknown as
+          | { isSupported?: () => boolean; new (opts: { title: string; body: string }): { show(): void } }
+          | undefined;
+        if (Notif && typeof Notif.isSupported === 'function' && Notif.isSupported()) {
+          new Notif({
+            title: 'Antigravity · Auto-Compacting',
+            body: `Summarizing earlier context using ${label}.`,
+          }).show();
+        }
+      } catch {
+        /* OS notification may be unavailable in headless sessions. */
+      }
+      try {
+        if (BrowserWindow && typeof BrowserWindow.getAllWindows === 'function') {
+          for (const win of BrowserWindow.getAllWindows()) {
+            if (!win.isDestroyed()) win.webContents.send('agy:compaction-event', event);
+          }
+        }
+      } catch {
+        /* Window broadcast is best-effort. */
+      }
+    });
+  }
   registerCustomModelHandlers();
 
   // Registered before the vendor's ready callback, without replacing its startup,

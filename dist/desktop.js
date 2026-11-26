@@ -11,6 +11,34 @@ function install(getLanguageServerPort) {
         return;
     installed = true;
     (0, proxy_1.setLanguageServerPortResolver)(getLanguageServerPort);
+    if (typeof proxy_1.setCompactionNotifier === 'function') {
+        (0, proxy_1.setCompactionNotifier)((event) => {
+            const label = event.modelName || (event.isCustom ? 'Custom model' : 'Antigravity');
+            try {
+                const Notif = electron_1.Notification;
+                if (Notif && typeof Notif.isSupported === 'function' && Notif.isSupported()) {
+                    new Notif({
+                        title: 'Antigravity · Auto-Compacting',
+                        body: `Summarizing earlier context using ${label}.`,
+                    }).show();
+                }
+            }
+            catch {
+                /* OS notification may be unavailable in headless sessions. */
+            }
+            try {
+                if (electron_1.BrowserWindow && typeof electron_1.BrowserWindow.getAllWindows === 'function') {
+                    for (const win of electron_1.BrowserWindow.getAllWindows()) {
+                        if (!win.isDestroyed())
+                            win.webContents.send('agy:compaction-event', event);
+                    }
+                }
+            }
+            catch {
+                /* Window broadcast is best-effort. */
+            }
+        });
+    }
     (0, customIpc_1.registerCustomModelHandlers)();
     // Registered before the vendor's ready callback, without replacing its startup,
     // updater, WSL integration, certificate policy, or window configuration.

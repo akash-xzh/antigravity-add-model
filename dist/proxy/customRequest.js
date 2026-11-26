@@ -33,6 +33,8 @@ var __importStar = (this && this.__importStar) || (function () {
     };
 })();
 Object.defineProperty(exports, "__esModule", { value: true });
+exports.setCompactionNotifier = setCompactionNotifier;
+exports.notifyCompactionIfNeeded = notifyCompactionIfNeeded;
 exports.getProxyMetrics = getProxyMetrics;
 exports.stopCustomRequests = stopCustomRequests;
 exports.buildFallbackChain = buildFallbackChain;
@@ -62,6 +64,33 @@ const googlePoolFailover_1 = require("./googlePoolFailover");
 const reasoningReplay_1 = require("./reasoningReplay");
 const conversationUsage_1 = require("./conversationUsage");
 const circuits = new circuitBreaker_1.CircuitBreaker();
+let compactionNotifier;
+const lastCompactionNotifyAt = new Map();
+function setCompactionNotifier(fn) {
+    compactionNotifier = fn;
+}
+function notifyCompactionIfNeeded(body, modelName, isCustom, conversationId) {
+    if (!(0, requestOptions_1.isAntigravityCompactionRequest)(body))
+        return false;
+    const now = Date.now();
+    const key = conversationId || modelName || 'default';
+    const prev = lastCompactionNotifyAt.get(key) || 0;
+    if (now - prev >= 15000) {
+        lastCompactionNotifyAt.set(key, now);
+        if (lastCompactionNotifyAt.size > 200) {
+            const oldest = lastCompactionNotifyAt.keys().next().value;
+            if (oldest)
+                lastCompactionNotifyAt.delete(oldest);
+        }
+        try {
+            compactionNotifier?.({ conversationId, modelName, isCustom, at: now });
+        }
+        catch {
+            /* Notification hook must never disrupt generation. */
+        }
+    }
+    return true;
+}
 /**
  * Endpoints that rejected stream_options.include_usage. Scoped by model + endpoint + format and
  * time-limited: one old error must not silently disable usage telemetry for the process lifetime.
@@ -282,7 +311,8 @@ async function runCustomModelRequest(res, primary, originalBody, isStream, allMo
     }
     // Resolve once before trimming/translating; retries and fallback providers
     // must preserve the primary model's choice for this compaction operation.
-    const compactionEffort = (0, requestOptions_1.isAntigravityCompactionRequest)(originalBody) ? primary.compactionReasoningEffort : undefined;
+    const isCompaction = notifyCompactionIfNeeded(originalBody, primary.displayName || primary.name, true, prepared.context.conversationId);
+    const compactionEffort = isCompaction ? primary.compactionReasoningEffort : undefined;
     const toolSchemas = (0, utils_1.collectToolSchemas)(originalBody);
     const artifactContext = (0, artifactMetadata_1.collectArtifactContext)(originalBody, toolSchemas);
     const controller = new AbortController();
