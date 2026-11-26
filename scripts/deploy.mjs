@@ -172,12 +172,21 @@ export function fingerprint(resources) {
 function equal(a, b) {
   return JSON.stringify(a) === JSON.stringify(b);
 }
-function backupId(version, original) {
+function legacyBackupId(version, original) {
   const slug =
     String(version)
       .replace(/[^a-zA-Z0-9._-]/g, '_')
       .slice(0, 50) || 'unknown';
   return `v-${slug}-${createHash('sha256').update(JSON.stringify(original)).digest('hex')}`;
+}
+function backupId(version, original) {
+  // Keep backup folder names short so nested app.asar.unpacked paths stay well
+  // under Windows' 260-char MAX_PATH limit during Antigravity installer upgrades.
+  const slug =
+    String(version)
+      .replace(/[^a-zA-Z0-9._-]/g, '_')
+      .slice(0, 16) || 'unknown';
+  return `${slug}-${createHash('sha256').update(JSON.stringify(original)).digest('hex').slice(0, 12)}`;
 }
 export function resolveResources(input, platform = process.platform, env = process.env) {
   const candidates = input
@@ -270,7 +279,8 @@ function readState(resources) {
     typeof state.version !== 'string' ||
     !validSnapshot(state.original) ||
     !validSnapshot(state.patched) ||
-    state.backupId !== backupId(state.version, state.original)
+    (state.backupId !== backupId(state.version, state.original) &&
+      state.backupId !== legacyBackupId(state.version, state.original))
   ) {
     fail('INVALID_STATE', 'Patch state failed validation. Refusing to use a backup path from invalid state.');
   }
@@ -519,6 +529,8 @@ export async function deploy(options = {}, operations = {}) {
   let staging;
   let keepStaging = false;
   let originalBackup;
+  let restoredCleanly = false;
+  let activeBackupId = null;
   try {
     fs.writeFileSync(lockFd, `pid=${process.pid}\n`);
     if (!equal(fingerprint(resources), current))
@@ -580,10 +592,11 @@ export async function deploy(options = {}, operations = {}) {
       nextState = {
         schema: 1,
         version,
-        backupId: backupId(version, original),
+        backupId: repeated ? state.backupId : backupId(version, original),
         original,
         patched: fingerprint(candidateRoot),
       };
+      activeBackupId = nextState.backupId;
       originalBackup = path.join(meta, 'backups', nextState.backupId);
       assertNoLinks(resources, originalBackup);
       if (repeated || exists(originalBackup)) verifyBackup(resources, nextState);
@@ -609,6 +622,22 @@ export async function deploy(options = {}, operations = {}) {
     replacements.push({ target: path.join(meta, 'state.json'), candidate: nextState ? stateCandidate : null });
     swapTransaction(resources, staging, replacements, operations.rename);
     asar.uncache(files.archive);
+    if (options.restore) {
+      restoredCleanly = true;
+    } else if (activeBackupId) {
+      // Prune stale backup folders from earlier Antigravity versions so old
+      // unpacked trees never accumulate inside resources/ and break updates.
+      const backupsDir = path.join(meta, 'backups');
+      try {
+        if (exists(backupsDir)) {
+          for (const entry of fs.readdirSync(backupsDir)) {
+            if (entry !== activeBackupId) removeOwned(resources, path.join(backupsDir, entry));
+          }
+        }
+      } catch {
+        /* Best-effort pruning; current backup and state are already committed. */
+      }
+    }
     return {
       action: options.restore ? 'restore' : 'apply',
       resources,
@@ -647,6 +676,15 @@ export async function deploy(options = {}, operations = {}) {
         console.warn(`Warning: deploy lock ${lock} is owned by live pid ${pid}; leaving it in place.`);
       } else if (!removeDeployLock(resources, lock)) {
         console.warn(`Warning: stale deploy lock ${lock} (pid=${pid ?? 'unknown'}) could not be removed; retry the deploy.`);
+      }
+    }
+    // After a clean --restore, remove .antigravity-model-patch completely so
+    // Windows installers never hit MAX_PATH / locked-file errors during updates.
+    if (restoredCleanly && !keepStaging && !exists(lock)) {
+      try {
+        removeOwned(resources, meta);
+      } catch (metaCleanupError) {
+        console.warn(`Warning: could not remove patch directory ${meta}: ${metaCleanupError.message}`);
       }
     }
   }
