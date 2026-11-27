@@ -1832,14 +1832,29 @@ describe('Google fleet and native picker search', () => {
   it('injects a dedicated full-width Providers tab in the Settings sidebar and restores native tabs cleanly', async () => {
     const html = `
       <div class="settings-modal-container" aria-label="Settings">
-        <div id="settings-shell">
-          <div id="settings-sidebar">
-            <div class="relative group/nav-item mx-2"><button type="button" data-testid="settings-nav-item-General" class="nav-btn"><span>General</span></button></div>
-            <div class="relative group/nav-item mx-2"><button type="button" data-testid="settings-nav-item-Models" class="nav-btn bg-sidebar-secondary"><span>Models</span></button></div>
-            <div class="relative group/nav-item mx-2"><button type="button" data-testid="settings-nav-item-Browser" class="nav-btn"><span>Browser</span></button></div>
-          </div>
-          <div id="settings-pane">
-            <section id="native-models"><h2>Models &amp; Usage</h2><div>Weekly Limit Remaining</div></section>
+        <div class="flex-1 min-h-0 w-full relative">
+          <div id="e3b-split">
+            <div class="pane-first">
+              <div data-testid="settings-sidebar">
+                <div class="flex-1 overflow-y-auto">
+                  <div class="px-4"><h1>Settings</h1></div>
+                  <div class="flex flex-col gap-0.5">
+                    <div class="relative group/nav-item mx-2"><button type="button" data-testid="settings-nav-item-General" class="nav-btn"><span>General</span></button></div>
+                    <div class="relative group/nav-item mx-2"><button type="button" data-testid="settings-nav-item-Models" class="nav-btn bg-sidebar-secondary"><span>Models</span></button></div>
+                    <div class="relative group/nav-item mx-2"><button type="button" data-testid="settings-nav-item-Browser" class="nav-btn"><span>Browser</span></button></div>
+                  </div>
+                  <div class="px-4 mt-2"><h2>Projects</h2></div>
+                </div>
+              </div>
+            </div>
+            <div class="resize-handle"></div>
+            <div class="pane-second">
+              <div class="flex w-full h-full overflow-auto min-h-0">
+                <div class="grow w-full" id="settings-pane">
+                  <section id="native-models"><h2>Models &amp; Usage</h2><div>Weekly Limit Remaining</div></section>
+                </div>
+              </div>
+            </div>
           </div>
         </div>
       </div>
@@ -1864,7 +1879,7 @@ describe('Google fleet and native picker search', () => {
     expect(fullSection.parentElement?.id).toBe('settings-pane');
 
     // Clicking a native tab restores native content and removes the full-width Providers view
-    const generalBtn = [...f.document.querySelectorAll<HTMLButtonElement>('#settings-sidebar button')].find(
+    const generalBtn = [...f.document.querySelectorAll<HTMLButtonElement>('[data-testid="settings-sidebar"] button')].find(
       (b) => b.textContent === 'General',
     )!;
     generalBtn.click();

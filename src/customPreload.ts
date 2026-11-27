@@ -3582,14 +3582,22 @@ window.addEventListener('DOMContentLoaded', () => {
         document.querySelectorAll<HTMLElement>(
           '.settings-modal-container,[role="dialog"][aria-label="Settings"],[data-testid="settings-view"],[data-testid="settings-panel"],[role="dialog"]',
         ),
-      ).find((el) => isVisibleEl(el) && /\bModels\b/.test(el.textContent || '') && /\b(General|Appearance|Browser)\b/.test(el.textContent || '')) ||
-      null;
+      ).find(
+        (el) =>
+          isVisibleEl(el) &&
+          (Boolean(el.querySelector('[data-testid="settings-sidebar"]')) ||
+            (/\bModels\b/.test(el.textContent || '') && /\b(General|Appearance|Browser)\b/.test(el.textContent || ''))),
+      ) || null;
     if (!settingsRoot) return null;
-    // Antigravity renders each nav item as <div class="relative group/nav-item mx-2"><button data-testid="settings-nav-item-Models">...</button></div>
-    const byTestId = settingsRoot.querySelector<HTMLElement>('[data-testid="settings-nav-item-Models"]');
+
+    // Antigravity's desktop Settings sidebar has data-testid="settings-sidebar"
+    const sidebarEl = settingsRoot.querySelector<HTMLElement>('[data-testid="settings-sidebar"]');
+    const searchScope = sidebarEl && isVisibleEl(sidebarEl) ? sidebarEl : settingsRoot;
+
+    const byTestId = searchScope.querySelector<HTMLElement>('[data-testid="settings-nav-item-Models"]');
     const modelsBtn =
       (byTestId && isVisibleEl(byTestId) ? byTestId : null) ||
-      Array.from(settingsRoot.querySelectorAll<HTMLElement>('button,[role="tab"]')).find(
+      Array.from(searchScope.querySelectorAll<HTMLElement>('button,[role="tab"]')).find(
         (btn) =>
           btn.id !== 'agy-providers-nav-tab' &&
           (btn.textContent || '').trim() === 'Models' &&
@@ -3597,36 +3605,44 @@ window.addEventListener('DOMContentLoaded', () => {
       ) ||
       null;
     if (!modelsBtn || !modelsBtn.parentElement) return null;
-    // If modelsBtn is the sole button inside a wrapper div (e.g. TX's .group/nav-item), treat that wrapper as the list item.
+
+    // Each TX nav item is <div class="relative group/nav-item mx-2"><button data-testid="settings-nav-item-Models">...</button></div>
     const parentHasOtherTabs = Array.from(modelsBtn.parentElement.querySelectorAll<HTMLElement>('button,[role="tab"]')).some(
       (b) => b !== modelsBtn && b.id !== 'agy-providers-nav-tab',
     );
     const modelsItem = parentHasOtherTabs ? modelsBtn : modelsBtn.parentElement;
     const navList = modelsItem.parentElement;
     if (!navList) return null;
-    // Verify navList contains sibling Settings tabs (General / Appearance / Browser / Shortcuts / Notifications).
+
     const siblingTexts = Array.from(navList.querySelectorAll<HTMLElement>('button,[role="tab"]')).map(
       (el) => (el.textContent || '').trim(),
     );
     if (!siblingTexts.some((t) => /^(General|Appearance|Browser|Shortcuts|Notifications)$/i.test(t))) return null;
-    // Walk up from navList to find the 2-column split [sidebarCol, contentPane] inside settingsRoot.
-    let node: HTMLElement | null = navList;
+
+    // Start walking up from settings-sidebar itself (NOT navList inside the sidebar!) so we step straight
+    // out to E3b's split container [first: sidebar, second: right content pane].
+    let node: HTMLElement | null = sidebarEl && sidebarEl.contains(navList) ? sidebarEl : navList;
     while (node && node.parentElement && node !== settingsRoot) {
       const parent: HTMLElement = node.parentElement;
-      const visibleSiblings = Array.from(parent.children).filter(
+      const siblingPanes = Array.from(parent.children).filter(
         (child): child is HTMLElement =>
           child instanceof HTMLElement &&
           child !== node &&
           child.tagName !== 'STYLE' &&
           child.tagName !== 'SCRIPT' &&
+          // Skip split-pane resize handles (narrow empty divider elements) and single close buttons
+          child.children.length > 0 &&
           !(child.tagName === 'BUTTON' && child.children.length <= 1),
       );
-      if (visibleSiblings.length >= 1) {
-        const candidatePane =
-          visibleSiblings.find((el) => el.querySelector('h1,h2,h3,section,[role="tabpanel"],.overflow-y-auto')) ||
-          visibleSiblings[0];
-        if (candidatePane && settingsRoot.contains(candidatePane)) {
-          return { root: settingsRoot, modelsBtn, modelsItem, sidebarCol: node, contentPane: candidatePane };
+      if (siblingPanes.length >= 1) {
+        const rightWrapper =
+          siblingPanes.find((el) => el.querySelector('.overflow-auto,.overflow-y-auto,h1,h2,h3,section,[role="tabpanel"]')) ||
+          siblingPanes[0];
+        if (rightWrapper && settingsRoot.contains(rightWrapper)) {
+          // Prefer the inner scrollable .grow.w-full container if present so native scroll works seamlessly
+          const innerGrow = rightWrapper.querySelector<HTMLElement>('.overflow-auto > .grow.w-full');
+          const contentPane = innerGrow || rightWrapper;
+          return { root: settingsRoot, modelsBtn, modelsItem, sidebarCol: sidebarEl || node, contentPane };
         }
       }
       node = parent;
