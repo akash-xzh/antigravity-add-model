@@ -88,7 +88,7 @@ function extractMainJsIdentifiers(source: string): ExtractedIdentifiers | null {
     new RegExp(`${escapedReactVar}\\.createElement\\(([A-Za-z0-9_$]+),\\{side:"right",align:"start"`),
   );
   const menuItemMatch = h0cSlice.match(
-    new RegExp(`${escapedReactVar}\\.createElement\\(([A-Za-z0-9_$]+),\\{"data-testid":"model-selector-item"`),
+    new RegExp(`${escapedReactVar}\\.createElement\\(([A-Za-z0-9_$]+),\\s*\\{"data-testid":"model-selector-item"`),
   );
   if (!subMatch || !contentMatch || !menuItemMatch) return null;
 
@@ -96,11 +96,11 @@ function extractMainJsIdentifiers(source: string): ExtractedIdentifiers | null {
   const [, subContentComp] = contentMatch;
   const [, menuItemComp] = menuItemMatch;
 
-  // Match j0c right after i0c
-  const afterGroup = source.slice(groupIdx, Math.min(source.length, groupIdx + 4500));
+  // Match j0c right after i0c (supports both older ()=> and newer ({upgrade:a}={})=> with plan-locked models)
+  const afterGroup = source.slice(groupIdx, Math.min(source.length, groupIdx + 6500));
   const j0cMatch = afterGroup.match(
     new RegExp(
-      `var ([A-Za-z0-9_$]+)=\\(\\)=>\\{var \\{groups:([A-Za-z0-9_$]+),refreshModels:([A-Za-z0-9_$]+),customModels:([A-Za-z0-9_$]+),onAddCustomModel:([A-Za-z0-9_$]+),onEditCustomModel:([A-Za-z0-9_$]+),showCustomModelHeader:([A-Za-z0-9_$]+),bestOfNConfig:([A-Za-z0-9_$]+),isModelListLoading:([A-Za-z0-9_$]+)\\}=([A-Za-z0-9_$]+)\\(\\),\\{scrollRef:([A-Za-z0-9_$]+),overflow:([A-Za-z0-9_$]+),onScroll:([A-Za-z0-9_$]+)\\}=([A-Za-z0-9_$]+)\\(\\),[A-Za-z0-9_$]+=\\8\\?\\.isBestOfNEnabled\\?\\?!1;if\\(\\9\\)return ${escapedReactVar}\\.createElement\\(([A-Za-z0-9_$]+),\\{refreshModels:\\3\\}\\);[\\s\\S]*?"No models available"\\),${escapedReactVar}\\.createElement\\(([A-Za-z0-9_$]+),\\{refreshModels:\\3\\}\\)\\)+,\\7&&${escapedReactVar}\\.createElement\\(([A-Za-z0-9_$]+),\\{customModels:\\4,onAddCustomModel:\\5,onEditCustomModel:\\6\\}\\)\\);return ${escapedReactVar}\\.createElement\\("div",\\{className:"relative flex flex-col flex-grow min-h-0"\\}[\\s\\S]*?from-card to-transparent"\\}\\)\\)\\};`,
+      `var ([A-Za-z0-9_$]+)=\\((?:\\{[^}]*\\}=\\{\\})?\\)=>\\{var \\{groups:([A-Za-z0-9_$]+),refreshModels:([A-Za-z0-9_$]+),customModels:([A-Za-z0-9_$]+),onAddCustomModel:([A-Za-z0-9_$]+),onEditCustomModel:([A-Za-z0-9_$]+),showCustomModelHeader:([A-Za-z0-9_$]+),bestOfNConfig:([A-Za-z0-9_$]+),isModelListLoading:([A-Za-z0-9_$]+)\\}=([A-Za-z0-9_$]+)\\(\\),\\{scrollRef:([A-Za-z0-9_$]+),overflow:([A-Za-z0-9_$]+),onScroll:([A-Za-z0-9_$]+)\\}=([A-Za-z0-9_$]+)\\(\\),[A-Za-z0-9_$]+=\\8\\?\\.isBestOfNEnabled\\?\\?!1[^;]*;if\\(\\9\\)return ${escapedReactVar}\\.createElement\\(([A-Za-z0-9_$]+),\\{refreshModels:\\3\\}\\);[\\s\\S]*?"No models available"\\),${escapedReactVar}\\.createElement\\(([A-Za-z0-9_$]+),\\{refreshModels:\\3\\}\\)\\)+[\\s\\S]*?,\\7&&${escapedReactVar}\\.createElement\\(([A-Za-z0-9_$]+),\\{customModels:\\4,onAddCustomModel:\\5,onEditCustomModel:\\6\\}\\)\\);return ${escapedReactVar}\\.createElement\\("div",\\{className:"relative flex flex-col flex-grow min-h-0"\\}[\\s\\S]*?from-card to-transparent"\\}\\)\\)\\};`,
     ),
   );
   if (!j0cMatch) return null;
@@ -113,9 +113,11 @@ function extractMainJsIdentifiers(source: string): ExtractedIdentifiers | null {
   const refreshComp = j0cMatch[16];
   const customSectionComp = j0cMatch[17];
 
-  // Match separator DW inside k0c right after j0c
+  // Match separator (DW/LQ) inside j0c or k0c right after j0c
   const k0cSlice = source.slice(groupIdx + (j0cMatch.index ?? 0), Math.min(source.length, groupIdx + (j0cMatch.index ?? 0) + j0cFullMatch.length + 1200));
-  const sepMatch = k0cSlice.match(new RegExp(`&&${escapedReactVar}\\.createElement\\(([A-Za-z0-9_$]+),null\\)`));
+  const sepMatch =
+    j0cFullMatch.match(new RegExp(`${escapedReactVar}\\.createElement\\(([A-Za-z0-9_$]+),\\{className:"shrink-0 !mx-0"\\}\\)`)) ||
+    k0cSlice.match(new RegExp(`&&${escapedReactVar}\\.createElement\\(([A-Za-z0-9_$]+),null\\)`));
   const separatorComp = sepMatch ? sepMatch[1] : '';
 
   // Dynamically extract the effort parser helper (e.g. bW=a=>hSb.get(a.value)??jSb(a.label))
@@ -200,13 +202,13 @@ export function patchMainJsModelSelector(
    */
   const effortPatches: [name: string, find: string, replace: string][] = [
     ['effort order', '["low","medium","high","xhigh","max"]', '["minimal","low","medium","high","xhigh","extra","max"]'],
-    ['effort labels', 'aW={low:"Low",', 'aW={minimal:"Minimal",extra:"Extra",low:"Low",'],
+    ['effort labels', '={low:"Low",', '={minimal:"Minimal",extra:"Extra",low:"Low",'],
     [
       'label effort pattern',
-      'iSb=/^(.*?)\\s*\\((low|medium|high|xhigh|max)(?:\\s+thinking)?\\)\\s*$/i',
-      'iSb=/^(.*?)\\s*\\((minimal|low|medium|high|xhigh|extra|max)(?:\\s+thinking)?\\)\\s*$/i',
+      '=/^(.*?)\\s*\\((low|medium|high|xhigh|max)(?:\\s+thinking)?\\)\\s*$/i',
+      '=/^(.*?)\\s*\\((minimal|low|medium|high|xhigh|extra|max)(?:\\s+thinking)?\\)\\s*$/i',
     ],
-    ['modelId effort pattern', 'lW=/-(low|medium|high|xhigh|max)$/', 'lW=/-(minimal|low|medium|high|xhigh|extra|max)$/'],
+    ['modelId effort pattern', '=/-(low|medium|high|xhigh|max)$/', '=/-(minimal|low|medium|high|xhigh|extra|max)$/'],
   ];
   const geminiFilter = 'a?a.toLowerCase().includes("gemini"):!1';
   if (code.includes(geminiFilter)) {
