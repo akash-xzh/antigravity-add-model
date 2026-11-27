@@ -1996,10 +1996,10 @@ describe('Google fleet and native picker search', () => {
     expect(rows[0].querySelector('.agy-row-title strong')?.textContent).toContain('Claude Sonnet 4.6');
     expect(rows[0].querySelector('.agy-effort-chip')?.textContent).toBe('Low · Med · High');
 
-    // Test runs against lowest enabled variant (medium, since low is disabled)
+    // Test runs text generation against lowest enabled variant (medium, since low is disabled)
     await f.click('Test', rows[0]);
     expect(f.invoke).toHaveBeenCalledWith(
-      'storage:test-model-connection',
+      'storage:test-model-generation',
       expect.objectContaining({ name: 'models/claude-medium' }),
     );
 

@@ -438,9 +438,11 @@ window.addEventListener('DOMContentLoaded', () => {
       .agy-effort-tab[data-enabled="false"]{opacity:.38;text-decoration:line-through}
       .agy-effort-tab[data-enabled="false"][aria-pressed="true"]{opacity:.72}
       .agy-row-slug{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:11px;color:#8e8e98}
-      .agy-sticky-bar{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:6px 0 2px;padding:6px 0}
+      .agy-sticky-bar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin:10px 0 4px;padding:4px 0}
       .agy-sticky-bar .agy-field{margin:0;flex:1 1 220px}
-      .agy-chip{appearance:none;font:inherit;font-size:11.5px;color:#a1a1aa;background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.10);border-radius:9999px;padding:3px 10px;cursor:pointer;white-space:nowrap}
+      .agy-sticky-bar .agy-field>span{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
+      .agy-sticky-bar .agy-actions{margin:0;align-items:center}
+      .agy-chip{appearance:none;font:inherit;font-size:12px;line-height:1;height:30px;display:inline-flex;align-items:center;justify-content:center;color:#a1a1aa;background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.10);border-radius:9999px;padding:0 12px;cursor:pointer;white-space:nowrap}
       .agy-chip:hover{color:#f4f4f5;border-color:rgba(255,255,255,.20)}
       .agy-chip[aria-pressed="true"]{color:#09090b;background:#f4f4f5;border-color:#f4f4f5;font-weight:600}
       @media(max-width:680px){.zc-split-card{grid-template-columns:1fr}.zc-sidebar{border-right:0;border-bottom:1px solid rgba(255,255,255,.10);flex-direction:row;overflow-x:auto}.zc-tpl-grid{grid-template-columns:1fr}}
@@ -2263,19 +2265,20 @@ window.addEventListener('DOMContentLoaded', () => {
             .map((v) => (v.effort || '').toLowerCase())
             .filter((e): e is EffortKey => (EFFORT_KEYS as string[]).includes(e));
 
-          // Inline ZCode row actions: Test (plug), Edit (pencil), Delete (trash), Enable/Disable switch, More menu
+          // Inline ZCode row actions: Test generation (plug), Edit (pencil), Delete (trash), Enable/Disable switch, More menu
           const testBtn = makeIconAction(
             'Test',
             '<path d="M12 22v-5"/><path d="M9 8V2"/><path d="M15 8V2"/><path d="M18 8v5a4 4 0 0 1-4 4h-4a4 4 0 0 1-4-4V8Z"/>',
             async () => {
-              setStatus(rowStatus, 'Testing…');
-              showProviderToast(`Connecting to ${groupDisplayName} / ${model.externalModelName || model.name}…`, 'pending', 0);
-              const result = requireSuccess(await storageAPI.testModelConnection(model));
-              const msg = result.message || 'Connection successful.';
+              setStatus(rowStatus, 'Testing generation…');
+              showProviderToast(`Testing generation: ${groupDisplayName} / ${model.externalModelName || model.name}…`, 'pending', 0);
+              const result = requireSuccess(await storageAPI.testModelGeneration(model));
+              const msg = result.message || 'Generation succeeded.';
               setStatus(rowStatus, msg);
               showProviderToast(msg, 'success');
             },
           );
+          testBtn.title = 'Test text generation';
           const editBtn = makeIconAction(
             'Edit',
             '<path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/>',
