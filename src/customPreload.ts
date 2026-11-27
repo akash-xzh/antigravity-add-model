@@ -8,6 +8,7 @@ interface CustomModelEntry {
   provider: string;
   providerName?: string;
   apiKey: string;
+  apiKeyLength?: number;
   apiUrl: string;
   externalModelName: string;
   apiFormat?: string;
@@ -158,6 +159,13 @@ const storageAPI = {
     ipcRenderer.invoke('storage:get-display-settings'),
   saveDisplaySettings: (settings: { showStatusEmoji: boolean }): Promise<ActionResult> =>
     ipcRenderer.invoke('storage:save-display-settings', settings),
+  revealApiKey: (name: string): Promise<{ success: boolean; apiKey?: string; error?: string }> =>
+    ipcRenderer.invoke('storage:reveal-api-key', name),
+  syncModelEfforts: (payload: {
+    baseModel: CustomModelEntry;
+    efforts: Array<'minimal' | 'low' | 'medium' | 'high' | 'xhigh'>;
+    existingVariantNames?: string[];
+  }): Promise<ActionResult> => ipcRenderer.invoke('storage:sync-model-efforts', payload),
 };
 
 window.addEventListener('DOMContentLoaded', () => {
@@ -171,6 +179,8 @@ window.addEventListener('DOMContentLoaded', () => {
   let selectedProviderKey = '';
   let rightPaneMode: 'detail' | 'template-picker' = 'detail';
   let apiKeyVisible = false;
+  let revealedApiKey: string | null = null;
+  let revealedApiKeyForModel = '';
   let providersTabActive = false;
   let providerToast: { text: string; type: 'pending' | 'success' | 'failure' } | null = null;
   let providerToastTimer: ReturnType<typeof setTimeout> | undefined;
@@ -324,7 +334,7 @@ window.addEventListener('DOMContentLoaded', () => {
       #agy-custom-models-section *,#agy-modal-overlay *{box-sizing:border-box}
       #agy-custom-models-section [hidden],#agy-modal-overlay [hidden]{display:none!important}
       #agy-custom-models-section{margin:24px 0;padding:20px;border:1px solid rgba(255,255,255,.10);border-radius:12px;background:#121214;min-width:0}
-      #agy-custom-models-section[data-fullwidth="true"]{margin:0;padding:24px 28px 32px;border:0;border-radius:0;background:transparent;width:100%;max-width:none;min-height:100%;box-sizing:border-box}
+      #agy-custom-models-section[data-fullwidth="true"]{margin:0;padding:52px 28px 32px;border:0;border-radius:0;background:transparent;width:100%;max-width:none;min-height:100%;box-sizing:border-box}
       #agy-custom-models-section[data-fullwidth="true"] .zc-split-card{min-height:calc(100vh - 230px);grid-template-columns:240px minmax(0,1fr)}
       #agy-providers-banner{margin:18px 0;padding:14px 16px;border-radius:10px;border:1px solid rgba(255,255,255,.10);background:#1b1b1e;display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;font:13px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#f4f4f5}
       #agy-providers-banner .agy-btn{appearance:none;font:inherit;font-size:12.5px;font-weight:600;padding:6px 13px;border-radius:8px;border:1px solid #f4f4f5;background:#f4f4f5;color:#09090b;cursor:pointer;white-space:nowrap}
@@ -406,10 +416,10 @@ window.addEventListener('DOMContentLoaded', () => {
       #agy-custom-models-section .agy-switch[aria-checked="true"] .agy-switch-dot,#agy-modal-overlay .agy-switch[aria-checked="true"] .agy-switch-dot{transform:translateX(14px);background:#ffffff}
       .agy-row .agy-muted{font-size:11px}
       .agy-row .agy-status{margin-top:2px;font-size:11px}
-      .agy-row-info{display:flex;flex-direction:column;gap:2px;min-width:0;overflow:hidden;flex:1 1 auto}
+      .agy-row-info{display:flex;flex-direction:column;gap:2px;min-width:0;flex:1 1 auto}
       .agy-row-title{display:flex;align-items:center;gap:6px;min-width:0;flex-wrap:wrap}
-      .agy-row-title strong{font-size:12.5px;font-weight:500;color:#f4f4f5;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-      .agy-row-meta{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+      .agy-row-title strong{font-size:12.5px;font-weight:500;color:#f4f4f5;min-width:0;white-space:normal;overflow-wrap:anywhere;word-break:break-word}
+      .agy-row-meta{min-width:0;white-space:normal;overflow-wrap:anywhere}
       .agy-row-actions{display:flex;align-items:center;gap:3px;margin-left:auto;flex:0 0 auto}
       .agy-menu{position:relative}
       .agy-menu-btn{list-style:none;cursor:pointer;display:inline-flex;align-items:center;justify-content:center;width:24px;height:24px;border-radius:6px;border:0;background:transparent;color:#a1a1aa;font-size:14px;line-height:1;user-select:none}
@@ -475,12 +485,20 @@ window.addEventListener('DOMContentLoaded', () => {
       #agy-modal-overlay .zc-btn-ghost{background:transparent;border-color:transparent;color:#a1a1aa}
       #agy-modal-overlay .zc-btn-ghost:hover{background:rgba(255,255,255,.07);border-color:transparent;color:#f4f4f5}
       .zc-grid-2-1{display:grid;grid-template-columns:minmax(0,1.7fr) minmax(0,1fr);gap:0 12px}
+      .zc-grid-3{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:0 10px}
       .zc-grid-4{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:0 10px}
+      .agy-effort-picker{display:flex;align-items:center;flex-wrap:wrap;gap:6px;margin:2px 0 10px}
+      .agy-effort-picker-head{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:5px;color:#a1a1aa;font-size:12px;font-weight:500}
+      .zc-adv-tabs{display:inline-flex;align-items:center;gap:3px;padding:3px;margin-bottom:12px;border-radius:8px;background:#16161a;border:1px solid rgba(255,255,255,.09);flex-wrap:wrap}
+      .zc-adv-tab{appearance:none;font:inherit;font-size:12px;font-weight:500;padding:4px 10px;border-radius:6px;border:0;background:transparent;color:#a1a1aa;cursor:pointer;transition:background .12s ease,color .12s ease}
+      .zc-adv-tab:hover{color:#f4f4f5;background:rgba(255,255,255,.06)}
+      .zc-adv-tab[aria-selected="true"]{background:rgba(255,255,255,.12);color:#fafafa;font-weight:600}
+      .zc-adv-panel{min-width:0}
       .zc-adv-sub{font-size:11px;font-weight:600;letter-spacing:.05em;text-transform:uppercase;color:#71717a;margin:12px 0 8px;padding-top:10px;border-top:1px solid rgba(255,255,255,.07)}
       .zc-adv-sub:first-of-type{margin-top:2px;padding-top:0;border-top:0}
       .zc-modal-footer{display:flex;align-items:center;justify-content:space-between;gap:10px;padding-top:14px;margin-top:12px;border-top:1px solid rgba(255,255,255,.09)}
       .zc-modal-footer-left,.zc-modal-footer-right{display:flex;align-items:center;gap:6px}
-      @media(max-width:600px){.zc-grid-2-1,.zc-grid-4{grid-template-columns:1fr 1fr}.zc-modal-footer{flex-wrap:wrap}}
+      @media(max-width:600px){.zc-grid-2-1,.zc-grid-3,.zc-grid-4{grid-template-columns:1fr 1fr}.zc-modal-footer{flex-wrap:wrap}}
       .agy-grid{display:grid;grid-template-columns:1fr 1fr;gap:0 14px}.agy-discovery{max-height:240px;overflow:auto;margin:12px 0;border-radius:8px;border:1px solid rgba(255,255,255,.09);background:#161618;padding:4px 10px}
       .agy-discovery:empty{display:none}
       .agy-choice{display:flex;gap:10px;align-items:center;padding:7px 2px;border-bottom:1px solid rgba(255,255,255,.06);overflow-wrap:anywhere}.agy-choice:last-child{border-bottom:0}.agy-choice span{min-width:0}
@@ -1002,11 +1020,25 @@ window.addEventListener('DOMContentLoaded', () => {
       }
     };
   }
-  function openDeleteModelModal(model: CustomModelEntry): void {
+  function openDeleteModelModal(model: CustomModelEntry, slotVariants?: CustomModelEntry[], slotTitle?: string): void {
+    const targets = slotVariants && slotVariants.length > 1 ? slotVariants : [model];
+    const isMulti = targets.length > 1;
     const { body, status, close } = openModal('Delete model');
     body.append(
-      element('p', '', `Delete “${model.displayName || model.name}”?`),
-      element('p', 'agy-muted', 'This removes the saved model configuration from this app.'),
+      element(
+        'p',
+        '',
+        isMulti
+          ? `Delete “${slotTitle || model.displayName || model.name}” and all ${targets.length} effort variants?`
+          : `Delete “${model.displayName || model.name}”?`,
+      ),
+      element(
+        'p',
+        'agy-muted',
+        isMulti
+          ? 'This removes all saved effort variants for this model from this app.'
+          : 'This removes the saved model configuration from this app.',
+      ),
     );
     const actions = element('div', 'agy-actions');
     actions.append(
@@ -1018,8 +1050,10 @@ window.addEventListener('DOMContentLoaded', () => {
           const deletedIndex = visibleRows.findIndex((row) => row.dataset.modelName === model.name);
           const adjacentNames = [...visibleRows.slice(deletedIndex + 1), ...visibleRows.slice(0, deletedIndex).reverse()]
             .map((row) => row.dataset.modelName);
-          setStatus(status, 'Deleting model…');
-          requireSuccess(await storageAPI.deleteCustomModel(model.name));
+          setStatus(status, isMulti ? `Deleting ${targets.length} variants…` : 'Deleting model…');
+          for (const targetModel of targets) {
+            requireSuccess(await storageAPI.deleteCustomModel(targetModel.name));
+          }
           // The user may have closed this dialog while storage was updating.
           const dialogStillOpen = body.isConnected;
           if (dialogStillOpen) close();
@@ -1507,7 +1541,8 @@ window.addEventListener('DOMContentLoaded', () => {
   }
 
   let rowMenuDismissInstalled = false;
-  const selectedEffortByKey = new Map<string, string>();
+  type EffortKey = 'minimal' | 'low' | 'medium' | 'high' | 'xhigh';
+  const EFFORT_KEYS: EffortKey[] = ['minimal', 'low', 'medium', 'high', 'xhigh'];
   const EFFORT_ORDER: Record<string, number> = { minimal: 0, low: 1, medium: 2, high: 3, xhigh: 4, extra: 5 };
 
   function shouldSkipBackgroundRefresh(target: HTMLElement): boolean {
@@ -1685,6 +1720,8 @@ window.addEventListener('DOMContentLoaded', () => {
             selectedProviderKey = key;
             rightPaneMode = 'detail';
             apiKeyVisible = false;
+            revealedApiKey = null;
+            revealedApiKeyForModel = '';
             void renderCustomModelsList();
           });
           navGroup.append(navBtn);
@@ -1807,6 +1844,57 @@ window.addEventListener('DOMContentLoaded', () => {
           headActions.append(renameBtn);
         }
 
+        const deleteProviderBtn = button(
+          'Delete provider',
+          () => {
+            const { body, status, close } = openModal('Delete provider');
+            const count = fullGroupModels.length;
+            body.append(
+              element(
+                'p',
+                '',
+                `Delete "${groupDisplayName}" and all ${count} model${count === 1 ? '' : 's'}?`,
+              ),
+              element('p', 'agy-muted', 'This removes all saved model configurations for this provider from this app.'),
+            );
+            const modalActions = element('div', 'agy-actions');
+            modalActions.append(
+              button('Cancel', close),
+              button(
+                'Delete provider',
+                async () => {
+                  setStatus(status, `Deleting ${groupDisplayName}…`);
+                  for (const model of fullGroupModels) {
+                    requireSuccess(await storageAPI.deleteCustomModel(model.name));
+                  }
+                  const dialogStillOpen = body.isConnected;
+                  if (dialogStillOpen) close();
+                  selectedProviderKey = '';
+                  apiKeyVisible = false;
+                  revealedApiKey = null;
+                  revealedApiKeyForModel = '';
+                  await modelsChanged();
+                  showProviderToast(`Deleted ${groupDisplayName}`, 'success');
+                },
+                status,
+                true,
+              ),
+            );
+            body.append(modalActions);
+          },
+          groupStatus,
+        );
+        deleteProviderBtn.className = 'zc-icon-btn zc-icon-danger';
+        deleteProviderBtn.title = `Delete provider "${groupDisplayName}"`;
+        deleteProviderBtn.replaceChildren(
+          makeSvgIcon(
+            '<path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/>',
+            14,
+          ),
+          element('span', 'agy-sr-only', 'Delete provider'),
+        );
+        headActions.append(deleteProviderBtn);
+
         const allEnabled = fullGroupModels.every((model) => model.enabled !== false);
         const groupToggle = button(
           allEnabled ? 'Disable group' : 'Enable group',
@@ -1901,20 +1989,36 @@ window.addEventListener('DOMContentLoaded', () => {
         const keyRow = element('div', 'zc-field-row');
         keyRow.append(element('label', 'zc-field-label', 'API Key'));
         const keyWrap = element('div', 'zc-input-wrap');
+        const hasMaskedSavedKey = first.apiKey === '********';
+        const maskedDisplayValue =
+          hasMaskedSavedKey && typeof first.apiKeyLength === 'number' && first.apiKeyLength > 0
+            ? '•'.repeat(Math.min(first.apiKeyLength, 64))
+            : first.apiKey === 'none'
+              ? ''
+              : first.apiKey || '';
+        const isShowingRevealed = apiKeyVisible && revealedApiKeyForModel === first.name && revealedApiKey !== null;
         const keyInput = document.createElement('input');
         keyInput.type = apiKeyVisible ? 'text' : 'password';
         keyInput.className = 'zc-input zc-mono';
         keyInput.style.paddingRight = '36px';
-        keyInput.value = first.apiKey || '';
-        keyInput.placeholder = 'Enter API key';
+        keyInput.value = isShowingRevealed ? revealedApiKey! : maskedDisplayValue;
+        keyInput.placeholder =
+          hasMaskedSavedKey && typeof first.apiKeyLength === 'number' && first.apiKeyLength > 0
+            ? '•'.repeat(Math.min(first.apiKeyLength, 64))
+            : 'Enter API key';
         const saveGroupKey = async () => {
           const nextKey = keyInput.value;
-          if (nextKey === (first.apiKey || '')) return;
+          if (nextKey === maskedDisplayValue) return;
+          if (revealedApiKey !== null && revealedApiKeyForModel === first.name && nextKey === revealedApiKey) return;
+          if (!nextKey && (!first.apiKey || first.apiKey === 'none')) return;
           try {
             showProviderToast(`Saving ${groupDisplayName}…`, 'pending', 0);
             for (const m of fullGroupModels) {
-              requireSuccess(await storageAPI.saveCustomModel({ ...m, apiKey: nextKey }));
+              requireSuccess(await storageAPI.saveCustomModel({ ...m, apiKey: nextKey || 'none' }));
             }
+            apiKeyVisible = false;
+            revealedApiKey = null;
+            revealedApiKeyForModel = '';
             await modelsChanged();
             showProviderToast(`${groupDisplayName} saved`, 'success');
           } catch (err) {
@@ -1925,21 +2029,49 @@ window.addEventListener('DOMContentLoaded', () => {
         keyInput.addEventListener('keydown', (e) => {
           if (e.key === 'Enter') keyInput.blur();
         });
+        const eyeOpenSvg =
+          '<path d="M2 12s3-7 10-7 10 7 10 7-3 7-10 7-10-7-10-7Z"/><circle cx="12" cy="12" r="3"/>';
+        const eyeOffSvg =
+          '<path d="M9.88 9.88a3 3 0 1 0 4.24 4.24"/><path d="M10.73 5.08A10.43 10.43 0 0 1 12 5c7 0 10 7 10 7a13.16 13.16 0 0 1-1.67 2.68"/><path d="M6.61 6.61A13.526 13.526 0 0 0 2 12s3 7 10 7a9.74 9.74 0 0 0 5.39-1.61"/><line x1="2" x2="22" y1="2" y2="22"/>';
         const eyeBtn = document.createElement('button');
         eyeBtn.type = 'button';
         eyeBtn.className = 'zc-icon-btn zc-eye-btn';
-        eyeBtn.title = apiKeyVisible ? 'Hide API key' : 'Show API key';
-        eyeBtn.append(
-          makeSvgIcon(
-            apiKeyVisible
-              ? '<path d="M9.88 9.88a3 3 0 1 0 4.24 4.24"/><path d="M10.73 5.08A10.43 10.43 0 0 1 12 5c7 0 10 7 10 7a13.16 13.16 0 0 1-1.67 2.68"/><path d="M6.61 6.61A13.526 13.526 0 0 0 2 12s3 7 10 7a9.74 9.74 0 0 0 5.39-1.61"/><line x1="2" x2="22" y1="2" y2="22"/>'
-              : '<path d="M2 12s3-7 10-7 10 7 10 7-3 7-10 7-10-7-10-7Z"/><circle cx="12" cy="12" r="3"/>',
-            14,
-          ),
-        );
-        eyeBtn.addEventListener('click', () => {
-          apiKeyVisible = !apiKeyVisible;
-          keyInput.type = apiKeyVisible ? 'text' : 'password';
+        const syncEyeButton = () => {
+          eyeBtn.title = apiKeyVisible ? 'Hide API key' : 'Show API key';
+          eyeBtn.setAttribute('aria-label', eyeBtn.title);
+          eyeBtn.replaceChildren(makeSvgIcon(apiKeyVisible ? eyeOffSvg : eyeOpenSvg, 14));
+        };
+        syncEyeButton();
+        eyeBtn.addEventListener('click', async () => {
+          if (!apiKeyVisible) {
+            if (hasMaskedSavedKey && keyInput.value === maskedDisplayValue) {
+              eyeBtn.disabled = true;
+              try {
+                const res = await storageAPI.revealApiKey(first.name);
+                if (res?.success && typeof res.apiKey === 'string') {
+                  revealedApiKey = res.apiKey;
+                  revealedApiKeyForModel = first.name;
+                  keyInput.value = res.apiKey;
+                }
+              } catch {
+                // Gracefully degrade when revealApiKey IPC is unavailable (e.g. unit test fixtures).
+              } finally {
+                eyeBtn.disabled = false;
+              }
+            }
+            apiKeyVisible = true;
+            keyInput.type = 'text';
+            syncEyeButton();
+          } else {
+            apiKeyVisible = false;
+            keyInput.type = 'password';
+            if (revealedApiKey !== null && revealedApiKeyForModel === first.name && keyInput.value === revealedApiKey) {
+              keyInput.value = maskedDisplayValue;
+            }
+            revealedApiKey = null;
+            revealedApiKeyForModel = '';
+            syncEyeButton();
+          }
         });
         keyWrap.append(keyInput, eyeBtn);
         keyRow.append(keyWrap);
@@ -2024,282 +2156,250 @@ window.addEventListener('DOMContentLoaded', () => {
             );
           }
           const isGrouped = slot.variants.length > 1;
-          const pickInitialVariant = (): ParsedVariant => {
-            if (!isGrouped) return slot.variants[0];
-            const savedName = selectedEffortByKey.get(slot.key);
-            return (
-              slot.variants.find((v) => v.model.name === savedName) ||
-              slot.variants.find((v) => v.effort?.toLowerCase() === 'medium' && v.model.enabled !== false) ||
-              slot.variants.find((v) => v.model.enabled !== false) ||
-              slot.variants[0]
-            );
-          };
+          // Pick lowest enabled variant (variants are sorted minimal -> xhigh), or first variant if all disabled
+          const primaryVariant =
+            slot.variants.find((v) => v.model.enabled !== false) || slot.variants[0];
+          const { model, shortName, effort } = primaryVariant;
 
           const row = element('div', 'agy-row');
-          const renderSlotRow = (active: ParsedVariant) => {
-            const { model, shortName, effort } = active;
-            if (isGrouped) selectedEffortByKey.set(slot.key, model.name);
-            const health = healthMap ? healthMap[model.name] : undefined;
-            const isRecent = isGrouped
-              ? slot.variants.some((v) => Boolean(v.model.isRecent))
-              : Boolean(model.isRecent);
-            const starPrefix = isRecent && showStatusEmoji ? '⭐ ' : '';
-            const statusDot = !showStatusEmoji
-              ? ''
-              : health?.status === 'slow' || health?.status === 'cooldown'
-                ? '🟡 '
-                : !health || health.status === 'healthy'
-                  ? '🟢 '
-                  : '🔴 ';
+          const health = healthMap ? healthMap[model.name] : undefined;
+          const isRecent = isGrouped
+            ? slot.variants.some((v) => Boolean(v.model.isRecent))
+            : Boolean(model.isRecent);
+          const starPrefix = isRecent && showStatusEmoji ? '⭐ ' : '';
+          const statusDot = !showStatusEmoji
+            ? ''
+            : health?.status === 'slow' || health?.status === 'cooldown'
+              ? '🟡 '
+              : !health || health.status === 'healthy'
+                ? '🟢 '
+                : '🔴 ';
 
-            const enabledVariantsCount = slot.variants.filter((v) => v.model.enabled !== false).length;
-            const allDisabled = enabledVariantsCount === 0;
-            row.dataset.modelName = model.name;
-            row.dataset.enabled = String(isGrouped ? !allDisabled : model.enabled !== false);
+          const enabledVariantsCount = slot.variants.filter((v) => v.model.enabled !== false).length;
+          const allDisabled = enabledVariantsCount === 0;
+          const isOn = isGrouped ? !allDisabled : model.enabled !== false;
+          row.dataset.modelName = model.name;
+          row.dataset.enabled = String(isOn);
 
-            const info = element('div', 'agy-row-info');
-            const titleLine = element('div', 'agy-row-title');
-            const titleEl = element('strong', '', `${starPrefix}${statusDot}${shortName}`);
-            titleLine.append(titleEl);
-            const ctxNum = typeof model.contextWindow === 'number' ? model.contextWindow : undefined;
-            const ctxLabel = formatCompactContext(ctxNum);
-            if (ctxLabel) {
-              const ctxBadge = element('span', 'zc-ctx-badge', ctxLabel);
-              ctxBadge.title = `Context window: ${ctxNum?.toLocaleString()} tokens`;
-              titleLine.append(ctxBadge);
-            }
-            if (model.supportsImages) {
-              const visionEl = element('span', 'zc-vision-badge');
-              visionEl.title = 'Supports image input';
-              visionEl.append(makeSvgIcon('<rect width="18" height="18" x="3" y="3" rx="2" ry="2"/><circle cx="9" cy="9" r="2"/><path d="m21 15-3.086-3.086a2 2 0 0 0-2.828 0L6 21"/>', 13));
-              titleLine.append(visionEl);
-            }
+          const info = element('div', 'agy-row-info');
+          const titleLine = element('div', 'agy-row-title');
+          const titleEl = element('strong', '', `${starPrefix}${statusDot}${shortName}`);
+          titleLine.append(titleEl);
+          if (isGrouped) {
+            const effortSummary = slot.variants.map((v) => formatEffortLabel(v.effort || '')).join(' · ');
+            const effortBadge = element('span', 'agy-effort-chip', effortSummary);
+            effortBadge.title = `Supported reasoning efforts: ${effortSummary}`;
+            titleLine.append(effortBadge);
+          } else if (effort) {
+            titleLine.append(element('span', 'agy-effort-chip', formatEffortLabel(effort)));
+          }
+          const ctxNum = typeof model.contextWindow === 'number' ? model.contextWindow : undefined;
+          const ctxLabel = formatCompactContext(ctxNum);
+          if (ctxLabel) {
+            const ctxBadge = element('span', 'zc-ctx-badge', ctxLabel);
+            ctxBadge.title = `Context window: ${ctxNum?.toLocaleString()} tokens`;
+            titleLine.append(ctxBadge);
+          }
+          if (model.supportsImages) {
+            const visionEl = element('span', 'zc-vision-badge');
+            visionEl.title = 'Supports image input';
+            visionEl.append(makeSvgIcon('<rect width="18" height="18" x="3" y="3" rx="2" ry="2"/><circle cx="9" cy="9" r="2"/><path d="m21 15-3.086-3.086a2 2 0 0 0-2.828 0L6 21"/>', 13));
+            titleLine.append(visionEl);
+          }
 
-            const meta = element('div', 'agy-muted agy-row-meta');
-            if (model.externalModelName) meta.append(element('span', 'agy-row-slug', model.externalModelName));
-            if (isRecent) {
-              if (meta.childNodes.length) meta.append(document.createTextNode(' · '));
-              meta.append(document.createTextNode('Recent'));
-            }
-            if (isGrouped && enabledVariantsCount < slot.variants.length) {
-              if (meta.childNodes.length) meta.append(document.createTextNode(' · '));
-              meta.append(document.createTextNode(`${enabledVariantsCount}/${slot.variants.length} on`));
-            }
+          const meta = element('div', 'agy-muted agy-row-meta');
+          if (model.externalModelName) meta.append(element('span', 'agy-row-slug', model.externalModelName));
+          if (isRecent) {
+            if (meta.childNodes.length) meta.append(document.createTextNode(' · '));
+            meta.append(document.createTextNode('Recent'));
+          }
+          if (isGrouped && enabledVariantsCount > 0 && enabledVariantsCount < slot.variants.length) {
+            if (meta.childNodes.length) meta.append(document.createTextNode(' · '));
+            meta.append(document.createTextNode(`${enabledVariantsCount}/${slot.variants.length} on`));
+          }
 
-            const rowStatus = statusNode();
-            info.append(titleLine, meta);
-            if (model.nativePickerAvailable === false) {
-              info.append(
-                element(
-                  'div',
-                  'agy-muted agy-row-meta',
-                  typeof model.nativePickerError === 'string'
-                    ? model.nativePickerError
-                    : 'Not currently available in the native model picker. Direct API access remains available.',
-                ),
-              );
-            }
-            info.append(rowStatus);
-
-            const buildEffortTabs = (): HTMLElement | null => {
-              if (!isGrouped) return effort ? element('span', 'agy-effort-chip', formatEffortLabel(effort)) : null;
-              const tabs = element('div', 'agy-effort-tabs');
-              tabs.setAttribute('role', 'group');
-              tabs.setAttribute('aria-label', `Reasoning effort variants for ${shortName}`);
-              for (const variant of slot.variants) {
-                const effLabel = formatEffortLabel(variant.effort || '');
-                const tab = document.createElement('button');
-                tab.type = 'button';
-                tab.className = 'agy-effort-tab';
-                tab.textContent = effLabel;
-                const isSelected = variant.model.name === model.name;
-                const isVarEnabled = variant.model.enabled !== false;
-                tab.setAttribute('aria-pressed', String(isSelected));
-                tab.dataset.enabled = String(isVarEnabled);
-                tab.dataset.modelName = variant.model.name;
-                tab.title = `${shortName} (${variant.effort}) — ${isVarEnabled ? 'Enabled' : 'Disabled'}${isSelected ? ' (selected)' : '. Click to select'}`;
-                tab.addEventListener('click', () => {
-                  if (variant.model.name !== model.name) renderSlotRow(variant);
-                });
-                tabs.append(tab);
-              }
-              return tabs;
-            };
-
-            const makeIconAction = (
-              label: string,
-              svg: string,
-              onClick: () => void | Promise<void>,
-              danger = false,
-            ): HTMLButtonElement => {
-              const btn = document.createElement('button');
-              btn.type = 'button';
-              btn.className = `zc-icon-btn${danger ? ' zc-icon-danger' : ''}`;
-              btn.title = label;
-              btn.append(makeSvgIcon(svg, 14), element('span', 'agy-sr-only', label));
-              btn.addEventListener('click', async () => {
-                btn.disabled = true;
-                try {
-                  await onClick();
-                } catch (err) {
-                  const msg = err instanceof Error ? err.message : 'Action failed.';
-                  setStatus(rowStatus, msg, true);
-                  showProviderToast(msg, 'failure', 6000);
-                } finally {
-                  btn.disabled = false;
-                }
-              });
-              return btn;
-            };
-
-            // Inline ZCode row actions (K6n): Test (plug), Edit (pencil), Delete (trash), Enable/Disable switch, More menu
-            const testBtn = makeIconAction(
-              'Test',
-              '<path d="M12 22v-5"/><path d="M9 8V2"/><path d="M15 8V2"/><path d="M18 8v5a4 4 0 0 1-4 4h-4a4 4 0 0 1-4-4V8Z"/>',
-              async () => {
-                setStatus(rowStatus, 'Testing…');
-                showProviderToast(`Connecting to ${groupDisplayName} / ${model.externalModelName || model.name}…`, 'pending', 0);
-                const result = requireSuccess(await storageAPI.testModelConnection(model));
-                const msg = result.message || 'Connection successful.';
-                setStatus(rowStatus, msg);
-                showProviderToast(msg, 'success');
-              },
-            );
-            const editBtn = makeIconAction(
-              'Edit',
-              '<path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/>',
-              () => openModelModal(model, 'edit', providersTabActive ? { scopedToProvider: true } : undefined),
-            );
-            const deleteBtn = makeIconAction(
-              'Delete',
-              '<path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/>',
-              () => openDeleteModelModal(model),
-              true,
-            );
-
-            const isOn = model.enabled !== false;
-            const toggleButton = button(
-              isOn ? 'Disable' : 'Enable',
-              async () => {
-                toggleButton.setAttribute('aria-checked', String(!isOn));
-                requireSuccess(await storageAPI.saveCustomModel({ ...model, enabled: !isOn }));
-                await modelsChanged();
-                showProviderToast(`${groupDisplayName} / ${shortName} saved`, 'success');
-              },
-              rowStatus,
-            );
-            toggleButton.classList.add('agy-switch');
-            toggleButton.setAttribute('role', 'switch');
-            toggleButton.setAttribute('aria-checked', String(isOn));
-            toggleButton.replaceChildren(
-              element('span', 'agy-sr-only', isOn ? 'Disable' : 'Enable'),
-              element('span', 'agy-switch-dot'),
-            );
-            toggleButton.title = `${isOn ? 'Disable' : 'Enable'}${isGrouped && effort ? ` ${effort.toUpperCase()}` : ''}`;
-
-            const menuList = element('div', 'agy-menu-list');
-            menuList.append(
-              button(
-                'Check',
-                async () => {
-                  setStatus(rowStatus, 'Checking…');
-                  try {
-                    const checkRes = await storageAPI.checkModelHealth(model.name);
-                    const mHealth = checkRes[model.name];
-                    if (mHealth?.status === 'healthy') {
-                      setStatus(rowStatus, `🟢 Healthy (${mHealth.latencyMs || 0}ms)`);
-                      showProviderToast(`${shortName} healthy (${mHealth.latencyMs || 0}ms)`, 'success');
-                    } else {
-                      setStatus(rowStatus, `🔴 Unhealthy (${mHealth?.error || 'Failed'})`, true);
-                      showProviderToast(`${shortName} unhealthy: ${mHealth?.error || 'Failed'}`, 'failure', 6000);
-                    }
-                    void renderCustomModelsList();
-                  } catch (e: unknown) {
-                    setStatus(rowStatus, (e as Error)?.message || 'Check failed', true);
-                  }
-                },
-                rowStatus,
+          const rowStatus = statusNode();
+          info.append(titleLine, meta);
+          if (model.nativePickerAvailable === false) {
+            info.append(
+              element(
+                'div',
+                'agy-muted agy-row-meta',
+                typeof model.nativePickerError === 'string'
+                  ? model.nativePickerError
+                  : 'Not currently available in the native model picker. Direct API access remains available.',
               ),
-              button('Test generation', () => openGenerationTest(model), rowStatus),
-              button('Duplicate', () => openModelModal(model, 'duplicate'), rowStatus),
-              ...(model.supportsThinking === false
-                ? []
-                : [
-                    button(
-                      'Effort variants',
-                      () => {
-                        const { body, status, close } = openModal('Create reasoning variants');
-                        body.append(
-                          element(
-                            'p',
-                            'agy-muted',
-                            'Creates three copies with low, medium and high reasoning effort. The provider must support reasoning. For Google and Anthropic formats the thinking budgets are 1,024 / 4,096 / 8,192 tokens; output limits increase if needed to fit the budget. Existing models and credentials are preserved.',
-                          ),
-                        );
-                        body.append(
-                          button(
-                            'Create three variants',
-                            async () => {
-                              requireSuccess(await ipcRenderer.invoke('storage:create-effort-variants', model.name));
-                              close();
-                              await modelsChanged();
-                              showProviderToast(`Created effort variants for ${shortName}`, 'success');
-                            },
-                            status,
-                            true,
-                          ),
-                        );
-                      },
-                      rowStatus,
-                    ),
-                  ]),
-              ...(isGrouped
-                ? [
-                    button(
-                      allDisabled ? 'Enable all efforts' : 'Disable all efforts',
-                      async () => {
-                        const targetEnabled = allDisabled;
-                        for (const variant of slot.variants) {
-                          if ((variant.model.enabled !== false) !== targetEnabled) {
-                            requireSuccess(await storageAPI.saveCustomModel({ ...variant.model, enabled: targetEnabled }));
-                          }
-                        }
-                        await modelsChanged();
-                      },
-                      rowStatus,
-                    ),
-                  ]
-                : []),
             );
-            const menu = element('details', 'agy-menu');
-            const menuSummary = element('summary', 'agy-menu-btn', '⋯');
-            menuSummary.title = isGrouped && effort ? `More actions for ${shortName} (${effort})` : 'More actions';
-            menuSummary.setAttribute('aria-label', `More actions for ${shortName}${isGrouped && effort ? ` (${effort})` : ''}`);
-            menu.append(menuSummary, menuList);
-            menu.addEventListener('click', (event) => {
-              if ((event.target as HTMLElement).closest('button')) menu.open = false;
-            });
-            menu.addEventListener('toggle', () => {
-              if (!menu.open) return;
-              for (const other of target.querySelectorAll<HTMLDetailsElement>('details.agy-menu[open]')) {
-                if (other !== menu) other.open = false;
+          }
+          info.append(rowStatus);
+
+          const makeIconAction = (
+            label: string,
+            svg: string,
+            onClick: () => void | Promise<void>,
+            danger = false,
+          ): HTMLButtonElement => {
+            const btn = document.createElement('button');
+            btn.type = 'button';
+            btn.className = `zc-icon-btn${danger ? ' zc-icon-danger' : ''}`;
+            btn.title = label;
+            btn.append(makeSvgIcon(svg, 14), element('span', 'agy-sr-only', label));
+            btn.addEventListener('click', async () => {
+              btn.disabled = true;
+              try {
+                await onClick();
+              } catch (err) {
+                const msg = err instanceof Error ? err.message : 'Action failed.';
+                setStatus(rowStatus, msg, true);
+                showProviderToast(msg, 'failure', 6000);
+              } finally {
+                btn.disabled = false;
               }
             });
-
-            const actions = element('div', 'agy-row-actions');
-            const effortControl = buildEffortTabs();
-            actions.append(
-              ...(effortControl ? [effortControl] : []),
-              testBtn,
-              editBtn,
-              deleteBtn,
-              toggleButton,
-              menu,
-            );
-            row.replaceChildren(info, actions);
+            return btn;
           };
 
-          renderSlotRow(pickInitialVariant());
+          const slotEfforts = slot.variants
+            .map((v) => (v.effort || '').toLowerCase())
+            .filter((e): e is EffortKey => (EFFORT_KEYS as string[]).includes(e));
+
+          // Inline ZCode row actions: Test (plug), Edit (pencil), Delete (trash), Enable/Disable switch, More menu
+          const testBtn = makeIconAction(
+            'Test',
+            '<path d="M12 22v-5"/><path d="M9 8V2"/><path d="M15 8V2"/><path d="M18 8v5a4 4 0 0 1-4 4h-4a4 4 0 0 1-4-4V8Z"/>',
+            async () => {
+              setStatus(rowStatus, 'Testing…');
+              showProviderToast(`Connecting to ${groupDisplayName} / ${model.externalModelName || model.name}…`, 'pending', 0);
+              const result = requireSuccess(await storageAPI.testModelConnection(model));
+              const msg = result.message || 'Connection successful.';
+              setStatus(rowStatus, msg);
+              showProviderToast(msg, 'success');
+            },
+          );
+          const editBtn = makeIconAction(
+            'Edit',
+            '<path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/>',
+            () =>
+              openModelModal(model, 'edit', {
+                ...(providersTabActive ? { scopedToProvider: true } : {}),
+                ...(isGrouped || slotEfforts.length > 0
+                  ? {
+                      effortSlot: {
+                        baseDisplayName: shortName,
+                        efforts: slotEfforts,
+                        existingVariantNames: slot.variants.map((v) => v.model.name),
+                      },
+                    }
+                  : {}),
+              }),
+          );
+          const deleteBtn = makeIconAction(
+            'Delete',
+            '<path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/>',
+            () => openDeleteModelModal(model, isGrouped ? slot.variants.map((v) => v.model) : undefined, shortName),
+            true,
+          );
+
+          const toggleButton = button(
+            isOn ? 'Disable' : 'Enable',
+            async () => {
+              const nextEnabled = !isOn;
+              toggleButton.setAttribute('aria-checked', String(nextEnabled));
+              const targets = isGrouped ? slot.variants.map((v) => v.model) : [model];
+              for (const targetModel of targets) {
+                if ((targetModel.enabled !== false) !== nextEnabled) {
+                  requireSuccess(await storageAPI.saveCustomModel({ ...targetModel, enabled: nextEnabled }));
+                }
+              }
+              await modelsChanged();
+              showProviderToast(`${groupDisplayName} / ${shortName} saved`, 'success');
+            },
+            rowStatus,
+          );
+          toggleButton.classList.add('agy-switch');
+          toggleButton.setAttribute('role', 'switch');
+          toggleButton.setAttribute('aria-checked', String(isOn));
+          toggleButton.replaceChildren(
+            element('span', 'agy-sr-only', isOn ? 'Disable' : 'Enable'),
+            element('span', 'agy-switch-dot'),
+          );
+          toggleButton.title = `${isOn ? 'Disable' : 'Enable'} ${shortName}`;
+
+          const menuList = element('div', 'agy-menu-list');
+          menuList.append(
+            button(
+              'Check',
+              async () => {
+                setStatus(rowStatus, 'Checking…');
+                try {
+                  const checkRes = await storageAPI.checkModelHealth(model.name);
+                  const mHealth = checkRes[model.name];
+                  if (mHealth?.status === 'healthy') {
+                    setStatus(rowStatus, `🟢 Healthy (${mHealth.latencyMs || 0}ms)`);
+                    showProviderToast(`${shortName} healthy (${mHealth.latencyMs || 0}ms)`, 'success');
+                  } else {
+                    setStatus(rowStatus, `🔴 Unhealthy (${mHealth?.error || 'Failed'})`, true);
+                    showProviderToast(`${shortName} unhealthy: ${mHealth?.error || 'Failed'}`, 'failure', 6000);
+                  }
+                  void renderCustomModelsList();
+                } catch (e: unknown) {
+                  setStatus(rowStatus, (e as Error)?.message || 'Check failed', true);
+                }
+              },
+              rowStatus,
+            ),
+            button('Test generation', () => openGenerationTest(model), rowStatus),
+            button('Duplicate', () => openModelModal(model, 'duplicate'), rowStatus),
+            ...(model.supportsThinking === false
+              ? []
+              : [
+                  button(
+                    'Effort variants',
+                    () => {
+                      const { body, status, close } = openModal('Create reasoning variants');
+                      body.append(
+                        element(
+                          'p',
+                          'agy-muted',
+                          'Creates three copies with low, medium and high reasoning effort. The provider must support reasoning. For Google and Anthropic formats the thinking budgets are 1,024 / 4,096 / 8,192 tokens; output limits increase if needed to fit the budget. Existing models and credentials are preserved.',
+                        ),
+                      );
+                      body.append(
+                        button(
+                          'Create three variants',
+                          async () => {
+                            requireSuccess(await ipcRenderer.invoke('storage:create-effort-variants', model.name));
+                            close();
+                            await modelsChanged();
+                            showProviderToast(`Created effort variants for ${shortName}`, 'success');
+                          },
+                          status,
+                          true,
+                        ),
+                      );
+                    },
+                    rowStatus,
+                  ),
+                ]),
+          );
+          const menu = element('details', 'agy-menu');
+          const menuSummary = element('summary', 'agy-menu-btn', '⋯');
+          menuSummary.title = 'More actions';
+          menuSummary.setAttribute('aria-label', `More actions for ${shortName}`);
+          menu.append(menuSummary, menuList);
+          menu.addEventListener('click', (event) => {
+            if ((event.target as HTMLElement).closest('button')) menu.open = false;
+          });
+          menu.addEventListener('toggle', () => {
+            if (!menu.open) return;
+            for (const other of target.querySelectorAll<HTMLDetailsElement>('details.agy-menu[open]')) {
+              if (other !== menu) other.open = false;
+            }
+          });
+
+          const actions = element('div', 'agy-row-actions');
+          actions.append(testBtn, editBtn, deleteBtn, toggleButton, menu);
+          row.replaceChildren(info, actions);
           modelsList.append(row);
         }
 
@@ -2338,6 +2438,11 @@ window.addEventListener('DOMContentLoaded', () => {
       apiKey?: string;
       copyFrom?: string;
       scopedToProvider?: boolean;
+      effortSlot?: {
+        baseDisplayName: string;
+        efforts: EffortKey[];
+        existingVariantNames: string[];
+      };
     },
   ): Promise<void> {
     const scopedToProvider = Boolean(initialProvider?.scopedToProvider);
@@ -2619,6 +2724,7 @@ window.addEventListener('DOMContentLoaded', () => {
       const cleanExistingDisplayName = (existing?.displayName || '')
         .replace(/^[🟢🔴⚪🟡⭐\s•·|-]+(?:\[[^\]]+\]\s*)?[•·|-]?\s*/u, '')
         .trim();
+      const initialSlot = mode === 'edit' ? initialProvider?.effortSlot : undefined;
       const displayName = field(
         grid,
         'Display name',
@@ -2627,13 +2733,13 @@ window.addEventListener('DOMContentLoaded', () => {
           ? `${cleanExistingDisplayName || existing?.externalModelName || ''} copy`
           : mode === 'discover'
             ? ''
-            : cleanExistingDisplayName,
+            : initialSlot?.baseDisplayName || cleanExistingDisplayName,
       );
       displayName.placeholder = 'Optional';
       modelSec.append(grid);
 
-      // Key model properties right in front (4 compact columns)
-      const propsRow = element('div', 'zc-grid-4');
+      // Key model properties right in front (3 compact columns)
+      const propsRow = element('div', 'zc-grid-3');
       const context = field(
         propsRow,
         'Context window',
@@ -2650,16 +2756,6 @@ window.addEventListener('DOMContentLoaded', () => {
         'number',
       );
       maxOutput.placeholder = '16384';
-      const effort = selectField(
-        propsRow,
-        'Reasoning effort',
-        'agy-reasoning-effort',
-        ['', 'none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'].map((value) => [
-          value,
-          value || 'Default',
-        ]),
-        String(existing?.reasoningEffort || ''),
-      );
       const vision = selectField(
         propsRow,
         'Image input',
@@ -2672,6 +2768,42 @@ window.addEventListener('DOMContentLoaded', () => {
         existing?.supportsVision == null ? '' : String(existing.supportsVision),
       );
       modelSec.append(propsRow);
+
+      // Multi-select chip picker for Supported reasoning efforts
+      const selectedEfforts = new Set<EffortKey>(initialSlot?.efforts || []);
+      let effortsModified = false;
+      const effortPickerHead = element('div', 'agy-effort-picker-head');
+      effortPickerHead.append(
+        element('span', '', 'Supported reasoning efforts'),
+        element('span', 'agy-muted', 'None = single model'),
+      );
+      const effortPicker = element('div', 'agy-effort-picker');
+      effortPicker.id = 'agy-effort-chips';
+      effortPicker.setAttribute('role', 'group');
+      effortPicker.setAttribute('aria-label', 'Supported reasoning efforts');
+      const effortChipLabels: Array<[EffortKey, string]> = [
+        ['minimal', 'Minimal'],
+        ['low', 'Low'],
+        ['medium', 'Medium'],
+        ['high', 'High'],
+        ['xhigh', 'XHigh'],
+      ];
+      for (const [key, caption] of effortChipLabels) {
+        const chip = document.createElement('button');
+        chip.type = 'button';
+        chip.className = 'agy-chip agy-effort-opt';
+        chip.dataset.effort = key;
+        chip.textContent = caption;
+        chip.setAttribute('aria-pressed', String(selectedEfforts.has(key)));
+        chip.addEventListener('click', () => {
+          if (selectedEfforts.has(key)) selectedEfforts.delete(key);
+          else selectedEfforts.add(key);
+          effortsModified = true;
+          chip.setAttribute('aria-pressed', String(selectedEfforts.has(key)));
+        });
+        effortPicker.append(chip);
+      }
+      modelSec.append(effortPickerHead, effortPicker);
       body.append(modelSec);
 
       modelId.addEventListener('blur', async () => {
@@ -2690,11 +2822,60 @@ window.addEventListener('DOMContentLoaded', () => {
         } catch {}
       });
 
-      // ── Section 3: Clean Grouped Advanced Settings ─────────────────────────
+      // ── Section 3: Minimal Category-Based Advanced Settings ────────────────
       const advanced = element('details');
       advanced.append(element('summary', '', 'Advanced settings'));
 
-      advanced.append(element('div', 'zc-adv-sub', 'Identity & State'));
+      type AdvTabKey = 'general' | 'thinking' | 'network' | 'overrides';
+      const advTabDefs: Array<[AdvTabKey, string]> = [
+        ['general', 'General'],
+        ['thinking', 'Thinking'],
+        ['network', 'Network'],
+        ['overrides', 'Overrides'],
+      ];
+      const advTabBar = element('div', 'zc-adv-tabs');
+      advTabBar.setAttribute('role', 'tablist');
+      advTabBar.setAttribute('aria-label', 'Advanced settings categories');
+      const advTabs = new Map<AdvTabKey, HTMLButtonElement>();
+      const advPanels = new Map<AdvTabKey, HTMLElement>();
+      let activeAdvTab: AdvTabKey = 'general';
+
+      const setActiveAdvTab = (next: AdvTabKey) => {
+        activeAdvTab = next;
+        for (const [key, tabBtn] of advTabs) {
+          tabBtn.setAttribute('aria-selected', String(key === activeAdvTab));
+        }
+        for (const [key, panel] of advPanels) {
+          panel.hidden = key !== activeAdvTab;
+        }
+      };
+
+      for (const [key, label] of advTabDefs) {
+        const tabBtn = document.createElement('button');
+        tabBtn.type = 'button';
+        tabBtn.className = 'zc-adv-tab';
+        tabBtn.id = `agy-adv-tab-${key}`;
+        tabBtn.dataset.advTab = key;
+        tabBtn.setAttribute('role', 'tab');
+        tabBtn.setAttribute('aria-controls', `agy-adv-panel-${key}`);
+        tabBtn.setAttribute('aria-selected', String(key === activeAdvTab));
+        tabBtn.textContent = label;
+        tabBtn.addEventListener('click', () => setActiveAdvTab(key));
+        advTabs.set(key, tabBtn);
+        advTabBar.append(tabBtn);
+
+        const panel = element('div', 'zc-adv-panel');
+        panel.id = `agy-adv-panel-${key}`;
+        panel.dataset.advPanel = key;
+        panel.setAttribute('role', 'tabpanel');
+        panel.setAttribute('aria-labelledby', tabBtn.id);
+        panel.hidden = key !== activeAdvTab;
+        advPanels.set(key, panel);
+      }
+      advanced.append(advTabBar);
+
+      // General tab
+      const generalPanel = advPanels.get('general')!;
       const identityGrid = element('div', 'agy-grid');
       const name = field(
         identityGrid,
@@ -2713,12 +2894,23 @@ window.addEventListener('DOMContentLoaded', () => {
         ],
         String(existing?.enabled !== false),
       );
-      advanced.append(identityGrid);
-      const description = field(advanced, 'Description', 'agy-description', String(existing?.description || ''));
+      generalPanel.append(identityGrid);
+      const description = field(generalPanel, 'Description', 'agy-description', String(existing?.description || ''));
       description.placeholder = 'Optional notes';
 
-      advanced.append(element('div', 'zc-adv-sub', 'Thinking & Compaction'));
+      // Thinking tab
+      const thinkingPanel = advPanels.get('thinking')!;
       const compactGrid = element('div', 'agy-grid');
+      const effort = selectField(
+        compactGrid,
+        'Reasoning effort',
+        'agy-reasoning-effort',
+        ['', 'none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'].map((value) => [
+          value,
+          value || 'Default',
+        ]),
+        String(existing?.reasoningEffort || ''),
+      );
       const thinking = field(
         compactGrid,
         'Thinking budget (tokens)',
@@ -2747,9 +2939,10 @@ window.addEventListener('DOMContentLoaded', () => {
       compactionThreshold.max = '90';
       compactionThreshold.placeholder = '80';
       compactionThreshold.title = '10–90% of actual context window. Leave blank for 80% default.';
-      advanced.append(compactGrid);
+      thinkingPanel.append(compactGrid);
 
-      advanced.append(element('div', 'zc-adv-sub', 'Network & Reliability'));
+      // Network tab
+      const networkPanel = advPanels.get('network')!;
       const netGrid = element('div', 'agy-grid');
       const timeout = field(
         netGrid,
@@ -2786,7 +2979,7 @@ window.addEventListener('DOMContentLoaded', () => {
         ],
         String(existing?.allowUnauthorized === true),
       );
-      advanced.append(netGrid);
+      networkPanel.append(netGrid);
 
       const breaker = existing?.circuitBreaker as
         | { enabled?: boolean; failureThreshold?: number; cooldownMs?: number }
@@ -2817,24 +3010,27 @@ window.addEventListener('DOMContentLoaded', () => {
         breaker?.cooldownMs != null ? String(breaker.cooldownMs) : '',
         'number',
       );
-      advanced.append(breakerGrid);
+      networkPanel.append(breakerGrid);
 
-      advanced.append(element('div', 'zc-adv-sub', 'Overrides & Prompt'));
+      // Overrides tab
+      const overridesPanel = advPanels.get('overrides')!;
       const fallbacks = field(
-        advanced,
+        overridesPanel,
         'Fallback models (comma separated)',
         'agy-fallback-models',
         Array.isArray(existing?.fallbackModels) ? existing.fallbackModels.join(', ') : '',
       );
-      const headers = jsonField(advanced, 'Custom headers (JSON)', 'agy-custom-headers', existing?.customHeaders);
-      const extraBody = jsonField(advanced, 'Additional request fields (JSON)', 'agy-extra-body', existing?.extraBody);
+      const headers = jsonField(overridesPanel, 'Custom headers (JSON)', 'agy-custom-headers', existing?.customHeaders);
+      const extraBody = jsonField(overridesPanel, 'Additional request fields (JSON)', 'agy-extra-body', existing?.extraBody);
       const systemPrompt = textAreaField(
-        advanced,
+        overridesPanel,
         'System prompt (appended after default)',
         'agy-system-prompt',
         existing?.systemPrompt,
         'e.g. Always answer concisely.',
       );
+
+      for (const panel of advPanels.values()) advanced.append(panel);
       body.append(advanced);
       const discovery = element('div', 'agy-discovery');
       const discoveryFilter = element('div');
@@ -3116,7 +3312,21 @@ window.addEventListener('DOMContentLoaded', () => {
                 applyDetectedCaps(config, detectedMap[id]);
               }
             }
-            requireSuccess(await storageAPI.saveCustomModel(config));
+            const orderedEfforts = EFFORT_KEYS.filter((key) => selectedEfforts.has(key));
+            const existingVariantNames = initialSlot?.existingVariantNames;
+            const shouldSyncEfforts =
+              orderedEfforts.length > 0 || (Boolean(existingVariantNames?.length) && effortsModified);
+            if (shouldSyncEfforts) {
+              requireSuccess(
+                await storageAPI.syncModelEfforts({
+                  baseModel: config,
+                  efforts: orderedEfforts,
+                  ...(existingVariantNames?.length ? { existingVariantNames } : {}),
+                }),
+              );
+            } else {
+              requireSuccess(await storageAPI.saveCustomModel(config));
+            }
             await modelsChanged();
             close();
           },

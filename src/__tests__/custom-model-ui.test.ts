@@ -1888,4 +1888,185 @@ describe('Google fleet and native picker search', () => {
     expect(nativeModels.style.display).toBe('');
     expect(f.document.getElementById('agy-custom-models-section')).toBeNull();
   });
+
+  it('adds top clearance on full-width Providers view to clear Settings close button', async () => {
+    const f = await fixture();
+    const styleText = f.document.getElementById('agy-manager-style')?.textContent || '';
+    expect(styleText).toMatch(/#agy-custom-models-section\[data-fullwidth="true"\][^{]*\{[^}]*padding:52px/);
+  });
+
+  it('displays real API key length mask and reveals/re-masks via storage:reveal-api-key', async () => {
+    const f = await fixture(undefined, [{ ...model, apiKey: '********', apiKeyLength: 24 }]);
+    f.handlers['storage:reveal-api-key'] = (name: string) => ({
+      success: true,
+      apiKey: name === model.name ? 'sk-real-secret-key-12345' : '',
+    });
+    const keyInput = f.document.querySelector<HTMLInputElement>('.zc-input-wrap input')!;
+    const eyeBtn = f.document.querySelector<HTMLButtonElement>('.zc-eye-btn')!;
+    expect(keyInput.type).toBe('password');
+    expect(keyInput.value).toHaveLength(24);
+
+    eyeBtn.click();
+    await settle();
+    expect(f.invoke).toHaveBeenCalledWith('storage:reveal-api-key', model.name);
+    expect(keyInput.type).toBe('text');
+    expect(keyInput.value).toBe('sk-real-secret-key-12345');
+
+    // Blurring without editing must not overwrite the saved key
+    keyInput.dispatchEvent(new f.dom.window.Event('blur'));
+    await settle();
+    expect(f.invoke.mock.calls.some(([ch]) => ch === 'storage:save-custom-model')).toBe(false);
+
+    // Toggling hide re-masks the input
+    eyeBtn.click();
+    await settle();
+    expect(keyInput.type).toBe('password');
+    expect(keyInput.value).toHaveLength(24);
+  });
+
+  it('deletes an entire provider group through an in-app confirmation modal', async () => {
+    const customModels = [
+      {
+        ...model,
+        name: 'models/shared-1',
+        displayName: 'Alpha',
+        provider: 'custom',
+        providerName: 'Shared Group',
+        apiUrl: 'https://shared.example/v1',
+        externalModelName: 'alpha',
+      },
+      {
+        ...model,
+        name: 'models/shared-2',
+        displayName: 'Beta',
+        provider: 'custom',
+        providerName: 'Shared Group',
+        apiUrl: 'https://shared.example/v1',
+        externalModelName: 'beta',
+      },
+    ];
+    const f = await fixture(undefined, customModels);
+    await f.click('Delete provider');
+    const dialog = f.document.querySelector<HTMLElement>('[role="dialog"]')!;
+    expect(dialog.textContent).toContain('Delete "Shared Group" and all 2 models?');
+    await f.click('Cancel', dialog);
+    expect(f.getModels()).toHaveLength(2);
+
+    await f.click('Delete provider');
+    const confirmDialog = f.document.querySelector<HTMLElement>('[role="dialog"]')!;
+    await f.click('Delete provider', confirmDialog);
+    expect(f.invoke).toHaveBeenCalledWith('storage:delete-custom-model', 'models/shared-1');
+    expect(f.invoke).toHaveBeenCalledWith('storage:delete-custom-model', 'models/shared-2');
+    expect(f.getModels()).toHaveLength(0);
+  });
+
+  it('combines effort variants into one row without effort tabs and syncs via multi-effort chip picker', async () => {
+    const variants = [
+      {
+        ...model,
+        name: 'models/claude-low',
+        displayName: 'Claude Sonnet 4.6 (Low)',
+        externalModelName: 'claude-sonnet-4-6',
+        reasoningEffort: 'low',
+        enabled: false,
+      },
+      {
+        ...model,
+        name: 'models/claude-medium',
+        displayName: 'Claude Sonnet 4.6 (Medium)',
+        externalModelName: 'claude-sonnet-4-6',
+        reasoningEffort: 'medium',
+        enabled: true,
+      },
+      {
+        ...model,
+        name: 'models/claude-high',
+        displayName: 'Claude Sonnet 4.6 (High)',
+        externalModelName: 'claude-sonnet-4-6',
+        reasoningEffort: 'high',
+        enabled: true,
+      },
+    ];
+    const f = await fixture(undefined, variants);
+    f.handlers['storage:sync-model-efforts'] = () => ({ success: true, count: 3 });
+
+    const rows = f.document.querySelectorAll<HTMLElement>('.agy-row');
+    expect(rows).toHaveLength(1);
+    expect(rows[0].querySelector('.agy-effort-tabs')).toBeNull();
+    expect(rows[0].querySelector('.agy-row-title strong')?.textContent).toContain('Claude Sonnet 4.6');
+    expect(rows[0].querySelector('.agy-effort-chip')?.textContent).toBe('Low · Med · High');
+
+    // Test runs against lowest enabled variant (medium, since low is disabled)
+    await f.click('Test', rows[0]);
+    expect(f.invoke).toHaveBeenCalledWith(
+      'storage:test-model-connection',
+      expect.objectContaining({ name: 'models/claude-medium' }),
+    );
+
+    // Edit pre-selects all active efforts and strips effort suffix from display name
+    await f.click('Edit', rows[0]);
+    expect(f.input('agy-display-name').value).toBe('Claude Sonnet 4.6');
+    const chips = Array.from(f.document.querySelectorAll<HTMLButtonElement>('#agy-effort-chips .agy-effort-opt'));
+    const pressed = () => chips.filter((c) => c.getAttribute('aria-pressed') === 'true').map((c) => c.dataset.effort);
+    expect(pressed()).toEqual(['low', 'medium', 'high']);
+
+    // Deselect Low, select XHigh, and save -> calls storage:sync-model-efforts
+    chips.find((c) => c.dataset.effort === 'low')!.click();
+    chips.find((c) => c.dataset.effort === 'xhigh')!.click();
+    expect(pressed()).toEqual(['medium', 'high', 'xhigh']);
+    await f.click('Save model');
+    expect(f.invoke).toHaveBeenCalledWith(
+      'storage:sync-model-efforts',
+      expect.objectContaining({
+        efforts: ['medium', 'high', 'xhigh'],
+        existingVariantNames: ['models/claude-low', 'models/claude-medium', 'models/claude-high'],
+      }),
+    );
+
+    // Row Disable switch disables all enabled variants in the slot together
+    const rowAfter = f.document.querySelector<HTMLElement>('.agy-row')!;
+    await f.click('Disable', rowAfter);
+    expect(f.getModels().every((m) => m.enabled === false)).toBe(true);
+
+    // Row Delete removes all variants in the slot after confirmation
+    await f.click('Delete', f.document.querySelector<HTMLElement>('.agy-row')!);
+    const delDialog = f.document.querySelector<HTMLElement>('[role="dialog"]')!;
+    expect(delDialog.textContent).toContain('all 3 effort variants');
+    await f.click('Delete model', delDialog);
+    expect(f.getModels()).toHaveLength(0);
+  });
+
+  it('organizes Advanced settings into compact category tabs while keeping all inputs in the DOM', async () => {
+    const f = await fixture();
+    await f.click('Edit', f.document.getElementById('agy-custom-models-content')!);
+    const tabs = Array.from(f.document.querySelectorAll<HTMLButtonElement>('.zc-adv-tab'));
+    expect(tabs.map((t) => t.textContent)).toEqual(['General', 'Thinking', 'Network', 'Overrides']);
+
+    const panel = (key: string) => f.document.getElementById(`agy-adv-panel-${key}`)!;
+    expect(panel('general').hidden).toBe(false);
+    expect(panel('thinking').hidden).toBe(true);
+    expect(panel('network').hidden).toBe(true);
+    expect(panel('overrides').hidden).toBe(true);
+
+    // Inputs in hidden tabs remain accessible in the DOM
+    expect(f.document.getElementById('agy-reasoning-effort')).toBeTruthy();
+    expect(f.document.getElementById('agy-thinking-budget')).toBeTruthy();
+    expect(f.document.getElementById('agy-compaction-effort')).toBeTruthy();
+    expect(f.document.getElementById('agy-compaction-threshold')).toBeTruthy();
+    expect(f.document.getElementById('agy-timeout')).toBeTruthy();
+    expect(f.document.getElementById('agy-custom-headers')).toBeTruthy();
+
+    // Switching tabs reveals only the selected category
+    await f.click('Thinking', f.document.querySelector('[role="dialog"]')!);
+    expect(panel('general').hidden).toBe(true);
+    expect(panel('thinking').hidden).toBe(false);
+
+    await f.click('Network', f.document.querySelector('[role="dialog"]')!);
+    expect(panel('thinking').hidden).toBe(true);
+    expect(panel('network').hidden).toBe(false);
+
+    await f.click('Overrides', f.document.querySelector('[role="dialog"]')!);
+    expect(panel('network').hidden).toBe(true);
+    expect(panel('overrides').hidden).toBe(false);
+  });
 });

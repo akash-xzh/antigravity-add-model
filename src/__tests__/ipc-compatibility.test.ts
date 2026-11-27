@@ -257,6 +257,8 @@ describe('standalone custom model addon', () => {
     expect([...fixture.handlers.keys()]).toEqual([
       'storage:get-custom-models',
       'storage:save-custom-model',
+      'storage:reveal-api-key',
+      'storage:sync-model-efforts',
       'storage:delete-custom-model',
       'storage:test-model-connection',
       'storage:test-model-generation',
@@ -264,6 +266,7 @@ describe('standalone custom model addon', () => {
       'storage:get-provider-presets',
       'storage:discover-models',
       'storage:discover-local',
+      'storage:detect-model-capabilities',
       'storage:export-custom-models',
       'storage:import-custom-models',
       'storage:get-gateway',

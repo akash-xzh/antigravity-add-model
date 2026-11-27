@@ -261,3 +261,253 @@ describe('shared management model identity responses', () => {
     expect(secondRead['models/proxy-updated']?.status).toBe('cooldown');
   });
 });
+
+describe('apiKeyLength, storage:reveal-api-key, and storage:sync-model-efforts', () => {
+  it('returns apiKeyLength in storage:get-custom-models while keeping apiKey masked and omits it for empty/none keys', () => {
+    const f = fixture();
+    f.manager.saveModel({ ...example, name: 'models/with-key', apiKey: 'sk-live-secret-1234567890' });
+    f.manager.saveModel({ ...example, name: 'models/empty-key', apiKey: '' });
+    f.manager.saveModel({ ...example, name: 'models/none-key', apiKey: 'none' });
+
+    const list = f.list();
+    const withKey = list.find((m) => m.name === 'models/with-key')!;
+    const emptyKey = list.find((m) => m.name === 'models/empty-key')!;
+    const noneKey = list.find((m) => m.name === 'models/none-key')!;
+
+    expect(withKey.apiKey).toBe('********');
+    expect(withKey.apiKeyLength).toBe('sk-live-secret-1234567890'.length);
+    expect(JSON.stringify(list)).not.toContain('sk-live-secret-1234567890');
+
+    expect(emptyKey.apiKey).toBe('');
+    expect(emptyKey.apiKeyLength).toBeUndefined();
+    expect(noneKey.apiKey).toBe('');
+    expect(noneKey.apiKeyLength).toBeUndefined();
+
+    // Saving back a returned model must not persist apiKeyLength to disk
+    f.actions['storage:save-custom-model'](withKey);
+    const persisted = f.manager.store.read().find((m) => m.name === 'models/with-key')!;
+    expect(persisted).not.toHaveProperty('apiKeyLength');
+  });
+
+  it('reveals the decrypted apiKey via storage:reveal-api-key and handles empty/none/missing models', () => {
+    const f = fixture();
+    f.manager.saveModel({ ...example, name: 'models/secret-one', apiKey: 'sk-revealed-key-999' });
+    f.manager.saveModel({ ...example, name: 'models/no-key', apiKey: 'none' });
+    f.manager.saveModel({ ...example, name: 'models/blank-key', apiKey: '' });
+
+    expect(f.actions['storage:reveal-api-key']('models/secret-one')).toEqual({
+      success: true,
+      apiKey: 'sk-revealed-key-999',
+    });
+    expect(f.actions['storage:reveal-api-key']('models/no-key')).toEqual({
+      success: true,
+      apiKey: '',
+    });
+    expect(f.actions['storage:reveal-api-key']('models/blank-key')).toEqual({
+      success: true,
+      apiKey: '',
+    });
+    expect(f.actions['storage:reveal-api-key']('models/does-not-exist')).toEqual({
+      success: false,
+      error: expect.any(String),
+    });
+    expect(f.actions['storage:reveal-api-key']('')).toEqual({
+      success: false,
+      error: expect.any(String),
+    });
+  });
+
+  it('syncs multiple effort variants, preserves masked credentials, propagates properties, and deletes removed variants', () => {
+    const f = fixture();
+    // Seed an initial single model with real credentials
+    f.manager.saveModel({
+      ...example,
+      name: 'models/gpt-5',
+      displayName: 'GPT-5',
+      apiKey: 'sk-super-secret-key',
+      customHeaders: { 'x-tenant': 'tenant-secret' },
+      contextWindow: 128000,
+      maxOutputTokens: 16384,
+      supportsVision: true,
+      providerName: 'My Provider',
+    });
+
+    // Expand to low + medium + high while passing masked credentials
+    const created = f.actions['storage:sync-model-efforts']({
+      baseModel: {
+        ...example,
+        name: 'models/gpt-5',
+        displayName: 'GPT-5',
+        apiKey: '********',
+        customHeaders: { 'x-tenant': '********' },
+        contextWindow: 200000,
+        maxOutputTokens: 32768,
+        supportsVision: true,
+        enabled: true,
+        providerName: 'My Provider',
+      },
+      efforts: ['low', 'medium', 'high'],
+      existingVariantNames: ['models/gpt-5'],
+    }) as { success: boolean; count?: number };
+
+    expect(created).toEqual({ success: true, count: 3 });
+    const afterCreate = f.list();
+    expect(afterCreate.map((m) => m.name).sort()).toEqual([
+      'models/gpt-5-high',
+      'models/gpt-5-low',
+      'models/gpt-5-medium',
+    ]);
+    for (const [effort, label] of [
+      ['low', 'Low'],
+      ['medium', 'Medium'],
+      ['high', 'High'],
+    ] as const) {
+      const variant = afterCreate.find((m) => m.name === `models/gpt-5-${effort}`)!;
+      expect(variant).toMatchObject({
+        displayName: `GPT-5 (${label})`,
+        reasoningEffort: effort,
+        contextWindow: 200000,
+        maxOutputTokens: 32768,
+        supportsVision: true,
+        enabled: true,
+        providerName: 'My Provider',
+        apiKey: '********',
+        apiKeyLength: 'sk-super-secret-key'.length,
+      });
+      expect(f.actions['storage:reveal-api-key'](variant.name)).toEqual({
+        success: true,
+        apiKey: 'sk-super-secret-key',
+      });
+    }
+
+    // Update efforts to remove medium and add xhigh, updating shared properties
+    const updated = f.actions['storage:sync-model-efforts']({
+      baseModel: {
+        ...example,
+        name: 'models/gpt-5-low',
+        displayName: 'GPT-5 (Low)',
+        apiKey: '********',
+        customHeaders: { 'x-tenant': '********' },
+        contextWindow: 256000,
+        maxOutputTokens: 16384,
+        enabled: false,
+      },
+      efforts: ['low', 'xhigh'],
+      existingVariantNames: ['models/gpt-5-low', 'models/gpt-5-medium', 'models/gpt-5-high'],
+    }) as { success: boolean; count?: number };
+
+    expect(updated).toEqual({ success: true, count: 2 });
+    const afterUpdate = f.list();
+    expect(afterUpdate.map((m) => m.name).sort()).toEqual(['models/gpt-5-low', 'models/gpt-5-xhigh']);
+    expect(afterUpdate.find((m) => m.name === 'models/gpt-5-xhigh')).toMatchObject({
+      displayName: 'GPT-5 (XHigh)',
+      reasoningEffort: 'xhigh',
+      contextWindow: 256000,
+      enabled: false,
+    });
+    expect(f.actions['storage:reveal-api-key']('models/gpt-5-xhigh')).toEqual({
+      success: true,
+      apiKey: 'sk-super-secret-key',
+    });
+
+    // Collapse back to single model (efforts: []) and clean up stale variants
+    const collapsed = f.actions['storage:sync-model-efforts']({
+      baseModel: {
+        ...example,
+        name: 'models/gpt-5-low',
+        displayName: 'GPT-5 (Low)',
+        apiKey: '********',
+        customHeaders: { 'x-tenant': '********' },
+        contextWindow: 128000,
+      },
+      efforts: [],
+      existingVariantNames: ['models/gpt-5-low', 'models/gpt-5-xhigh'],
+    }) as { success: boolean; count?: number };
+
+    expect(collapsed).toEqual({ success: true, count: 1 });
+    const afterCollapse = f.list();
+    expect(afterCollapse.map((m) => m.name)).toEqual(['models/gpt-5']);
+    expect(afterCollapse[0]).toMatchObject({
+      name: 'models/gpt-5',
+      displayName: 'GPT-5',
+      contextWindow: 128000,
+      apiKey: '********',
+    });
+    expect(f.actions['storage:reveal-api-key']('models/gpt-5')).toEqual({
+      success: true,
+      apiKey: 'sk-super-secret-key',
+    });
+  });
+
+  it('applies thinkingBudget and maxOutputTokens for non-openai formats in storage:sync-model-efforts', () => {
+    const f = fixture();
+    const res = f.actions['storage:sync-model-efforts']({
+      baseModel: {
+        name: 'models/claude-sonnet',
+        displayName: 'Claude Sonnet',
+        provider: 'anthropic',
+        apiUrl: 'https://api.anthropic.com/v1',
+        externalModelName: 'claude-sonnet-4-5',
+        apiKey: 'sk-ant-test-1234',
+        apiFormat: 'anthropic',
+        contextWindow: 200000,
+        maxOutputTokens: 8192,
+      },
+      efforts: ['minimal', 'low', 'medium', 'high', 'xhigh'],
+    }) as { success: boolean; count?: number };
+
+    expect(res).toEqual({ success: true, count: 5 });
+    const list = f.list();
+    expect(list.find((m) => m.name === 'models/claude-sonnet-minimal')).toMatchObject({
+      displayName: 'Claude Sonnet (Minimal)',
+      reasoningEffort: 'minimal',
+      thinkingBudget: 512,
+      maxOutputTokens: 8192,
+    });
+    expect(list.find((m) => m.name === 'models/claude-sonnet-low')).toMatchObject({
+      displayName: 'Claude Sonnet (Low)',
+      reasoningEffort: 'low',
+      thinkingBudget: 1024,
+      maxOutputTokens: 8192,
+    });
+    expect(list.find((m) => m.name === 'models/claude-sonnet-high')).toMatchObject({
+      displayName: 'Claude Sonnet (High)',
+      reasoningEffort: 'high',
+      thinkingBudget: 8192,
+      maxOutputTokens: 9216,
+    });
+    expect(list.find((m) => m.name === 'models/claude-sonnet-xhigh')).toMatchObject({
+      displayName: 'Claude Sonnet (XHigh)',
+      reasoningEffort: 'xhigh',
+      thinkingBudget: 16384,
+      maxOutputTokens: 17408,
+    });
+  });
+
+  it('rejects invalid efforts or masked key without existing source without mutating saved models', () => {
+    const f = fixture();
+    f.manager.saveModel(example);
+
+    const invalidEffort = f.actions['storage:sync-model-efforts']({
+      baseModel: example,
+      efforts: ['turbo'],
+    }) as { success: boolean; error?: string };
+    expect(invalidEffort.success).toBe(false);
+    expect(invalidEffort.error).toContain('Invalid reasoning effort');
+
+    const missingSource = f.actions['storage:sync-model-efforts']({
+      baseModel: { ...example, name: 'models/brand-new', apiKey: '********' },
+      efforts: ['low'],
+    }) as { success: boolean; error?: string };
+    expect(missingSource.success).toBe(false);
+
+    const noThinking = f.actions['storage:sync-model-efforts']({
+      baseModel: { ...example, supportsThinking: false },
+      efforts: ['high'],
+    }) as { success: boolean; error?: string };
+    expect(noThinking.success).toBe(false);
+
+    // Original model remains untouched
+    expect(f.list().map((m) => m.name)).toEqual([example.name]);
+  });
+});
