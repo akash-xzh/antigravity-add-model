@@ -171,6 +171,7 @@ window.addEventListener('DOMContentLoaded', () => {
   let selectedProviderKey = '';
   let rightPaneMode: 'detail' | 'template-picker' = 'detail';
   let apiKeyVisible = false;
+  let providersTabActive = false;
   let providerToast: { text: string; type: 'pending' | 'success' | 'failure' } | null = null;
   let providerToastTimer: ReturnType<typeof setTimeout> | undefined;
   let cancelModalOperation: (() => void) | undefined;
@@ -323,11 +324,28 @@ window.addEventListener('DOMContentLoaded', () => {
       #agy-custom-models-section *,#agy-modal-overlay *{box-sizing:border-box}
       #agy-custom-models-section [hidden],#agy-modal-overlay [hidden]{display:none!important}
       #agy-custom-models-section{margin:24px 0;padding:20px;border:1px solid rgba(255,255,255,.10);border-radius:12px;background:#121214;min-width:0}
-      #agy-custom-models-section h2,#agy-modal-overlay h2{font-size:17px;margin:0;color:#f4f4f5;font-weight:600;letter-spacing:-.01em}
+      #agy-custom-models-section[data-fullwidth="true"]{margin:0;padding:24px 28px 32px;border:0;border-radius:0;background:transparent;width:100%;max-width:none;min-height:100%;box-sizing:border-box}
+      #agy-custom-models-section[data-fullwidth="true"] .zc-split-card{min-height:calc(100vh - 230px);grid-template-columns:240px minmax(0,1fr)}
+      #agy-providers-banner{margin:18px 0;padding:14px 16px;border-radius:10px;border:1px solid rgba(255,255,255,.10);background:#1b1b1e;display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;font:13px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#f4f4f5}
+      #agy-providers-banner .agy-btn{appearance:none;font:inherit;font-size:12.5px;font-weight:600;padding:6px 13px;border-radius:8px;border:1px solid #f4f4f5;background:#f4f4f5;color:#09090b;cursor:pointer;white-space:nowrap}
+      #agy-providers-banner .agy-btn:hover{background:#e4e4e7}
+      .agy-providers-nav-tab{width:100%;text-align:left;cursor:pointer;transition:background .12s ease,color .12s ease}
+      .agy-providers-nav-tab[data-active="true"]{background:rgba(255,255,255,.11)!important;color:#fafafa!important;font-weight:500}
+      #agy-custom-models-section h2,#agy-modal-overlay h2{font-size:18px;margin:0;color:#f4f4f5;font-weight:600;letter-spacing:-.015em}
       #agy-custom-models-section h3{font-size:14px;margin:0;color:#f4f4f5;font-weight:600}
       .agy-toolbar,.agy-actions,.agy-group-heading,.agy-row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
-      .agy-toolbar{justify-content:space-between;margin-bottom:8px}.agy-actions{margin:8px 0}
-      .agy-toolbar .agy-btn{padding:5px 11px;font-size:12px;border-radius:8px}
+      .agy-toolbar{justify-content:space-between;margin-bottom:6px}.agy-actions{margin:8px 0}
+      .agy-toolbar .agy-btn{padding:6px 12px;font-size:12.5px;border-radius:8px}
+      .agy-tools-menu{position:relative}
+      .agy-tools-btn{list-style:none;cursor:pointer;display:inline-flex;align-items:center;gap:5px;padding:6px 11px;font-size:12.5px;font-weight:500;border-radius:8px;border:1px solid rgba(255,255,255,.12);background:rgba(255,255,255,.05);color:#e4e4e7;user-select:none;transition:background .12s ease,border-color .12s ease}
+      .agy-tools-btn::-webkit-details-marker{display:none}
+      .agy-tools-btn:hover,.agy-tools-menu[open] .agy-tools-btn{background:rgba(255,255,255,.10);border-color:rgba(255,255,255,.22);color:#fafafa}
+      .agy-tools-popover{position:absolute;right:0;top:calc(100% + 6px);z-index:45;min-width:220px;padding:6px;border-radius:10px;border:1px solid rgba(255,255,255,.16);background:#232327;box-shadow:0 16px 40px rgba(0,0,0,.65);display:flex;flex-direction:column;gap:2px}
+      #agy-custom-models-section .agy-tools-popover .agy-btn{width:100%;text-align:left;border:0;background:transparent;border-radius:6px;padding:7px 10px;font-size:12.5px;color:#e4e4e7}
+      #agy-custom-models-section .agy-tools-popover .agy-btn:hover{background:rgba(255,255,255,.08);color:#fafafa}
+      .agy-tools-divider{height:1px;background:rgba(255,255,255,.09);margin:4px 2px}
+      .agy-tools-popover .agy-toggle-label{padding:6px 10px;font-size:12px;color:#d4d4d8;border-radius:6px}
+      .agy-tools-popover .agy-toggle-label:hover{background:rgba(255,255,255,.06)}
       .agy-muted{color:#a1a1aa;font-size:12px;overflow-wrap:anywhere}
       .agy-sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
       /* ZCode two-pane Models UI (B7n / R7n / b8n / V7n / l8n / K6n / G6n) */
@@ -415,22 +433,39 @@ window.addEventListener('DOMContentLoaded', () => {
       .agy-chip:hover{color:#f4f4f5;border-color:rgba(255,255,255,.20)}
       .agy-chip[aria-pressed="true"]{color:#09090b;background:#f4f4f5;border-color:#f4f4f5;font-weight:600}
       @media(max-width:680px){.zc-split-card{grid-template-columns:1fr}.zc-sidebar{border-right:0;border-bottom:1px solid rgba(255,255,255,.10);flex-direction:row;overflow-x:auto}.zc-tpl-grid{grid-template-columns:1fr}}
-      #agy-custom-models-section .agy-btn,#agy-modal-overlay .agy-btn{appearance:none;font:inherit;color:#e4e4e7;background:#27272c;border:1px solid #414149;border-radius:6px;padding:6px 10px;cursor:pointer;white-space:nowrap}
-      #agy-custom-models-section .agy-primary,#agy-modal-overlay .agy-primary{background:#e4e4e7;color:#18181b;border-color:#e4e4e7;font-weight:600}
-      #agy-custom-models-section .agy-btn:hover,#agy-modal-overlay .agy-btn:hover{filter:brightness(1.12)}
-      #agy-custom-models-section .agy-btn:disabled,#agy-modal-overlay .agy-btn:disabled{opacity:.5;cursor:wait}
-      #agy-custom-models-section :focus-visible,#agy-modal-overlay :focus-visible{outline:2px solid #a78bfa;outline-offset:3px}
-      .agy-status{color:#86efac;font-size:12px;margin-top:8px;white-space:pre-wrap;overflow-wrap:anywhere}.agy-status:empty{display:none}.agy-error{color:#fca5a5}
-      .agy-field{display:flex;flex-direction:column;gap:5px;margin-bottom:12px;min-width:0;color:#a1a1aa}
-      #agy-custom-models-section input,#agy-modal-overlay input,#agy-modal-overlay select,#agy-modal-overlay textarea{font:inherit;width:100%;background:#25252a;border:1px solid #414149;border-radius:6px;color:#fafafa;padding:8px 10px;min-width:0}
-      #agy-modal-overlay textarea{font-family:ui-monospace,monospace;resize:vertical}#agy-modal-overlay input[type=checkbox],#agy-custom-models-section input[type=checkbox]{width:auto!important;accent-color:#a78bfa;cursor:pointer;margin:0 6px 0 0}
+      #agy-custom-models-section .agy-btn,#agy-modal-overlay .agy-btn{appearance:none;font:inherit;font-size:12.5px;font-weight:500;color:#e4e4e7;background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.12);border-radius:8px;padding:6px 12px;cursor:pointer;white-space:nowrap;transition:background .13s ease,border-color .13s ease}
+      #agy-custom-models-section .agy-primary,#agy-modal-overlay .agy-primary{background:#f4f4f5;color:#09090b;border-color:#f4f4f5;font-weight:600}
+      #agy-custom-models-section .agy-btn:hover,#agy-modal-overlay .agy-btn:hover{background:rgba(255,255,255,.10);border-color:rgba(255,255,255,.22)}
+      #agy-custom-models-section .agy-primary:hover,#agy-modal-overlay .agy-primary:hover{background:#e4e4e7;border-color:#e4e4e7}
+      #agy-custom-models-section .agy-btn:disabled,#agy-modal-overlay .agy-btn:disabled{opacity:.48;cursor:wait}
+      #agy-custom-models-section :focus-visible,#agy-modal-overlay :focus-visible{outline:2px solid #38bdf8;outline-offset:2px}
+      .agy-status{color:#86efac;font-size:12.5px;font-weight:500;margin-top:10px;padding:8px 12px;border-radius:8px;border:1px solid rgba(34,197,94,.30);background:rgba(34,197,94,.10);white-space:pre-wrap;overflow-wrap:anywhere}.agy-status:empty{display:none}.agy-error{color:#fca5a5;border-color:rgba(239,68,68,.35);background:rgba(239,68,68,.12)}
+      .agy-row .agy-status{margin-top:4px;padding:3px 7px;font-size:11px;border-radius:6px}
+      .agy-field{display:flex;flex-direction:column;gap:5px;margin-bottom:12px;min-width:0;color:#a1a1aa;font-size:12px;font-weight:500}
+      #agy-custom-models-section input,#agy-modal-overlay input,#agy-modal-overlay select,#agy-modal-overlay textarea{font:inherit;font-size:13px;font-weight:400;width:100%;background:#232327;border:1px solid rgba(255,255,255,.11);border-radius:8px;color:#f4f4f5;padding:8px 11px;min-width:0;outline:none;transition:border-color .13s ease,background .13s ease}
+      #agy-custom-models-section input:hover,#agy-modal-overlay input:hover,#agy-modal-overlay select:hover,#agy-modal-overlay textarea:hover{border-color:rgba(255,255,255,.20)}
+      #agy-custom-models-section input:focus,#agy-modal-overlay input:focus,#agy-modal-overlay select:focus,#agy-modal-overlay textarea:focus{background:#161618;border-color:#38bdf8;box-shadow:0 0 0 2px rgba(56,189,248,.16)}
+      #agy-modal-overlay select option{background:#232327;color:#f4f4f5}
+      #agy-modal-overlay textarea{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px;resize:vertical}#agy-modal-overlay input[type=checkbox],#agy-custom-models-section input[type=checkbox]{width:auto!important;accent-color:#38bdf8;cursor:pointer;margin:0 6px 0 0}
       .agy-options-row{display:flex;align-items:center;gap:16px;margin:8px 0 12px;font-size:12px;color:#d4d4d8}
       .agy-toggle-label{display:inline-flex;align-items:center;gap:6px;cursor:pointer;user-select:none}
-      #agy-modal-overlay{position:fixed;inset:0;z-index:999999;background:#000a;display:flex;align-items:center;justify-content:center;padding:20px}
-      #agy-modal-card{width:680px;max-width:100%;max-height:90vh;overflow:auto;background:#18181b;border:1px solid #414149;border-radius:12px;padding:24px;box-shadow:0 24px 80px #0008}
-      .agy-grid{display:grid;grid-template-columns:1fr 1fr;gap:0 14px}.agy-discovery{max-height:240px;overflow:auto;margin:12px 0}
-      .agy-choice{display:flex;gap:10px;align-items:center;padding:7px 0;overflow-wrap:anywhere}.agy-choice span{min-width:0}
-      #agy-modal-overlay details{border:1px solid #303036;border-radius:8px;margin:12px 0;padding:12px}#agy-modal-overlay summary{cursor:pointer;margin-bottom:10px;font-weight:500}
+      #agy-modal-overlay{position:fixed;inset:0;z-index:999999;background:rgba(0,0,0,.66);backdrop-filter:blur(3px);display:flex;align-items:center;justify-content:center;padding:20px}
+      #agy-modal-card{width:620px;max-width:100%;max-height:88vh;display:flex;flex-direction:column;overflow:hidden;background:#1b1b1e;border:1px solid rgba(255,255,255,.15);border-radius:14px;padding:0;box-shadow:0 28px 84px rgba(0,0,0,.72)}
+      .zc-modal-head{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:15px 20px;border-bottom:1px solid rgba(255,255,255,.09);flex-shrink:0}
+      .zc-modal-body{flex:1 1 auto;overflow-y:auto;padding:18px 20px}
+      .zc-modal-status-wrap{padding:0 20px 14px;flex-shrink:0}
+      .zc-modal-status-wrap:has(.agy-status:empty){padding-bottom:0}
+      .zc-modal-rec-bar{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:9px 12px;margin-bottom:14px;border-radius:9px;border:1px solid rgba(255,255,255,.09);background:rgba(255,255,255,.03)}
+      .zc-modal-rec-left{display:flex;align-items:center;gap:9px;font-size:12.5px;color:#f4f4f5;font-weight:500}
+      .zc-modal-footer{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;padding-top:14px;margin-top:14px;border-top:1px solid rgba(255,255,255,.09)}
+      .zc-modal-footer-left,.zc-modal-footer-right{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+      .agy-grid{display:grid;grid-template-columns:1fr 1fr;gap:0 14px}.agy-discovery{max-height:240px;overflow:auto;margin:12px 0;border-radius:8px;border:1px solid rgba(255,255,255,.09);background:#161618;padding:4px 10px}
+      .agy-discovery:empty{display:none}
+      .agy-choice{display:flex;gap:10px;align-items:center;padding:7px 2px;border-bottom:1px solid rgba(255,255,255,.06);overflow-wrap:anywhere}.agy-choice:last-child{border-bottom:0}.agy-choice span{min-width:0}
+      #agy-modal-overlay details{border:1px solid rgba(255,255,255,.09);border-radius:10px;margin:14px 0 6px;padding:10px 14px;background:rgba(255,255,255,.02)}#agy-modal-overlay summary{cursor:pointer;font-size:13px;font-weight:500;color:#e4e4e7;user-select:none}#agy-modal-overlay details[open] summary{margin-bottom:12px}
+      #agy-modal-overlay .agy-switch{position:relative;display:inline-flex;align-items:center;width:30px;height:17px;padding:0;border-radius:9999px;border:1px solid transparent;background:#3a3a42;cursor:pointer;flex-shrink:0;transition:background .18s ease}
+      #agy-modal-overlay .agy-switch[aria-checked="true"]{background:#22c55e}
+      #agy-modal-overlay .agy-switch[aria-checked="true"] .agy-switch-dot{transform:translateX(14px)}
       .agy-fleet{margin:18px 0;border:1px solid #303036;border-radius:10px;padding:14px;min-width:0}.agy-fleet-table{width:100%;border-collapse:separate;border-spacing:0 12px;text-align:left;table-layout:fixed}.agy-fleet-table td{padding:0}.agy-fleet-card{background:#202024;border:1px solid #3f3f46;border-radius:10px;padding:16px;min-width:0}.agy-fleet-card-header{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap}.agy-fleet-card-header .agy-actions{margin:0}.agy-fleet-label{font-size:14px;font-weight:600;overflow-wrap:anywhere}.agy-fleet-pools{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,300px),1fr));gap:12px;margin-top:14px}.agy-fleet-pool{border:1px solid #303036;border-radius:8px;padding:12px;background:#18181b;min-width:0}.agy-fleet-pool .agy-actions{margin-bottom:0}.agy-fleet-account-state{margin-top:5px}.agy-pool-badge{display:inline-block;padding:2px 6px;border-radius:5px;background:#27272c;color:#a1a1aa;font-size:11px}.agy-pool-preferred,.agy-plan-pro{color:#86efac}.agy-plan-pro{background:rgba(34,197,94,.12);border:1px solid rgba(134,239,172,.3)}.agy-plan-ultra{color:#c4b5fd;background:rgba(139,92,246,.16);border:1px solid rgba(167,139,250,.35)}.agy-pool-disabled{color:#fca5a5}.agy-fleet-quotas{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,220px),1fr));gap:10px;margin:12px 0}.agy-quota-group{display:grid;gap:8px;align-content:start;background:#202024;border:1px solid #2b2b31;border-radius:8px;padding:10px}.agy-quota-group-title{font-size:11px;font-weight:600;color:#d4d4d8}.agy-quota-note{font-size:10px;color:#71717a;line-height:1.35;overflow:hidden;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical}.agy-quota-bucket[data-disabled="true"]{opacity:.55}.agy-quota-bucket{min-width:0}.agy-quota-heading{display:flex;justify-content:space-between;gap:8px;font-size:12px;flex-wrap:wrap}.agy-quota-bucket progress{display:block;width:100%;height:7px;margin:5px 0;accent-color:#86efac}.agy-quota-bucket[data-quota-level="high"] progress{accent-color:#86efac}.agy-quota-bucket[data-quota-level="high"] .agy-quota-value{color:#86efac}.agy-quota-bucket[data-quota-level="mid"] progress{accent-color:#fbbf24}.agy-quota-bucket[data-quota-level="mid"] .agy-quota-value{color:#fcd34d}.agy-quota-bucket[data-quota-level="low"] progress{accent-color:#f87171}.agy-quota-bucket[data-quota-level="low"] .agy-quota-value{color:#fca5a5}.agy-quota-bucket[data-exhausted="true"] progress{accent-color:#ef4444}.agy-quota-bucket[data-exhausted="true"] .agy-quota-value{color:#fca5a5}.agy-quota-reset{font-size:11px;color:#a1a1aa}.agy-fleet-fallback{display:flex;align-items:center;gap:8px;font-size:12px}.agy-fleet-fallback input{width:auto!important;accent-color:#86efac}.agy-fleet-details[hidden]{display:none}
       #agy-fleet-target-pool{font:inherit;color:#fafafa;background:#25252a;border:1px solid #414149;border-radius:6px;padding:6px;max-width:240px}#agy-fleet-target-pool option{background:#25252a;color:#fafafa}
       .agy-model-search-box{padding:4px 6px 6px}.agy-model-search-wrap{position:relative;display:flex;align-items:center}.agy-model-search-icon{position:absolute;left:8px;width:13px;height:13px;color:#a1a1aa;pointer-events:none;flex-shrink:0}.agy-model-search-input{box-sizing:border-box;width:100%;font:inherit;font-size:12px;color:inherit;background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.14);border-radius:6px;padding:5px 26px 5px 27px;outline:none;transition:border-color .12s,background .12s}.agy-model-search-input:focus{border-color:rgba(255,255,255,.32);background:rgba(255,255,255,.07)}.agy-model-search-clear{position:absolute;right:5px;border:0;background:transparent;color:#a1a1aa;cursor:pointer;font-size:12px;line-height:1;padding:2px 4px;border-radius:4px}.agy-model-search-clear:hover{color:#fafafa;background:rgba(255,255,255,.1)}.agy-model-no-results{padding:8px;color:#a1a1aa;font-size:12px}
@@ -453,7 +488,7 @@ window.addEventListener('DOMContentLoaded', () => {
     card.setAttribute('role', 'dialog');
     card.setAttribute('aria-modal', 'true');
     card.setAttribute('aria-labelledby', 'agy-modal-title');
-    const header = element('div', 'agy-toolbar');
+    const header = element('div', 'zc-modal-head');
     const heading = element('h2', '', title);
     heading.id = 'agy-modal-title';
     const close = () => {
@@ -463,10 +498,19 @@ window.addEventListener('DOMContentLoaded', () => {
       overlay.remove();
       if (previousFocus?.isConnected) previousFocus.focus({ preventScroll: true });
     };
-    header.append(heading, button('Close', close));
-    const body = element('div');
+    const closeBtn = button('Close', close);
+    closeBtn.className = 'zc-icon-btn';
+    closeBtn.title = 'Close';
+    closeBtn.replaceChildren(
+      makeSvgIcon('<path d="M18 6 6 18"/><path d="m6 6 12 12"/>', 16),
+      element('span', 'agy-sr-only', 'Close'),
+    );
+    header.append(heading, closeBtn);
+    const body = element('div', 'zc-modal-body');
+    const statusWrap = element('div', 'zc-modal-status-wrap');
     const status = statusNode();
-    card.append(header, body, status);
+    statusWrap.append(status);
+    card.append(header, body, statusWrap);
     overlay.append(card);
     overlay.addEventListener('click', (event) => {
       if (event.target === overlay) close();
@@ -2296,27 +2340,85 @@ window.addEventListener('DOMContentLoaded', () => {
           keyRequired: false,
         });
       if (!providers.length) throw new Error('Provider presets are unavailable. Close this dialog and try again.');
+      // ZCode V6n: Follow recommended config bar + 2-column primary form with Context & Max Output up front
+      let followRecommended = !existing || mode !== 'edit';
+      const recBar = element('div', 'zc-modal-rec-bar');
+      const recLeft = element('div', 'zc-modal-rec-left');
+      const recSwitch = document.createElement('button');
+      recSwitch.type = 'button';
+      recSwitch.className = 'agy-switch';
+      recSwitch.setAttribute('role', 'switch');
+      recSwitch.setAttribute('aria-checked', String(followRecommended));
+      recSwitch.setAttribute('aria-label', 'Follow recommended config');
+      recSwitch.append(element('span', 'agy-switch-dot'));
+      recLeft.append(element('span', '', 'Follow recommended config'), recSwitch);
+      const detectNowBtn = button(
+        'Detect properties',
+        async () => {
+          const id = modelId.value.trim();
+          if (!id) throw new Error('Enter a provider model ID first.');
+          setStatus(status, 'Detecting model properties…');
+          const result = await storageAPI.detectModelCapabilities([id]);
+          const detected = result[id];
+          if (!detected) {
+            setStatus(status, `No catalog match found for "${id}". You can enter limits manually.`, true);
+            return;
+          }
+          if (detected.contextWindow != null) context.value = String(detected.contextWindow);
+          if (detected.maxOutputTokens != null) maxOutput.value = String(detected.maxOutputTokens);
+          if (detected.supportsVision != null) vision.value = String(detected.supportsVision);
+          const parts: string[] = [];
+          if (detected.contextWindow != null) parts.push(`${detected.contextWindow.toLocaleString()} ctx`);
+          if (detected.maxOutputTokens != null) parts.push(`${detected.maxOutputTokens.toLocaleString()} max out`);
+          if (detected.supportsVision) parts.push('vision');
+          if (detected.supportsThinking) parts.push('reasoning');
+          setStatus(status, `Model defaults loaded: ${parts.join(' · ') || 'matched'}.`);
+        },
+        status,
+      );
+      recSwitch.addEventListener('click', () => {
+        followRecommended = !followRecommended;
+        recSwitch.setAttribute('aria-checked', String(followRecommended));
+      });
+      recBar.append(recLeft, detectNowBtn);
+      body.append(recBar);
+
+      const providerRow = element('div', 'agy-grid');
       const provider = selectField(
-        body,
+        providerRow,
         'Provider',
         'agy-provider',
         providers.map((preset) => [preset.id, preset.label]),
         seedProvider || providers[0].id,
       );
       const providerNameInput = field(
-        body,
+        providerRow,
         'Provider name (optional, for grouping)',
         'agy-provider-name',
         existing?.providerName || initialProvider?.providerName || '',
       );
       providerNameInput.placeholder = 'e.g. Agnes AI, Coarena';
+      body.append(providerRow);
       const updateProviderNameVisibility = () => {
         const label = providerNameInput.closest('label');
         if (label) label.hidden = provider.value !== 'custom';
       };
       updateProviderNameVisibility();
       const preset = () => providers.find((value) => value.id === provider.value) || providers[0];
-      const apiUrl = field(body, 'API URL', 'agy-api-url', existing?.apiUrl || initialProvider?.apiUrl || preset().defaultUrl, 'url');
+      const endpointRow = element('div', 'agy-grid');
+      const apiUrl = field(endpointRow, 'API URL', 'agy-api-url', existing?.apiUrl || initialProvider?.apiUrl || preset().defaultUrl, 'url');
+      const apiFormat = selectField(
+        endpointRow,
+        'API format',
+        'agy-api-format',
+        [
+          ['openai', 'OpenAI compatible'],
+          ['anthropic', 'Anthropic Messages'],
+          ['google', 'Google Gemini'],
+        ],
+        existing?.apiFormat || initialProvider?.apiFormat || preset().apiFormat,
+      );
+      body.append(endpointRow);
       const workersHint = element(
         'p',
         'agy-muted',
@@ -2361,17 +2463,6 @@ window.addEventListener('DOMContentLoaded', () => {
       opencodeAuth.addEventListener('change', updateOpencodeAuth);
       apiUrl.addEventListener('input', updateOpencodeAuth);
       updateOpencodeAuth();
-      const apiFormat = selectField(
-        body,
-        'API format',
-        'agy-api-format',
-        [
-          ['openai', 'OpenAI compatible'],
-          ['anthropic', 'Anthropic Messages'],
-          ['google', 'Google Gemini'],
-        ],
-        existing?.apiFormat || preset().apiFormat,
-      );
       const grid = element('div', 'agy-grid');
       const modelId = field(
         grid,
@@ -2379,6 +2470,7 @@ window.addEventListener('DOMContentLoaded', () => {
         'agy-model-id',
         mode === 'discover' ? '' : existing?.externalModelName || '',
       );
+      modelId.style.fontFamily = 'ui-monospace,SFMono-Regular,Menlo,Consolas,monospace';
       const cleanExistingDisplayName = (existing?.displayName || '')
         .replace(/^[🟢🔴⚪🟡⭐\s•·|-]+(?:\[[^\]]+\]\s*)?[•·|-]?\s*/u, '')
         .trim();
@@ -2393,6 +2485,38 @@ window.addEventListener('DOMContentLoaded', () => {
             : cleanExistingDisplayName,
       );
       body.append(grid);
+      const tokensRow = element('div', 'agy-grid');
+      const context = field(
+        tokensRow,
+        'Context window (tokens)',
+        'agy-context-window',
+        existing?.contextWindow != null ? String(existing.contextWindow) : '',
+        'number',
+      );
+      context.placeholder = 'e.g. 128000';
+      const maxOutput = field(
+        tokensRow,
+        'Maximum output tokens',
+        'agy-max-output',
+        existing?.maxOutputTokens != null ? String(existing.maxOutputTokens) : '',
+        'number',
+      );
+      maxOutput.placeholder = 'e.g. 16384';
+      body.append(tokensRow);
+      modelId.addEventListener('blur', async () => {
+        if (!followRecommended) return;
+        const id = modelId.value.trim();
+        if (!id || (context.value.trim() && maxOutput.value.trim())) return;
+        try {
+          const detectedMap = await storageAPI.detectModelCapabilities([id]);
+          const detected = detectedMap[id];
+          if (!detected) return;
+          if (!context.value.trim() && detected.contextWindow != null) context.value = String(detected.contextWindow);
+          if (!maxOutput.value.trim() && detected.maxOutputTokens != null) maxOutput.value = String(detected.maxOutputTokens);
+          if (!vision.value && detected.supportsVision != null) vision.value = String(detected.supportsVision);
+          setStatus(status, 'Model defaults loaded.');
+        } catch {}
+      });
       const name = field(
         body,
         'Configuration name (unique)',
@@ -2492,20 +2616,6 @@ window.addEventListener('DOMContentLoaded', () => {
           'agy-muted',
           'Only recognized IDE continuation summaries use this effort. Choose low for faster summaries, or none if your model supports disabling reasoning. Normal chat keeps its settings.',
         ),
-      );
-      const maxOutput = field(
-        advancedGrid,
-        'Maximum output tokens',
-        'agy-max-output',
-        existing?.maxOutputTokens != null ? String(existing.maxOutputTokens) : '',
-        'number',
-      );
-      const context = field(
-        advancedGrid,
-        'Context window (tokens)',
-        'agy-context-window',
-        existing?.contextWindow != null ? String(existing.contextWindow) : '',
-        'number',
       );
       const compactionThreshold = field(
         advancedGrid,
@@ -2855,8 +2965,10 @@ window.addEventListener('DOMContentLoaded', () => {
           config.maxOutputTokens = config.contextWindow > 1 ? config.contextWindow - 1 : undefined;
         }
       };
-      const actions = element('div', 'agy-actions');
-      actions.append(
+      const actions = element('div', 'zc-modal-footer');
+      const actionsLeft = element('div', 'zc-modal-footer-left');
+      const actionsRight = element('div', 'zc-modal-footer-right');
+      actionsLeft.append(
         button(
           'Test connection',
           async () => {
@@ -2872,31 +2984,6 @@ window.addEventListener('DOMContentLoaded', () => {
             setStatus(status, 'Sending a short generation test…');
             const result = requireSuccess(await storageAPI.testModelGeneration(connection()));
             setStatus(status, result.message || 'Generation succeeded.');
-          },
-          status,
-        ),
-        button(
-          'Detect properties',
-          async () => {
-            const id = modelId.value.trim();
-            if (!id) throw new Error('Enter a model ID first.');
-            setStatus(status, 'Detecting model properties…');
-            const map = await storageAPI.detectModelCapabilities([id]);
-            const detected = map[id];
-            if (!detected || !Object.keys(detected).length) {
-              setStatus(status, 'No catalog match found for this model ID. You can set properties manually.');
-              return;
-            }
-            if (detected.contextWindow !== undefined) context.value = String(detected.contextWindow);
-            if (detected.maxOutputTokens !== undefined) maxOutput.value = String(detected.maxOutputTokens);
-            if (detected.supportsVision !== undefined) vision.value = String(detected.supportsVision);
-            if (typeof detected.reasoningEffort === 'string') effort.value = detected.reasoningEffort;
-            const summary: string[] = [];
-            if (detected.contextWindow) summary.push(`${Math.round(detected.contextWindow / 1000)}K ctx`);
-            if (detected.maxOutputTokens) summary.push(`${Math.round(detected.maxOutputTokens / 1000)}K out`);
-            if (detected.supportsVision) summary.push('Vision');
-            if (detected.supportsThinking) summary.push(`Thinking${detected.reasoningEffort ? ` (${detected.reasoningEffort})` : ''}`);
-            setStatus(status, `Detected: ${summary.join(' · ') || 'properties updated'}.`);
           },
           status,
         ),
@@ -2919,12 +3006,14 @@ window.addEventListener('DOMContentLoaded', () => {
           },
           status,
         ),
+      );
+      actionsRight.append(
         button(
           'Save model',
           async () => {
             const config = modelConfig(modelId.value, displayName.value.trim());
             // Auto-detect missing properties when adding a new model (never overriding explicit fields)
-            if (!existing || mode !== 'edit') {
+            if (followRecommended && (!existing || mode !== 'edit')) {
               const id = modelId.value.trim();
               if (
                 id &&
@@ -2945,6 +3034,7 @@ window.addEventListener('DOMContentLoaded', () => {
           true,
         ),
       );
+      actions.append(actionsLeft, actionsRight);
       body.append(actions, discoveryFilter, discovery);
       body.append(
         button(
@@ -3472,33 +3562,91 @@ window.addEventListener('DOMContentLoaded', () => {
       return legacy;
     return null;
   }
-  function injectCustomModelsSection(): void {
-    const mount = findSettingsMount();
-    const existing = document.getElementById('agy-custom-models-section');
-    if (existing && mount && existing.parentElement === mount) return;
-    existing?.remove();
-    if (!mount) return;
-    installStyles();
+  function findSettingsSidebarAndPane(): {
+    root: HTMLElement;
+    modelsBtn: HTMLElement;
+    sidebarCol: HTMLElement;
+    contentPane: HTMLElement;
+  } | null {
+    const isVisibleEl = (el: HTMLElement): boolean => {
+      for (let cur: HTMLElement | null = el; cur; cur = cur.parentElement) {
+        if (cur.hidden || cur.getAttribute('aria-hidden') === 'true') return false;
+        const st = window.getComputedStyle(cur);
+        if (st.display === 'none' || st.visibility === 'hidden') return false;
+      }
+      return true;
+    };
+    const settingsRoot =
+      Array.from(
+        document.querySelectorAll<HTMLElement>(
+          '[role="dialog"][aria-label="Settings"],.settings-modal-container,[data-testid="settings-view"],[data-testid="settings-panel"],[role="dialog"]',
+        ),
+      ).find((el) => isVisibleEl(el) && /\bModels\b/.test(el.textContent || '') && /\b(General|Appearance|Browser)\b/.test(el.textContent || '')) ||
+      null;
+    if (!settingsRoot) return null;
+    const buttons = Array.from(settingsRoot.querySelectorAll<HTMLElement>('button,[role="tab"]'));
+    const modelsBtn = buttons.find(
+      (btn) =>
+        btn.id !== 'agy-providers-nav-tab' &&
+        (btn.textContent || '').trim() === 'Models' &&
+        isVisibleEl(btn),
+    );
+    if (!modelsBtn || !modelsBtn.parentElement) return null;
+    // Verify this is the Settings left sidebar (contains sibling nav items like General / Browser / Appearance).
+    const siblingTexts = Array.from(modelsBtn.parentElement.querySelectorAll<HTMLElement>('button,[role="tab"]')).map(
+      (el) => (el.textContent || '').trim(),
+    );
+    if (!siblingTexts.some((t) => /^(General|Appearance|Browser|Shortcuts|Notifications)$/i.test(t))) return null;
+    // Walk up from modelsBtn to find the 2-column split [sidebarCol, contentPane] inside settingsRoot.
+    let node: HTMLElement | null = modelsBtn.parentElement;
+    while (node && node.parentElement && node !== settingsRoot) {
+      const parent: HTMLElement = node.parentElement;
+      const visibleSiblings = Array.from(parent.children).filter(
+        (child): child is HTMLElement =>
+          child instanceof HTMLElement && child !== node && child.tagName !== 'STYLE' && child.tagName !== 'SCRIPT',
+      );
+      if (visibleSiblings.length >= 1) {
+        const candidatePane = visibleSiblings.find((el) => el.querySelector('h1,h2,h3,button,input,section,[role="tabpanel"]')) || visibleSiblings[0];
+        if (candidatePane && settingsRoot.contains(candidatePane)) {
+          return { root: settingsRoot, modelsBtn, sidebarCol: node, contentPane: candidatePane };
+        }
+      }
+      node = parent;
+    }
+    return null;
+  }
+
+  function restoreHiddenNativeSettings(contentPane: HTMLElement): void {
+    for (const child of Array.from(contentPane.children)) {
+      if (child instanceof HTMLElement && child.dataset.agyHiddenByProviders === '1') {
+        child.style.display = child.dataset.agyPrevDisplay || '';
+        delete child.dataset.agyHiddenByProviders;
+        delete child.dataset.agyPrevDisplay;
+      }
+    }
+  }
+
+  function buildCustomModelsSection(fullWidth: boolean): HTMLElement {
     const section = element('section');
     section.id = 'agy-custom-models-section';
     section.setAttribute('aria-label', 'Custom Models');
+    if (fullWidth) section.dataset.fullwidth = 'true';
+
+    const status = statusNode();
+    status.id = 'agy-main-status';
+
     const header = element('div', 'agy-toolbar');
-    const headerBtns = element('div', 'zc-detail-head-actions');
-    const addModel = button('Add model', () => openModelModal(), undefined, false);
-    addModel.id = 'agy-add-model';
-    const addProvider = button(
-      '+ Add provider',
-      () => {
-        rightPaneMode = rightPaneMode === 'template-picker' ? 'detail' : 'template-picker';
-        void renderCustomModelsList();
-      },
-      undefined,
-      true,
+    const titleWrap = element('div');
+    titleWrap.append(
+      element('h2', '', fullWidth ? 'Providers' : 'Models'),
+      element('p', 'agy-muted', 'Configure model providers, API endpoints, local servers, and gateways.'),
     );
-    headerBtns.append(addModel, addProvider);
-    header.append(element('h2', '', 'Models'), headerBtns);
-    const actions = element('div', 'agy-actions');
-    actions.append(
+
+    const headerBtns = element('div', 'zc-detail-head-actions');
+    const toolsMenu = element('details', 'agy-tools-menu');
+    const toolsSummary = element('summary', 'agy-tools-btn', 'Tools ▾');
+    const toolsList = element('div', 'agy-tools-popover');
+    toolsList.append(
       button('Discover local', discoverLocal),
       button('Check health', async () => {
         setStatus(status, 'Checking health of all models…');
@@ -3515,8 +3663,8 @@ window.addEventListener('DOMContentLoaded', () => {
       button('System Prompt', openPromptSections),
       button('Remote gateway', openGateway),
       button('Diagnostics', openDiagnostics),
+      element('div', 'agy-tools-divider'),
     );
-    const optionsRow = element('div', 'agy-options-row');
     const emojiToggleLabel = element('label', 'agy-toggle-label');
     const emojiToggleCheckbox = document.createElement('input');
     emojiToggleCheckbox.type = 'checkbox';
@@ -3534,21 +3682,36 @@ window.addEventListener('DOMContentLoaded', () => {
             : 'Status emojis disabled. Model names will show without emojis.',
         );
         await modelsChanged();
-      } catch (err) {
+      } catch {
         setStatus(status, 'Failed to save display setting', true);
       }
     });
-    emojiToggleLabel.append(
-      emojiToggleCheckbox,
-      document.createTextNode('Show status emojis before model names (🟢 • name)'),
-    );
-    optionsRow.append(emojiToggleLabel);
+    emojiToggleLabel.append(emojiToggleCheckbox, document.createTextNode('Status emojis (🟢)'));
+    toolsList.append(emojiToggleLabel);
+    toolsMenu.append(toolsSummary, toolsList);
+    toolsMenu.addEventListener('click', (event) => {
+      if ((event.target as HTMLElement).closest('button')) toolsMenu.open = false;
+    });
 
     storageAPI.getDisplaySettings().then((settings) => {
       if (settings && typeof settings.showStatusEmoji === 'boolean') {
         emojiToggleCheckbox.checked = settings.showStatusEmoji;
       }
     }).catch(() => {});
+
+    const addModel = button('Add model', () => openModelModal(), undefined, false);
+    addModel.id = 'agy-add-model';
+    const addProvider = button(
+      '+ Add provider',
+      () => {
+        rightPaneMode = rightPaneMode === 'template-picker' ? 'detail' : 'template-picker';
+        void renderCustomModelsList();
+      },
+      undefined,
+      true,
+    );
+    headerBtns.append(toolsMenu, addModel, addProvider);
+    header.append(titleWrap, headerBtns);
 
     const bar = element('div', 'agy-sticky-bar');
     bar.setAttribute('role', 'search');
@@ -3579,26 +3742,143 @@ window.addEventListener('DOMContentLoaded', () => {
       chips.append(chip);
     }
     bar.append(chips);
+
     const content = element('div');
     content.id = 'agy-custom-models-content';
     const fleet = element('div', 'agy-fleet');
     fleet.id = 'agy-google-account-pool-section';
     fleet.setAttribute('aria-label', 'Google account fleet and quotas');
     fleet.hidden = true;
-    const status = statusNode();
-    status.id = 'agy-main-status';
-    section.prepend(
-      header,
-      element('p', 'agy-muted', 'Provider connections, local models and remote gateways.'),
-      actions,
-      optionsRow,
-    );
-    section.append(status, fleet, bar, content);
+
+    section.append(header, status, fleet, bar, content);
+    return section;
+  }
+
+  function injectCustomModelsSection(): void {
+    installStyles();
+    const sidebarInfo = findSettingsSidebarAndPane();
+
+    // 1. Real Antigravity Settings dialog with left sidebar: inject dedicated full-width "Providers" tab!
+    if (sidebarInfo) {
+      const { modelsBtn, sidebarCol, contentPane } = sidebarInfo;
+      let navTab = document.getElementById('agy-providers-nav-tab') as HTMLButtonElement | null;
+      if (!navTab || !sidebarCol.contains(navTab)) {
+        navTab?.remove();
+        navTab = document.createElement('button');
+        navTab.id = 'agy-providers-nav-tab';
+        navTab.type = 'button';
+        // Copy native nav button layout classes while stripping active background classes.
+        const baseClasses = (modelsBtn.className || '')
+          .split(/\s+/)
+          .filter((c) => c && !/^(bg-|text-foreground|font-medium|font-semibold)/.test(c))
+          .join(' ');
+        navTab.className = `${baseClasses} agy-providers-nav-tab`.trim();
+        navTab.textContent = 'Providers';
+        modelsBtn.insertAdjacentElement('afterend', navTab);
+
+        navTab.addEventListener('click', (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          providersTabActive = true;
+          navTab!.dataset.active = 'true';
+          document.getElementById('agy-providers-banner')?.remove();
+          for (const child of Array.from(contentPane.children)) {
+            if (child instanceof HTMLElement && child.id !== 'agy-custom-models-section') {
+              // Keep floating close (×) button visible if it's a direct button child.
+              if (child.tagName === 'BUTTON' && child.children.length <= 1) continue;
+              if (child.dataset.agyHiddenByProviders !== '1') {
+                child.dataset.agyPrevDisplay = child.style.display || '';
+                child.dataset.agyHiddenByProviders = '1';
+                child.style.display = 'none';
+              }
+            }
+          }
+          let section = document.getElementById('agy-custom-models-section');
+          if (!section || section.parentElement !== contentPane) {
+            section?.remove();
+            section = buildCustomModelsSection(true);
+            contentPane.append(section);
+          }
+          void renderCustomModelsList();
+        });
+
+        if (sidebarCol.dataset.agyNavListener !== '1') {
+          sidebarCol.dataset.agyNavListener = '1';
+          sidebarCol.addEventListener(
+            'click',
+            (e) => {
+              const clicked = (e.target as HTMLElement | null)?.closest('button,[role="tab"]');
+              if (!clicked || clicked.id === 'agy-providers-nav-tab') return;
+              if (!providersTabActive) return;
+              providersTabActive = false;
+              const tab = document.getElementById('agy-providers-nav-tab');
+              if (tab) delete tab.dataset.active;
+              document.getElementById('agy-custom-models-section')?.remove();
+              restoreHiddenNativeSettings(contentPane);
+            },
+            true,
+          );
+        }
+      }
+
+      if (providersTabActive) {
+        navTab.dataset.active = 'true';
+        for (const child of Array.from(contentPane.children)) {
+          if (child instanceof HTMLElement && child.id !== 'agy-custom-models-section') {
+            if (child.tagName === 'BUTTON' && child.children.length <= 1) continue;
+            if (child.dataset.agyHiddenByProviders !== '1') {
+              child.dataset.agyPrevDisplay = child.style.display || '';
+              child.dataset.agyHiddenByProviders = '1';
+              child.style.display = 'none';
+            }
+          }
+        }
+        const existingFull = document.getElementById('agy-custom-models-section');
+        if (!existingFull || existingFull.parentElement !== contentPane) {
+          existingFull?.remove();
+          contentPane.append(buildCustomModelsSection(true));
+          void renderCustomModelsList();
+        }
+        return;
+      }
+
+      // When another tab (e.g. Models) is active, show a slim 1-line link banner on the Models tab
+      const mount = findSettingsMount();
+      document.getElementById('agy-custom-models-section')?.remove();
+      const existingBanner = document.getElementById('agy-providers-banner');
+      if (!mount) {
+        existingBanner?.remove();
+        return;
+      }
+      if (existingBanner && existingBanner.parentElement === mount) return;
+      existingBanner?.remove();
+      const banner = element('div');
+      banner.id = 'agy-providers-banner';
+      const left = element('div');
+      left.append(
+        element('div', '', 'Custom Providers & Models'),
+        element('div', 'agy-muted', 'Manage API endpoints, custom models, and local servers in full width.'),
+      );
+      (left.firstElementChild as HTMLElement).style.fontWeight = '600';
+      const openBtn = button('Open Providers →', () => navTab?.click());
+      banner.append(left, openBtn);
+      mount.append(banner);
+      return;
+    }
+
+    // 2. Fallback (settings route or JSDOM tests without left Settings sidebar): mount directly inside mount
+    providersTabActive = false;
+    const mount = findSettingsMount();
+    const existing = document.getElementById('agy-custom-models-section');
+    if (existing && mount && existing.parentElement === mount) return;
+    existing?.remove();
+    if (!mount) return;
+    const section = buildCustomModelsSection(false);
     mount.append(section);
     if (!rowMenuDismissInstalled) {
       rowMenuDismissInstalled = true;
       const closeOpenRowMenus = (except?: Node | null) => {
-        for (const openMenu of document.querySelectorAll<HTMLDetailsElement>('#agy-custom-models-content details.agy-menu[open]')) {
+        for (const openMenu of document.querySelectorAll<HTMLDetailsElement>('#agy-custom-models-section details.agy-menu[open], #agy-custom-models-section details.agy-tools-menu[open]')) {
           if (!except || !openMenu.contains(except)) openMenu.open = false;
         }
       };
@@ -3606,7 +3886,7 @@ window.addEventListener('DOMContentLoaded', () => {
       document.addEventListener('keydown', (event) => {
         if (event.key !== 'Escape') return;
         const active = document.activeElement as HTMLElement | null;
-        const activeMenu = active?.closest<HTMLDetailsElement>('#agy-custom-models-content details.agy-menu[open]');
+        const activeMenu = active?.closest<HTMLDetailsElement>('#agy-custom-models-section details.agy-menu[open], #agy-custom-models-section details.agy-tools-menu[open]');
         closeOpenRowMenus();
         activeMenu?.querySelector('summary')?.focus({ preventScroll: true });
       });

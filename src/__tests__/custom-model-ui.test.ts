@@ -1828,4 +1828,49 @@ describe('Google fleet and native picker search', () => {
     expect(replaceSpy).toHaveBeenCalledTimes(1);
     expect(content.textContent).toContain('Changed Externally');
   });
+
+  it('injects a dedicated full-width Providers tab in the Settings sidebar and restores native tabs cleanly', async () => {
+    const html = `
+      <div role="dialog" aria-label="Settings">
+        <div id="settings-shell">
+          <div id="settings-sidebar">
+            <button type="button" class="nav-btn">General</button>
+            <button type="button" class="nav-btn bg-white/10">Models</button>
+            <button type="button" class="nav-btn">Browser</button>
+          </div>
+          <div id="settings-pane">
+            <section id="native-models"><h2>Models &amp; Usage</h2><div>Weekly Limit Remaining</div></section>
+          </div>
+        </div>
+      </div>
+    `;
+    const f = await fixture(html, [model], 'https://127.0.0.1:54321/c/conv-1');
+    const navTab = f.document.getElementById('agy-providers-nav-tab') as HTMLButtonElement | null;
+    expect(navTab).toBeTruthy();
+    expect(navTab!.textContent).toBe('Providers');
+    expect(navTab!.previousElementSibling?.textContent).toBe('Models');
+    expect(f.document.getElementById('agy-providers-banner')).toBeTruthy();
+    expect(f.document.getElementById('agy-custom-models-section')).toBeNull();
+
+    // Clicking Providers takes over the full-width right pane and hides native content
+    navTab!.click();
+    await settle();
+    expect(navTab!.dataset.active).toBe('true');
+    const nativeModels = f.document.getElementById('native-models')!;
+    expect(nativeModels.style.display).toBe('none');
+    const fullSection = f.document.getElementById('agy-custom-models-section')!;
+    expect(fullSection).toBeTruthy();
+    expect(fullSection.dataset.fullwidth).toBe('true');
+    expect(fullSection.parentElement?.id).toBe('settings-pane');
+
+    // Clicking a native tab restores native content and removes the full-width Providers view
+    const generalBtn = [...f.document.querySelectorAll<HTMLButtonElement>('#settings-sidebar button')].find(
+      (b) => b.textContent === 'General',
+    )!;
+    generalBtn.click();
+    await settle();
+    expect(navTab!.dataset.active).toBeUndefined();
+    expect(nativeModels.style.display).toBe('');
+    expect(f.document.getElementById('agy-custom-models-section')).toBeNull();
+  });
 });
