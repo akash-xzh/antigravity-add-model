@@ -24,6 +24,7 @@ export const REQUIRED_BUILD_FILES = [
   'modelManagement.js',
   'modelActions.js',
   'chatContext.js',
+  'modelCapabilities.js',
   'modelIdentity.js',
   'diagnostics.js',
   'generationProbe.js',

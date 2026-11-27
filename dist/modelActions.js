@@ -39,6 +39,7 @@ const path = __importStar(require("node:path"));
 const modelIdentity_1 = require("./modelIdentity");
 const modelUtils_1 = require("./proxy/modelUtils");
 const chatContext_1 = require("./chatContext");
+const modelCapabilities_1 = require("./modelCapabilities");
 const promptSections_1 = require("./proxy/promptSections");
 const modelHealth_1 = require("./proxy/modelHealth");
 const ENCRYPTED_SECRET_RE = /^(enc:|local-gcm:|fallback:)/;
@@ -134,6 +135,15 @@ function createModelActions(manager) {
         'storage:get-provider-presets': manager.presets,
         'storage:discover-models': manager.discoverModels,
         'storage:discover-local': manager.discoverLocal,
+        'storage:detect-model-capabilities': async (payload) => {
+            const ids = Array.isArray(payload)
+                ? payload
+                : typeof payload === 'string'
+                    ? [payload]
+                    : [];
+            const capabilities = await (0, modelCapabilities_1.detectModelCapabilitiesBatch)(ids.filter((id) => typeof id === 'string'), path.dirname(manager.store.filename));
+            return { success: true, capabilities };
+        },
         'storage:export-custom-models': () => manager.store.export(),
         'storage:import-custom-models': (payload) => ({ success: true, count: manager.store.import(payload) }),
         'storage:get-gateway': manager.getGateway,

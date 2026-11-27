@@ -6,6 +6,7 @@ import * as path from 'node:path';
 import { allocateModelIdentities } from './modelIdentity';
 import { nativeCatalogCapabilities, nativeModelExperiments, type CustomModelConfig } from './proxy/modelUtils';
 import { getContextInformation } from './chatContext';
+import { detectModelCapabilitiesBatch } from './modelCapabilities';
 import {
   DEFAULT_PROMPT_SECTIONS,
   getAvailableTags,
@@ -121,6 +122,18 @@ export function createModelActions(
     'storage:get-provider-presets': manager.presets,
     'storage:discover-models': manager.discoverModels,
     'storage:discover-local': manager.discoverLocal,
+    'storage:detect-model-capabilities': async (payload?: unknown) => {
+      const ids = Array.isArray(payload)
+        ? payload
+        : typeof payload === 'string'
+          ? [payload]
+          : [];
+      const capabilities = await detectModelCapabilitiesBatch(
+        ids.filter((id): id is string => typeof id === 'string'),
+        path.dirname(manager.store.filename),
+      );
+      return { success: true, capabilities };
+    },
     'storage:export-custom-models': () => manager.store.export(),
     'storage:import-custom-models': (payload) => ({ success: true, count: manager.store.import(payload) }),
     'storage:get-gateway': manager.getGateway,

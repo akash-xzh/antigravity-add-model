@@ -106,6 +106,30 @@ const storageAPI = {
   getPresets: (): Promise<ProviderPreset[]> => ipcRenderer.invoke('storage:get-provider-presets'),
   discoverModels: (params: Partial<CustomModelEntry>): Promise<DiscoveryResult> =>
     ipcRenderer.invoke('storage:discover-models', params),
+  detectModelCapabilities: async (
+    modelIds: string[],
+  ): Promise<
+    Record<
+      string,
+      {
+        contextWindow?: number;
+        maxOutputTokens?: number;
+        supportsVision?: boolean;
+        supportsThinking?: boolean;
+        reasoningEffort?: CustomModelEntry['reasoningEffort'];
+        supportedEfforts?: Array<'minimal' | 'low' | 'medium' | 'high' | 'xhigh'>;
+      }
+    >
+  > => {
+    try {
+      const res = (await ipcRenderer.invoke('storage:detect-model-capabilities', modelIds)) as
+        | { success?: boolean; capabilities?: Record<string, Record<string, unknown>> }
+        | undefined;
+      return (res?.capabilities as Record<string, never>) || {};
+    } catch {
+      return {};
+    }
+  },
   getModelHealth: (): Promise<
     Record<
       string,
@@ -2564,17 +2588,50 @@ window.addEventListener('DOMContentLoaded', () => {
             else selected.delete(model.id);
             count.textContent = `${visible.length} of ${choices.length} models · ${selected.size} selected`;
           });
+          const capHints: string[] = [];
+          if (typeof model.contextWindow === 'number') {
+            capHints.push(
+              model.contextWindow >= 1_000_000
+                ? `${(model.contextWindow / 1_000_000).toFixed(model.contextWindow % 1_000_000 === 0 ? 0 : 1)}M ctx`
+                : `${Math.round(model.contextWindow / 1000)}K ctx`,
+            );
+          }
+          if (model.supportsVision) capHints.push('Vision');
+          if (model.supportsThinking) capHints.push('Thinking');
+          const baseText =
+            model.displayName && model.displayName !== model.id ? `${model.displayName} · ${model.id}` : model.id;
           label.append(
             checkbox,
-            element(
-              'span',
-              '',
-              model.displayName && model.displayName !== model.id ? `${model.displayName} · ${model.id}` : model.id,
-            ),
+            element('span', '', capHints.length ? `${baseText} (${capHints.join(' · ')})` : baseText),
           );
           discovery.append(label);
         }
       }
+      const applyDetectedCaps = (
+        config: CustomModelEntry,
+        detected?: {
+          contextWindow?: number;
+          maxOutputTokens?: number;
+          supportsVision?: boolean;
+          supportsThinking?: boolean;
+          reasoningEffort?: CustomModelEntry['reasoningEffort'];
+        },
+      ) => {
+        if (!detected) return;
+        for (const key of ['contextWindow', 'maxOutputTokens', 'supportsVision', 'supportsThinking', 'reasoningEffort'] as const) {
+          if (config[key] === undefined && detected[key] !== undefined) {
+            (config as unknown as Record<string, unknown>)[key] = detected[key];
+          }
+        }
+        if (
+          typeof config.contextWindow === 'number' &&
+          typeof config.maxOutputTokens === 'number' &&
+          config.maxOutputTokens >= config.contextWindow &&
+          !maxOutput.value.trim()
+        ) {
+          config.maxOutputTokens = config.contextWindow > 1 ? config.contextWindow - 1 : undefined;
+        }
+      };
       const actions = element('div', 'agy-actions');
       actions.append(
         button(
@@ -2596,6 +2653,31 @@ window.addEventListener('DOMContentLoaded', () => {
           status,
         ),
         button(
+          'Detect properties',
+          async () => {
+            const id = modelId.value.trim();
+            if (!id) throw new Error('Enter a model ID first.');
+            setStatus(status, 'Detecting model properties…');
+            const map = await storageAPI.detectModelCapabilities([id]);
+            const detected = map[id];
+            if (!detected || !Object.keys(detected).length) {
+              setStatus(status, 'No catalog match found for this model ID. You can set properties manually.');
+              return;
+            }
+            if (detected.contextWindow !== undefined) context.value = String(detected.contextWindow);
+            if (detected.maxOutputTokens !== undefined) maxOutput.value = String(detected.maxOutputTokens);
+            if (detected.supportsVision !== undefined) vision.value = String(detected.supportsVision);
+            if (typeof detected.reasoningEffort === 'string') effort.value = detected.reasoningEffort;
+            const summary: string[] = [];
+            if (detected.contextWindow) summary.push(`${Math.round(detected.contextWindow / 1000)}K ctx`);
+            if (detected.maxOutputTokens) summary.push(`${Math.round(detected.maxOutputTokens / 1000)}K out`);
+            if (detected.supportsVision) summary.push('Vision');
+            if (detected.supportsThinking) summary.push(`Thinking${detected.reasoningEffort ? ` (${detected.reasoningEffort})` : ''}`);
+            setStatus(status, `Detected: ${summary.join(' · ') || 'properties updated'}.`);
+          },
+          status,
+        ),
+        button(
           'Fetch provider models',
           async () => {
             setStatus(status, 'Fetching models…');
@@ -2608,7 +2690,7 @@ window.addEventListener('DOMContentLoaded', () => {
             setStatus(
               status,
               choices.length
-                ? 'Select models below, then choose Add selected.'
+                ? 'Select models below, then choose Add selected (properties auto-detect on add).'
                 : 'This provider returned no models. You can enter a model ID manually.',
             );
           },
@@ -2617,7 +2699,22 @@ window.addEventListener('DOMContentLoaded', () => {
         button(
           'Save model',
           async () => {
-            requireSuccess(await storageAPI.saveCustomModel(modelConfig(modelId.value, displayName.value.trim())));
+            const config = modelConfig(modelId.value, displayName.value.trim());
+            // Auto-detect missing properties when adding a new model (never overriding explicit fields)
+            if (!existing || mode !== 'edit') {
+              const id = modelId.value.trim();
+              if (
+                id &&
+                (config.contextWindow === undefined ||
+                  config.maxOutputTokens === undefined ||
+                  config.supportsVision === undefined ||
+                  config.supportsThinking === undefined)
+              ) {
+                const detectedMap = await storageAPI.detectModelCapabilities([id]);
+                applyDetectedCaps(config, detectedMap[id]);
+              }
+            }
+            requireSuccess(await storageAPI.saveCustomModel(config));
             await modelsChanged();
             close();
           },
@@ -2631,8 +2728,11 @@ window.addEventListener('DOMContentLoaded', () => {
           'Add selected',
           async () => {
             if (!selected.size) throw new Error('Select at least one model from the fetched list.');
+            const chosen = choices.filter((model) => selected.has(model.id));
+            setStatus(status, `Detecting properties and saving ${chosen.length} models…`);
+            const detectedMap = await storageAPI.detectModelCapabilities(chosen.map((c) => c.id));
             let saved = 0;
-            for (const choice of choices.filter((model) => selected.has(model.id))) {
+            for (const choice of chosen) {
               const prior = modelList.find(
                 (model) =>
                   model.provider === provider.value &&
@@ -2644,18 +2744,11 @@ window.addEventListener('DOMContentLoaded', () => {
                 choice.displayName || choice.id,
                 prior?.name || uniqueName(`models/${provider.value}/${choice.id}`),
               );
-              // Prefer explicit form overrides; otherwise retain the catalog's advertised limits/capabilities.
+              // Precedence: explicit form overrides > provider /v1/models metadata > catalog auto-detection
               for (const key of ['contextWindow', 'maxOutputTokens', 'supportsVision', 'supportsThinking'] as const) {
                 if (config[key] === undefined && choice[key] !== undefined) config[key] = choice[key];
               }
-              if (
-                typeof config.contextWindow === 'number' &&
-                typeof config.maxOutputTokens === 'number' &&
-                config.maxOutputTokens >= config.contextWindow &&
-                !maxOutput.value.trim()
-              ) {
-                config.maxOutputTokens = config.contextWindow > 1 ? config.contextWindow - 1 : undefined;
-              }
+              applyDetectedCaps(config, detectedMap[choice.id]);
               delete config.originalName;
               if (prior) config.originalName = prior.name;
               else if (existing?.name) config.copyFrom = existing.name;
