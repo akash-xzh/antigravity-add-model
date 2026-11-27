@@ -439,6 +439,15 @@ window.addEventListener('DOMContentLoaded', () => {
       #agy-custom-models-section .agy-btn:hover,#agy-modal-overlay .agy-btn:hover{background:rgba(255,255,255,.10);border-color:rgba(255,255,255,.22)}
       #agy-custom-models-section .agy-primary:hover,#agy-modal-overlay .agy-primary:hover{background:#e4e4e7;border-color:#e4e4e7}
       #agy-custom-models-section .agy-btn:disabled,#agy-modal-overlay .agy-btn:disabled{opacity:.48;cursor:wait}
+      /* Toggle switch placed AFTER .agy-btn so padding/border/width are never overridden */
+      #agy-custom-models-section .agy-switch,#agy-modal-overlay .agy-switch{appearance:none;position:relative;display:inline-flex;align-items:center;justify-content:flex-start;width:36px;height:20px;min-width:36px;padding:2px!important;border-radius:9999px!important;border:1px solid rgba(255,255,255,.14)!important;background:#2a2a30!important;cursor:pointer;flex-shrink:0;box-sizing:border-box;transition:background .18s ease,border-color .18s ease,box-shadow .18s ease}
+      #agy-custom-models-section .agy-switch[aria-checked="true"],#agy-modal-overlay .agy-switch[aria-checked="true"]{background:#10b981!important;border-color:rgba(16,185,129,.7)!important;box-shadow:inset 0 1px 0 rgba(255,255,255,.22)}
+      #agy-custom-models-section .agy-switch:hover,#agy-modal-overlay .agy-switch:hover{border-color:rgba(255,255,255,.28)!important}
+      #agy-custom-models-section .agy-switch[aria-checked="true"]:hover,#agy-modal-overlay .agy-switch[aria-checked="true"]:hover{background:#059669!important}
+      .agy-switch-dot{display:block;width:14px;height:14px;border-radius:9999px;background:#d4d4d8;box-shadow:0 1px 3px rgba(0,0,0,.45);transform:translateX(0);transition:transform .2s cubic-bezier(.34,1.35,.64,1),background .18s ease;pointer-events:none;flex-shrink:0}
+      #agy-custom-models-section .agy-switch[aria-checked="true"] .agy-switch-dot,#agy-modal-overlay .agy-switch[aria-checked="true"] .agy-switch-dot{transform:translateX(16px);background:#ffffff}
+      .zc-provider-pill{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:8px 11px;margin-bottom:14px;border-radius:8px;border:1px solid rgba(255,255,255,.09);background:rgba(255,255,255,.03);font-size:12px;color:#a1a1aa}
+      .zc-provider-pill strong{color:#f4f4f5;font-weight:600}
       #agy-custom-models-section :focus-visible,#agy-modal-overlay :focus-visible{outline:2px solid #38bdf8;outline-offset:2px}
       .agy-status{color:#86efac;font-size:12.5px;font-weight:500;margin-top:10px;padding:8px 12px;border-radius:8px;border:1px solid rgba(34,197,94,.30);background:rgba(34,197,94,.10);white-space:pre-wrap;overflow-wrap:anywhere}.agy-status:empty{display:none}.agy-error{color:#fca5a5;border-color:rgba(239,68,68,.35);background:rgba(239,68,68,.12)}
       .agy-row .agy-status{margin-top:4px;padding:3px 7px;font-size:11px;border-radius:6px}
@@ -1756,7 +1765,7 @@ window.addEventListener('DOMContentLoaded', () => {
         const badge = providerBadgeMeta(groupDisplayName);
         const badgeEl = element('span', 'zc-badge zc-badge-lg', badge.text);
         badgeEl.style.background = badge.color;
-        const headingText = `${groupDisplayName}${first.providerName && first.providerName !== first.provider ? ` (${first.provider})` : ''}`;
+        const headingText = groupDisplayName;
         const enabledInGroup = modelsInGroup.filter((m) => m.enabled !== false).length;
         headLeft.append(
           badgeEl,
@@ -1944,7 +1953,7 @@ window.addEventListener('DOMContentLoaded', () => {
         modelsHead.append(element('span', 'zc-field-label', 'Models'));
         const modelsHeadBtns = element('div', 'zc-detail-head-actions');
         modelsHeadBtns.append(
-          button('Discover models', () => openModelModal(first, 'discover'), groupStatus),
+          button('Discover models', () => openModelModal(first, 'discover', { scopedToProvider: providersTabActive }), groupStatus),
           button(
             '+ Add model',
             () =>
@@ -1954,6 +1963,8 @@ window.addEventListener('DOMContentLoaded', () => {
                 apiUrl: first.apiUrl,
                 apiFormat: first.apiFormat,
                 apiKey: first.apiKey,
+                copyFrom: first.name,
+                scopedToProvider: true,
               }),
             groupStatus,
           ),
@@ -2157,7 +2168,7 @@ window.addEventListener('DOMContentLoaded', () => {
             const editBtn = makeIconAction(
               'Edit',
               '<path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/>',
-              () => openModelModal(model, 'edit'),
+              () => openModelModal(model, 'edit', providersTabActive ? { scopedToProvider: true } : undefined),
             );
             const deleteBtn = makeIconAction(
               'Delete',
@@ -2320,22 +2331,31 @@ window.addEventListener('DOMContentLoaded', () => {
     existing?: CustomModelEntry,
     mode: 'edit' | 'duplicate' | 'discover' = 'edit',
     initialProvider?: {
-      provider: string;
+      provider?: string;
       providerName?: string;
       apiUrl?: string;
       apiFormat?: string;
       apiKey?: string;
+      copyFrom?: string;
+      scopedToProvider?: boolean;
     },
   ): Promise<void> {
-    const { body, status, close } = openModal(
+    const scopedToProvider = Boolean(initialProvider?.scopedToProvider);
+    const providerLabelForTitle =
+      (existing?.providerName || initialProvider?.providerName || existing?.provider || initialProvider?.provider || '').trim();
+    const modalTitle =
       mode === 'duplicate'
         ? 'Duplicate model'
         : mode === 'discover'
-          ? 'Discover provider models'
+          ? scopedToProvider && providerLabelForTitle
+            ? `Discover models · ${providerLabelForTitle}`
+            : 'Discover provider models'
           : existing
             ? 'Edit model'
-            : 'Add custom model',
-    );
+            : scopedToProvider && providerLabelForTitle
+              ? `Add model to ${providerLabelForTitle}`
+              : 'Add custom model';
+    const { body, status, close } = openModal(modalTitle);
     try {
       const presets = await storageAPI.getPresets();
       if (!body.isConnected) return;
@@ -2520,6 +2540,23 @@ window.addEventListener('DOMContentLoaded', () => {
       };
       updateGoogleVisibility();
       connSec.append(googleConfig);
+      if (scopedToProvider) {
+        // Already inside a provider: show a compact 1-line provider summary instead of repeating Base URL/Key/Format
+        connSec.hidden = true;
+        const pill = element('div', 'zc-provider-pill');
+        const pillInfo = element('div');
+        pillInfo.append(
+          element('strong', '', providerLabelForTitle || provider.value),
+          document.createTextNode(` · ${apiUrl.value}`),
+        );
+        const overrideToggle = button('Edit connection', () => {
+          connSec.hidden = !connSec.hidden;
+          overrideToggle.textContent = connSec.hidden ? 'Edit connection' : 'Hide connection';
+        });
+        overrideToggle.classList.add('zc-btn-sm', 'zc-btn-ghost');
+        pill.append(pillInfo, overrideToggle);
+        body.append(pill);
+      }
       body.append(connSec);
 
       // ── Section 2: Model (Important Properties Right in Front) ─────────────
@@ -2936,7 +2973,9 @@ window.addEventListener('DOMContentLoaded', () => {
             ? { originalName: existing.name }
             : existing?.name
               ? { copyFrom: existing.name }
-              : {}),
+              : initialProvider?.copyFrom
+                ? { copyFrom: initialProvider.copyFrom }
+                : {}),
         };
       }
       let addSelectedBtnRef: HTMLButtonElement | null = null;
@@ -3127,6 +3166,31 @@ window.addEventListener('DOMContentLoaded', () => {
       addSelectedBtn.hidden = true;
       addSelectedBtnRef = addSelectedBtn;
       body.append(discoveryFilter, discovery, addSelectedBtn, actions);
+      if (scopedToProvider && mode === 'discover') {
+        // Pure discovery mode inside a provider: hide manual model/advanced form and auto-fetch immediately!
+        modelSec.hidden = true;
+        advanced.hidden = true;
+        actions.hidden = true;
+        void (async () => {
+          setStatus(status, 'Fetching models…');
+          try {
+            const result = await storageAPI.discoverModels(connection());
+            requireSuccess(result);
+            choices = result.models || [];
+            discoverySearch.value = '';
+            selected.clear();
+            showChoices();
+            setStatus(
+              status,
+              choices.length
+                ? 'Select models below, then click Add selected (properties auto-detect on add).'
+                : 'This provider returned no models.',
+            );
+          } catch (err) {
+            setStatus(status, err instanceof Error ? err.message : 'Failed to fetch provider models.', true);
+          }
+        })();
+      }
       provider.addEventListener('change', () => {
         apiUrl.value = preset().defaultUrl;
         apiFormat.value = preset().apiFormat;
@@ -3786,8 +3850,6 @@ window.addEventListener('DOMContentLoaded', () => {
       }
     }).catch(() => {});
 
-    const addModel = button('Add model', () => openModelModal(), undefined, false);
-    addModel.id = 'agy-add-model';
     const addProvider = button(
       '+ Add provider',
       () => {
@@ -3797,7 +3859,14 @@ window.addEventListener('DOMContentLoaded', () => {
       undefined,
       true,
     );
-    headerBtns.append(toolsMenu, addModel, addProvider);
+    if (fullWidth) {
+      // In full-width Providers tab, only show Tools + Add provider (models are added inside a provider!)
+      headerBtns.append(toolsMenu, addProvider);
+    } else {
+      const addModel = button('Add model', () => openModelModal(), undefined, false);
+      addModel.id = 'agy-add-model';
+      headerBtns.append(toolsMenu, addModel, addProvider);
+    }
     header.append(titleWrap, headerBtns);
 
     const bar = element('div', 'agy-sticky-bar');
