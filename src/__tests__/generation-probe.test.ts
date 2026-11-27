@@ -7,6 +7,7 @@ import type { AddressInfo } from 'node:net';
 import { createModelManager } from '../modelManagement';
 import { clearDiagnostics, getDiagnostics } from '../diagnostics';
 import { getGooglePoolStatus, resetGoogleAccountState } from '../googleAccounts';
+import { extractApiErrorMessage } from '../generationProbe';
 
 const directories: string[] = [];
 const servers: http.Server[] = [];
@@ -97,23 +98,24 @@ describe('explicit generation test', () => {
     },
   );
 
-  it('does not retry or expose provider error bodies', async () => {
+  it('does not retry and redacts echoed API keys in provider error bodies', async () => {
     let attempts = 0;
     const url = await fixture((_req, res) => {
       attempts++;
-      res.writeHead(503);
-      res.end(JSON.stringify({ error: { message: 'private-key private-prompt' } }));
+      res.writeHead(503, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: { message: 'Upstream rejected key my-secret-api-key-123' } }));
     });
     const service = manager();
     const result = await service.testGeneration({
       provider: 'openai',
       apiUrl: url,
       externalModelName: 'test',
-      apiKey: 'key',
+      apiKey: 'my-secret-api-key-123',
     });
     expect(attempts).toBe(1);
     expect(result).toMatchObject({ success: false, status: 503 });
-    expect(JSON.stringify(result)).not.toContain('private-');
+    expect(result.error).toContain('Upstream rejected key [redacted]');
+    expect(JSON.stringify(result)).not.toContain('my-secret-api-key-123');
     expect(getDiagnostics().requests[0]).toMatchObject({ outcome: 'failed', status: 503 });
   });
 
@@ -177,5 +179,35 @@ describe('explicit generation test', () => {
       lastStatus: 200,
       modelCooldowns: [],
     });
+  });
+
+  it('surfaces the actual upstream API error message on failed generation tests', async () => {
+    const url = await fixture((_req, res) => {
+      res.writeHead(503, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: { message: 'No healthy upstream available for model foo' } }));
+    });
+    const result = await manager().testGeneration({
+      provider: 'openai',
+      apiFormat: 'openai',
+      apiUrl: url,
+      apiKey: 'test-key',
+      externalModelName: 'foo',
+    });
+    expect(result).toMatchObject({
+      success: false,
+      status: 503,
+      error: expect.stringContaining('No healthy upstream available for model foo'),
+    });
+  });
+});
+
+describe('extractApiErrorMessage', () => {
+  it('extracts JSON error messages, skips HTML, and redacts secrets', () => {
+    expect(extractApiErrorMessage(JSON.stringify({ error: { message: 'Model overloaded' } }))).toBe('Model overloaded');
+    expect(extractApiErrorMessage(JSON.stringify({ message: 'Rate limit exceeded' }))).toBe('Rate limit exceeded');
+    expect(extractApiErrorMessage('<!DOCTYPE html><html><body>502</body></html>')).toBe('');
+    expect(extractApiErrorMessage('Invalid key sk-secret1234567890 with Bearer tok_abcdef123456')).toBe(
+      'Invalid key [redacted] with Bearer [redacted]',
+    );
   });
 });

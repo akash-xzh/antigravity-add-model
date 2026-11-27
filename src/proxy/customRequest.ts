@@ -603,6 +603,7 @@ export async function runCustomModelRequest(
             const status = upstream.statusCode || 502;
             if (status < 200 || status >= 300) {
               const errorBody =
+                kind === 'generation-test' ||
                 status === 400 ||
                 status === 413 ||
                 status === 422 ||
@@ -631,6 +632,35 @@ export async function runCustomModelRequest(
               const overflowHint = contextOverflow
                 ? ' Context length exceeded the model limit; compact the conversation or switch to a larger-context model.'
                 : '';
+              const probeDetail = (() => {
+                if (kind !== 'generation-test' || !errorBody.trim()) return '';
+                let candidate = '';
+                try {
+                  const parsed = JSON.parse(errorBody) as Record<string, unknown>;
+                  const err = parsed?.error as Record<string, unknown> | string | undefined;
+                  if (typeof err === 'string' && err.trim()) candidate = err.trim();
+                  else if (err && typeof err === 'object') {
+                    if (typeof err.message === 'string' && err.message.trim()) candidate = err.message.trim();
+                    else if (typeof err.detail === 'string' && err.detail.trim()) candidate = err.detail.trim();
+                    else if (typeof err.code === 'string' && err.code.trim()) candidate = err.code.trim();
+                  }
+                  if (!candidate && typeof parsed?.message === 'string' && parsed.message.trim()) candidate = parsed.message.trim();
+                  else if (!candidate && typeof parsed?.detail === 'string' && parsed.detail.trim()) candidate = parsed.detail.trim();
+                  else if (!candidate && typeof parsed?.msg === 'string' && parsed.msg.trim()) candidate = parsed.msg.trim();
+                } catch {
+                  if (!/^<(?:!doctype|html|head|body)\b/i.test(errorBody.trim())) candidate = errorBody.trim();
+                }
+                if (!candidate) return '';
+                let cleaned = candidate
+                  .replace(/\bBearer\s+[A-Za-z0-9._\-+/=]{8,}/gi, 'Bearer [redacted]')
+                  .replace(/\b(?:sk|nvapi|gsk|xai|AIza)[A-Za-z0-9._\-]{8,}/g, '[redacted]')
+                  .replace(/\s+/g, ' ')
+                  .trim();
+                if (model.apiKey && model.apiKey !== 'none' && model.apiKey.length >= 4) {
+                  cleaned = cleaned.split(model.apiKey).join('[redacted]');
+                }
+                return cleaned.length > 260 ? `${cleaned.slice(0, 257)}…` : cleaned;
+              })();
               upstream.destroy();
               throw new UpstreamError(
                 `${
@@ -640,7 +670,7 @@ export async function runCustomModelRequest(
                       : describeGoogleAccessError(status).message
                     : opencode && [401, 403].includes(status)
                       ? describeOpencodeAccessError(status, errorBody)
-                      : `Upstream returned HTTP ${status}.`
+                      : probeDetail || `Upstream returned HTTP ${status}.`
                 }${hint}${overflowHint}`,
                 status,
                 !!decision || status === 408 || status === 429 || status >= 500,
