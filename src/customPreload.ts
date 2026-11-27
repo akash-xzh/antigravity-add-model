@@ -398,11 +398,12 @@ window.addEventListener('DOMContentLoaded', () => {
       .zc-toast{pointer-events:auto;display:flex;align-items:center;gap:8px;min-height:38px;padding:8px 12px;border-radius:10px;border:1px solid rgba(255,255,255,.14);background:rgba(35,35,39,.96);color:#f4f4f5;font-size:12px;font-weight:500;box-shadow:0 8px 24px rgba(0,0,0,.45)}
       .zc-toast[data-type="success"]{border-color:rgba(34,197,94,.35);background:rgba(20,45,30,.92);color:#86efac}
       .zc-toast[data-type="failure"]{border-color:rgba(239,68,68,.38);background:rgba(52,20,22,.92);color:#fca5a5}
-      #agy-custom-models-section .agy-switch{position:relative;display:inline-flex;align-items:center;width:30px;height:17px;padding:0;border-radius:9999px;border:1px solid transparent;background:#3a3a42;cursor:pointer;flex-shrink:0;transition:background .18s cubic-bezier(.22,1,.36,1),border-color .18s ease}
-      #agy-custom-models-section .agy-switch[aria-checked="true"]{background:#22c55e}
-      #agy-custom-models-section .agy-switch:hover{filter:brightness(1.08)}
-      .agy-switch-dot{width:13px;height:13px;border-radius:9999px;background:#fff;box-shadow:0 1px 2px rgba(0,0,0,.4);transform:translateX(1px);transition:transform .18s cubic-bezier(.22,1,.36,1);pointer-events:none}
-      #agy-custom-models-section .agy-switch[aria-checked="true"] .agy-switch-dot{transform:translateX(14px)}
+      #agy-custom-models-section .agy-switch,#agy-modal-overlay .agy-switch{position:relative;display:inline-flex;align-items:center;width:34px;height:20px;padding:2px;border-radius:9999px;border:1px solid rgba(255,255,255,.14);background:#2a2a30;cursor:pointer;flex-shrink:0;transition:background .18s ease,border-color .18s ease,box-shadow .18s ease}
+      #agy-custom-models-section .agy-switch[aria-checked="true"],#agy-modal-overlay .agy-switch[aria-checked="true"]{background:#10b981;border-color:rgba(16,185,129,.65);box-shadow:inset 0 1px 0 rgba(255,255,255,.22)}
+      #agy-custom-models-section .agy-switch:hover,#agy-modal-overlay .agy-switch:hover{border-color:rgba(255,255,255,.26)}
+      #agy-custom-models-section .agy-switch[aria-checked="true"]:hover,#agy-modal-overlay .agy-switch[aria-checked="true"]:hover{background:#059669}
+      .agy-switch-dot{width:14px;height:14px;border-radius:9999px;background:#e4e4e7;box-shadow:0 1px 3px rgba(0,0,0,.45);transform:translateX(0);transition:transform .2s cubic-bezier(.34,1.35,.64,1),background .18s ease;pointer-events:none}
+      #agy-custom-models-section .agy-switch[aria-checked="true"] .agy-switch-dot,#agy-modal-overlay .agy-switch[aria-checked="true"] .agy-switch-dot{transform:translateX(14px);background:#ffffff}
       .agy-row .agy-muted{font-size:11px}
       .agy-row .agy-status{margin-top:2px;font-size:11px}
       .agy-row-info{display:flex;flex-direction:column;gap:2px;min-width:0;overflow:hidden;flex:1 1 auto}
@@ -455,17 +456,26 @@ window.addEventListener('DOMContentLoaded', () => {
       .zc-modal-body{flex:1 1 auto;overflow-y:auto;padding:18px 20px}
       .zc-modal-status-wrap{padding:0 20px 14px;flex-shrink:0}
       .zc-modal-status-wrap:has(.agy-status:empty){padding-bottom:0}
-      .zc-modal-rec-bar{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:9px 12px;margin-bottom:14px;border-radius:9px;border:1px solid rgba(255,255,255,.09);background:rgba(255,255,255,.03)}
-      .zc-modal-rec-left{display:flex;align-items:center;gap:9px;font-size:12.5px;color:#f4f4f5;font-weight:500}
-      .zc-modal-footer{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;padding-top:14px;margin-top:14px;border-top:1px solid rgba(255,255,255,.09)}
-      .zc-modal-footer-left,.zc-modal-footer-right{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+      .zc-modal-rec-bar{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:8px 12px;margin-bottom:14px;border-radius:9px;border:1px solid rgba(255,255,255,.09);background:rgba(255,255,255,.03)}
+      .zc-modal-rec-left{display:flex;align-items:center;gap:8px;font-size:12px;color:#e4e4e7;font-weight:500}
+      .zc-sec{display:flex;flex-direction:column;gap:2px;margin-bottom:16px}
+      .zc-sec-head{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:10px;padding-bottom:6px;border-bottom:1px solid rgba(255,255,255,.07)}
+      .zc-sec-label{font-size:11px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;color:#71717a}
+      .zc-sec-actions{display:flex;align-items:center;gap:6px}
+      #agy-modal-overlay .zc-btn-sm{padding:4px 9px;font-size:11.5px;border-radius:7px}
+      #agy-modal-overlay .zc-btn-ghost{background:transparent;border-color:transparent;color:#a1a1aa}
+      #agy-modal-overlay .zc-btn-ghost:hover{background:rgba(255,255,255,.07);border-color:transparent;color:#f4f4f5}
+      .zc-grid-2-1{display:grid;grid-template-columns:minmax(0,1.7fr) minmax(0,1fr);gap:0 12px}
+      .zc-grid-4{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:0 10px}
+      .zc-adv-sub{font-size:11px;font-weight:600;letter-spacing:.05em;text-transform:uppercase;color:#71717a;margin:12px 0 8px;padding-top:10px;border-top:1px solid rgba(255,255,255,.07)}
+      .zc-adv-sub:first-of-type{margin-top:2px;padding-top:0;border-top:0}
+      .zc-modal-footer{display:flex;align-items:center;justify-content:space-between;gap:10px;padding-top:14px;margin-top:12px;border-top:1px solid rgba(255,255,255,.09)}
+      .zc-modal-footer-left,.zc-modal-footer-right{display:flex;align-items:center;gap:6px}
+      @media(max-width:600px){.zc-grid-2-1,.zc-grid-4{grid-template-columns:1fr 1fr}.zc-modal-footer{flex-wrap:wrap}}
       .agy-grid{display:grid;grid-template-columns:1fr 1fr;gap:0 14px}.agy-discovery{max-height:240px;overflow:auto;margin:12px 0;border-radius:8px;border:1px solid rgba(255,255,255,.09);background:#161618;padding:4px 10px}
       .agy-discovery:empty{display:none}
       .agy-choice{display:flex;gap:10px;align-items:center;padding:7px 2px;border-bottom:1px solid rgba(255,255,255,.06);overflow-wrap:anywhere}.agy-choice:last-child{border-bottom:0}.agy-choice span{min-width:0}
       #agy-modal-overlay details{border:1px solid rgba(255,255,255,.09);border-radius:10px;margin:14px 0 6px;padding:10px 14px;background:rgba(255,255,255,.02)}#agy-modal-overlay summary{cursor:pointer;font-size:13px;font-weight:500;color:#e4e4e7;user-select:none}#agy-modal-overlay details[open] summary{margin-bottom:12px}
-      #agy-modal-overlay .agy-switch{position:relative;display:inline-flex;align-items:center;width:30px;height:17px;padding:0;border-radius:9999px;border:1px solid transparent;background:#3a3a42;cursor:pointer;flex-shrink:0;transition:background .18s ease}
-      #agy-modal-overlay .agy-switch[aria-checked="true"]{background:#22c55e}
-      #agy-modal-overlay .agy-switch[aria-checked="true"] .agy-switch-dot{transform:translateX(14px)}
       .agy-fleet{margin:18px 0;border:1px solid #303036;border-radius:10px;padding:14px;min-width:0}.agy-fleet-table{width:100%;border-collapse:separate;border-spacing:0 12px;text-align:left;table-layout:fixed}.agy-fleet-table td{padding:0}.agy-fleet-card{background:#202024;border:1px solid #3f3f46;border-radius:10px;padding:16px;min-width:0}.agy-fleet-card-header{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap}.agy-fleet-card-header .agy-actions{margin:0}.agy-fleet-label{font-size:14px;font-weight:600;overflow-wrap:anywhere}.agy-fleet-pools{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,300px),1fr));gap:12px;margin-top:14px}.agy-fleet-pool{border:1px solid #303036;border-radius:8px;padding:12px;background:#18181b;min-width:0}.agy-fleet-pool .agy-actions{margin-bottom:0}.agy-fleet-account-state{margin-top:5px}.agy-pool-badge{display:inline-block;padding:2px 6px;border-radius:5px;background:#27272c;color:#a1a1aa;font-size:11px}.agy-pool-preferred,.agy-plan-pro{color:#86efac}.agy-plan-pro{background:rgba(34,197,94,.12);border:1px solid rgba(134,239,172,.3)}.agy-plan-ultra{color:#c4b5fd;background:rgba(139,92,246,.16);border:1px solid rgba(167,139,250,.35)}.agy-pool-disabled{color:#fca5a5}.agy-fleet-quotas{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,220px),1fr));gap:10px;margin:12px 0}.agy-quota-group{display:grid;gap:8px;align-content:start;background:#202024;border:1px solid #2b2b31;border-radius:8px;padding:10px}.agy-quota-group-title{font-size:11px;font-weight:600;color:#d4d4d8}.agy-quota-note{font-size:10px;color:#71717a;line-height:1.35;overflow:hidden;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical}.agy-quota-bucket[data-disabled="true"]{opacity:.55}.agy-quota-bucket{min-width:0}.agy-quota-heading{display:flex;justify-content:space-between;gap:8px;font-size:12px;flex-wrap:wrap}.agy-quota-bucket progress{display:block;width:100%;height:7px;margin:5px 0;accent-color:#86efac}.agy-quota-bucket[data-quota-level="high"] progress{accent-color:#86efac}.agy-quota-bucket[data-quota-level="high"] .agy-quota-value{color:#86efac}.agy-quota-bucket[data-quota-level="mid"] progress{accent-color:#fbbf24}.agy-quota-bucket[data-quota-level="mid"] .agy-quota-value{color:#fcd34d}.agy-quota-bucket[data-quota-level="low"] progress{accent-color:#f87171}.agy-quota-bucket[data-quota-level="low"] .agy-quota-value{color:#fca5a5}.agy-quota-bucket[data-exhausted="true"] progress{accent-color:#ef4444}.agy-quota-bucket[data-exhausted="true"] .agy-quota-value{color:#fca5a5}.agy-quota-reset{font-size:11px;color:#a1a1aa}.agy-fleet-fallback{display:flex;align-items:center;gap:8px;font-size:12px}.agy-fleet-fallback input{width:auto!important;accent-color:#86efac}.agy-fleet-details[hidden]{display:none}
       #agy-fleet-target-pool{font:inherit;color:#fafafa;background:#25252a;border:1px solid #414149;border-radius:6px;padding:6px;max-width:240px}#agy-fleet-target-pool option{background:#25252a;color:#fafafa}
       .agy-model-search-box{padding:4px 6px 6px}.agy-model-search-wrap{position:relative;display:flex;align-items:center}.agy-model-search-icon{position:absolute;left:8px;width:13px;height:13px;color:#a1a1aa;pointer-events:none;flex-shrink:0}.agy-model-search-input{box-sizing:border-box;width:100%;font:inherit;font-size:12px;color:inherit;background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.14);border-radius:6px;padding:5px 26px 5px 27px;outline:none;transition:border-color .12s,background .12s}.agy-model-search-input:focus{border-color:rgba(255,255,255,.32);background:rgba(255,255,255,.07)}.agy-model-search-clear{position:absolute;right:5px;border:0;background:transparent;color:#a1a1aa;cursor:pointer;font-size:12px;line-height:1;padding:2px 4px;border-radius:4px}.agy-model-search-clear:hover{color:#fafafa;background:rgba(255,255,255,.1)}.agy-model-no-results{padding:8px;color:#a1a1aa;font-size:12px}
@@ -2340,48 +2350,35 @@ window.addEventListener('DOMContentLoaded', () => {
           keyRequired: false,
         });
       if (!providers.length) throw new Error('Provider presets are unavailable. Close this dialog and try again.');
-      // ZCode V6n: Follow recommended config bar + 2-column primary form with Context & Max Output up front
+      // ── Section 1: Connection ──────────────────────────────────────────────
       let followRecommended = !existing || mode !== 'edit';
-      const recBar = element('div', 'zc-modal-rec-bar');
-      const recLeft = element('div', 'zc-modal-rec-left');
-      const recSwitch = document.createElement('button');
-      recSwitch.type = 'button';
-      recSwitch.className = 'agy-switch';
-      recSwitch.setAttribute('role', 'switch');
-      recSwitch.setAttribute('aria-checked', String(followRecommended));
-      recSwitch.setAttribute('aria-label', 'Follow recommended config');
-      recSwitch.append(element('span', 'agy-switch-dot'));
-      recLeft.append(element('span', '', 'Follow recommended config'), recSwitch);
-      const detectNowBtn = button(
-        'Detect properties',
+      const connSec = element('div', 'zc-sec');
+      const connHead = element('div', 'zc-sec-head');
+      connHead.append(element('span', 'zc-sec-label', 'Connection'));
+      const connHeadActions = element('div', 'zc-sec-actions');
+      const fetchBtn = button(
+        'Fetch provider models',
         async () => {
-          const id = modelId.value.trim();
-          if (!id) throw new Error('Enter a provider model ID first.');
-          setStatus(status, 'Detecting model properties…');
-          const result = await storageAPI.detectModelCapabilities([id]);
-          const detected = result[id];
-          if (!detected) {
-            setStatus(status, `No catalog match found for "${id}". You can enter limits manually.`, true);
-            return;
-          }
-          if (detected.contextWindow != null) context.value = String(detected.contextWindow);
-          if (detected.maxOutputTokens != null) maxOutput.value = String(detected.maxOutputTokens);
-          if (detected.supportsVision != null) vision.value = String(detected.supportsVision);
-          const parts: string[] = [];
-          if (detected.contextWindow != null) parts.push(`${detected.contextWindow.toLocaleString()} ctx`);
-          if (detected.maxOutputTokens != null) parts.push(`${detected.maxOutputTokens.toLocaleString()} max out`);
-          if (detected.supportsVision) parts.push('vision');
-          if (detected.supportsThinking) parts.push('reasoning');
-          setStatus(status, `Model defaults loaded: ${parts.join(' · ') || 'matched'}.`);
+          setStatus(status, 'Fetching models…');
+          const result = await storageAPI.discoverModels(connection());
+          requireSuccess(result);
+          choices = result.models || [];
+          discoverySearch.value = '';
+          selected.clear();
+          showChoices();
+          setStatus(
+            status,
+            choices.length
+              ? 'Select models below, then choose Add selected (properties auto-detect on add).'
+              : 'This provider returned no models. You can enter a model ID manually.',
+          );
         },
         status,
       );
-      recSwitch.addEventListener('click', () => {
-        followRecommended = !followRecommended;
-        recSwitch.setAttribute('aria-checked', String(followRecommended));
-      });
-      recBar.append(recLeft, detectNowBtn);
-      body.append(recBar);
+      fetchBtn.classList.add('zc-btn-sm');
+      connHeadActions.append(fetchBtn);
+      connHead.append(connHeadActions);
+      connSec.append(connHead);
 
       const providerRow = element('div', 'agy-grid');
       const provider = selectField(
@@ -2393,19 +2390,22 @@ window.addEventListener('DOMContentLoaded', () => {
       );
       const providerNameInput = field(
         providerRow,
-        'Provider name (optional, for grouping)',
+        'Provider name',
         'agy-provider-name',
         existing?.providerName || initialProvider?.providerName || '',
       );
       providerNameInput.placeholder = 'e.g. Agnes AI, Coarena';
-      body.append(providerRow);
+      connSec.append(providerRow);
       const updateProviderNameVisibility = () => {
+        const isCustom = provider.value === 'custom';
         const label = providerNameInput.closest('label');
-        if (label) label.hidden = provider.value !== 'custom';
+        if (label) label.hidden = !isCustom;
+        providerRow.style.gridTemplateColumns = isCustom ? '1fr 1fr' : '1fr';
       };
       updateProviderNameVisibility();
       const preset = () => providers.find((value) => value.id === provider.value) || providers[0];
-      const endpointRow = element('div', 'agy-grid');
+
+      const endpointRow = element('div', 'zc-grid-2-1');
       const apiUrl = field(endpointRow, 'API URL', 'agy-api-url', existing?.apiUrl || initialProvider?.apiUrl || preset().defaultUrl, 'url');
       const apiFormat = selectField(
         endpointRow,
@@ -2418,13 +2418,13 @@ window.addEventListener('DOMContentLoaded', () => {
         ],
         existing?.apiFormat || initialProvider?.apiFormat || preset().apiFormat,
       );
-      body.append(endpointRow);
+      connSec.append(endpointRow);
       const workersHint = element(
         'p',
         'agy-muted',
         'Cloudflare: replace ACCOUNT_ID in the API URL with your 32-character Account ID. Use the Workers AI API token template, or keep your existing authentication headers. Model discovery verifies catalog access; generation is not tested.',
       );
-      body.append(workersHint);
+      connSec.append(workersHint);
       function workersConnection(): boolean {
         if (provider.value === 'workers-ai') return true;
         try {
@@ -2439,18 +2439,19 @@ window.addEventListener('DOMContentLoaded', () => {
       };
       apiUrl.addEventListener('input', updateWorkersHint);
       updateWorkersHint();
+
       const apiKey = field(
-        body,
+        connSec,
         'API key',
         'agy-api-key',
         existing?.apiKey === 'none' ? '' : existing?.apiKey || initialProvider?.apiKey || '',
         'password',
       );
       apiKey.placeholder = preset().keyRequired ? 'Enter provider API key' : 'Optional for local servers';
-      const opencodeAuth = selectField(body, 'OpenCode authentication', 'agy-opencode-auth',
+      const opencodeAuth = selectField(connSec, 'OpenCode authentication', 'agy-opencode-auth',
         [['auth', 'API key'], ['noAuth', 'Keyless request']], existing?.apiKey && existing.apiKey !== 'none' ? 'auth' : 'noAuth');
       const opencodeHint = element('p', 'agy-muted', 'OpenCode may restrict keyless free models to its own app. If the service rejects this client, add an API key or choose another model/provider.');
-      body.append(opencodeHint);
+      connSec.append(opencodeHint);
       const isOpencode = () => ['opencode', 'zen'].includes(provider.value) || (() => {
         try { const url = new URL(apiUrl.value); return url.origin === 'https://opencode.ai' && !/\/(?:zen|inference)\/go\//.test(url.pathname); } catch { return false; }
       })();
@@ -2463,68 +2464,7 @@ window.addEventListener('DOMContentLoaded', () => {
       opencodeAuth.addEventListener('change', updateOpencodeAuth);
       apiUrl.addEventListener('input', updateOpencodeAuth);
       updateOpencodeAuth();
-      const grid = element('div', 'agy-grid');
-      const modelId = field(
-        grid,
-        'Provider model ID',
-        'agy-model-id',
-        mode === 'discover' ? '' : existing?.externalModelName || '',
-      );
-      modelId.style.fontFamily = 'ui-monospace,SFMono-Regular,Menlo,Consolas,monospace';
-      const cleanExistingDisplayName = (existing?.displayName || '')
-        .replace(/^[🟢🔴⚪🟡⭐\s•·|-]+(?:\[[^\]]+\]\s*)?[•·|-]?\s*/u, '')
-        .trim();
-      const displayName = field(
-        grid,
-        'Display name',
-        'agy-display-name',
-        mode === 'duplicate'
-          ? `${cleanExistingDisplayName || existing?.externalModelName || ''} copy`
-          : mode === 'discover'
-            ? ''
-            : cleanExistingDisplayName,
-      );
-      body.append(grid);
-      const tokensRow = element('div', 'agy-grid');
-      const context = field(
-        tokensRow,
-        'Context window (tokens)',
-        'agy-context-window',
-        existing?.contextWindow != null ? String(existing.contextWindow) : '',
-        'number',
-      );
-      context.placeholder = 'e.g. 128000';
-      const maxOutput = field(
-        tokensRow,
-        'Maximum output tokens',
-        'agy-max-output',
-        existing?.maxOutputTokens != null ? String(existing.maxOutputTokens) : '',
-        'number',
-      );
-      maxOutput.placeholder = 'e.g. 16384';
-      body.append(tokensRow);
-      modelId.addEventListener('blur', async () => {
-        if (!followRecommended) return;
-        const id = modelId.value.trim();
-        if (!id || (context.value.trim() && maxOutput.value.trim())) return;
-        try {
-          const detectedMap = await storageAPI.detectModelCapabilities([id]);
-          const detected = detectedMap[id];
-          if (!detected) return;
-          if (!context.value.trim() && detected.contextWindow != null) context.value = String(detected.contextWindow);
-          if (!maxOutput.value.trim() && detected.maxOutputTokens != null) maxOutput.value = String(detected.maxOutputTokens);
-          if (!vision.value && detected.supportsVision != null) vision.value = String(detected.supportsVision);
-          setStatus(status, 'Model defaults loaded.');
-        } catch {}
-      });
-      const name = field(
-        body,
-        'Configuration name (unique)',
-        'agy-model-name',
-        mode === 'duplicate' ? uniqueName(`${existing?.name}-copy`) : mode === 'discover' ? '' : existing?.name || '',
-      );
-      name.placeholder = 'Generated from provider and model ID when left blank';
-      const description = field(body, 'Description', 'agy-description', String(existing?.description || ''));
+
       const googleConfig = element('div');
       googleConfig.id = 'agy-google-account-config';
       const googleProject = field(
@@ -2566,7 +2506,6 @@ window.addEventListener('DOMContentLoaded', () => {
       const nativeFailover = selectField(poolGrid, 'Native Google request fallback', 'agy-google-native-failover',
         [['false', 'Off'], ['true', 'Use this pool for matching native models']], String(initialPool?.nativeFailoverEnabled === true));
       googleConfig.append(poolGrid);
-      googleConfig.append(element('p', 'agy-muted', 'Optional fallback uses this saved Google account pool only when a native request for the exact provider model fails. It does not change your signed-in IDE account.'));
       const readAccounts = createGoogleAccountPanel(
         googleConfig,
         Array.isArray(existing?.googleAccounts) ? (existing.googleAccounts as GoogleAccountEntry[]) : [],
@@ -2577,110 +2516,158 @@ window.addEventListener('DOMContentLoaded', () => {
         googleConfig.hidden = !isGoogle;
         updateOpencodeAuth();
         apiFormat.closest('label')!.hidden = isGoogle;
+        endpointRow.style.gridTemplateColumns = isGoogle ? '1fr' : 'minmax(0,1.7fr) minmax(0,1fr)';
       };
       updateGoogleVisibility();
-      body.append(googleConfig);
-      const advanced = element('details');
-      advanced.append(element('summary', '', 'Advanced settings'));
-      const advancedGrid = element('div', 'agy-grid');
+      connSec.append(googleConfig);
+      body.append(connSec);
+
+      // ── Section 2: Model (Important Properties Right in Front) ─────────────
+      const modelSec = element('div', 'zc-sec');
+      const modelHead = element('div', 'zc-sec-head');
+      modelHead.append(element('span', 'zc-sec-label', 'Model'));
+      const modelHeadActions = element('div', 'zc-sec-actions');
+      const recSwitch = document.createElement('button');
+      recSwitch.type = 'button';
+      recSwitch.className = 'agy-switch';
+      recSwitch.setAttribute('role', 'switch');
+      recSwitch.setAttribute('aria-checked', String(followRecommended));
+      recSwitch.setAttribute('aria-label', 'Auto-detect properties');
+      recSwitch.title = 'Automatically detect context window, max output, vision, and reasoning when entering a model ID';
+      recSwitch.append(element('span', 'agy-switch-dot'));
+      recSwitch.addEventListener('click', () => {
+        followRecommended = !followRecommended;
+        recSwitch.setAttribute('aria-checked', String(followRecommended));
+      });
+      const recLabel = element('span', 'agy-muted', 'Auto-detect');
+      const detectNowBtn = button(
+        'Detect properties',
+        async () => {
+          const id = modelId.value.trim();
+          if (!id) throw new Error('Enter a provider model ID first.');
+          setStatus(status, 'Detecting model properties…');
+          const result = await storageAPI.detectModelCapabilities([id]);
+          const detected = result[id];
+          if (!detected) {
+            setStatus(status, `No catalog match found for "${id}". You can enter limits manually.`, true);
+            return;
+          }
+          if (detected.contextWindow != null) context.value = String(detected.contextWindow);
+          if (detected.maxOutputTokens != null) maxOutput.value = String(detected.maxOutputTokens);
+          if (detected.supportsVision != null) vision.value = String(detected.supportsVision);
+          if (typeof detected.reasoningEffort === 'string') effort.value = detected.reasoningEffort;
+          const parts: string[] = [];
+          if (detected.contextWindow != null) parts.push(`${Math.round(detected.contextWindow / 1000)}K ctx`);
+          if (detected.maxOutputTokens != null) parts.push(`${Math.round(detected.maxOutputTokens / 1000)}K max out`);
+          if (detected.supportsVision) parts.push('vision');
+          if (detected.supportsThinking) parts.push('reasoning');
+          setStatus(status, `Model defaults loaded: ${parts.join(' · ') || 'matched'}.`);
+        },
+        status,
+      );
+      detectNowBtn.classList.add('zc-btn-sm');
+      modelHeadActions.append(recLabel, recSwitch, detectNowBtn);
+      modelHead.append(modelHeadActions);
+      modelSec.append(modelHead);
+
+      const grid = element('div', 'agy-grid');
+      const modelId = field(
+        grid,
+        'Provider model ID',
+        'agy-model-id',
+        mode === 'discover' ? '' : existing?.externalModelName || '',
+      );
+      modelId.style.fontFamily = 'ui-monospace,SFMono-Regular,Menlo,Consolas,monospace';
+      modelId.placeholder = 'e.g. deepseek-v3.2';
+      const cleanExistingDisplayName = (existing?.displayName || '')
+        .replace(/^[🟢🔴⚪🟡⭐\s•·|-]+(?:\[[^\]]+\]\s*)?[•·|-]?\s*/u, '')
+        .trim();
+      const displayName = field(
+        grid,
+        'Display name',
+        'agy-display-name',
+        mode === 'duplicate'
+          ? `${cleanExistingDisplayName || existing?.externalModelName || ''} copy`
+          : mode === 'discover'
+            ? ''
+            : cleanExistingDisplayName,
+      );
+      displayName.placeholder = 'Optional';
+      modelSec.append(grid);
+
+      // Key model properties right in front (4 compact columns)
+      const propsRow = element('div', 'zc-grid-4');
+      const context = field(
+        propsRow,
+        'Context window',
+        'agy-context-window',
+        existing?.contextWindow != null ? String(existing.contextWindow) : '',
+        'number',
+      );
+      context.placeholder = '128000';
+      const maxOutput = field(
+        propsRow,
+        'Max output',
+        'agy-max-output',
+        existing?.maxOutputTokens != null ? String(existing.maxOutputTokens) : '',
+        'number',
+      );
+      maxOutput.placeholder = '16384';
       const effort = selectField(
-        advancedGrid,
+        propsRow,
         'Reasoning effort',
         'agy-reasoning-effort',
         ['', 'none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'].map((value) => [
           value,
-          value || 'Provider default',
+          value || 'Default',
         ]),
         String(existing?.reasoningEffort || ''),
       );
-      const thinking = field(
-        advancedGrid,
-        'Thinking budget (tokens)',
-        'agy-thinking-budget',
-        existing?.thinkingBudget != null ? String(existing.thinkingBudget) : '',
-        'number',
-      );
-      const compactionEffort = selectField(
-        advancedGrid,
-        'Compaction reasoning effort',
-        'agy-compaction-effort',
-        ['', 'none', 'minimal', 'low', 'medium', 'high', 'xhigh'].map((value) => [
-          value,
-          value || 'Use normal model settings',
-        ]),
-        String(existing?.compactionReasoningEffort || ''),
-      );
-      advancedGrid.append(
-        element(
-          'p',
-          'agy-muted',
-          'Only recognized IDE continuation summaries use this effort. Choose low for faster summaries, or none if your model supports disabling reasoning. Normal chat keeps its settings.',
-        ),
-      );
-      const compactionThreshold = field(
-        advancedGrid,
-        'IDE compaction threshold (%)',
-        'agy-compaction-threshold',
-        existing?.compactionThresholdPercent != null ? String(existing.compactionThresholdPercent) : '',
-        'number',
-      );
-      compactionThreshold.min = '10';
-      compactionThreshold.max = '90';
-      compactionThreshold.placeholder = '80';
-      advancedGrid.append(element('p', 'agy-muted',
-        'Optional, 10–90% of the actual context window in new tokens since the previous checkpoint. Leave blank to use 80% of a context window you set above; without a context window the IDE keeps its own 50,000-token default. Native counts may differ from provider totals, and a high value can trim older history before a full checkpoint. The threshold is capped to reserve the model output limit plus 1,024 tokens. Set accurate context and output limits, then fully quit and reopen the IDE; the model cache may take an additional turn to refresh.',
-      ));
-      advancedGrid.append(element('p', 'agy-muted',
-        'IDE 2.5.5 needs at least 50,000 input tokens after those reserves. Its native picker may show a compatibility context, for example 90,000 for a real 85,000-token model. Your saved context and provider limit remain 85,000 in that example, and the custom checkpoint policy uses that real limit.',
-      ));
-      const timeout = field(
-        advancedGrid,
-        'Request timeout (milliseconds)',
-        'agy-timeout',
-        existing?.timeout != null ? String(existing.timeout) : '',
-        'number',
-      );
-      const retries = field(
-        advancedGrid,
-        'Maximum retries (0–5)',
-        'agy-max-retries',
-        existing?.maxRetries != null ? String(existing.maxRetries) : '',
-        'number',
-      );
-      retries.max = '5';
       const vision = selectField(
-        advancedGrid,
+        propsRow,
         'Image input',
         'agy-vision',
         [
-          ['', 'Auto detect'],
-          ['true', 'Supported'],
-          ['false', 'Unsupported'],
+          ['', 'Auto'],
+          ['true', 'Yes'],
+          ['false', 'No'],
         ],
         existing?.supportsVision == null ? '' : String(existing.supportsVision),
       );
-      const rawUrl = selectField(
-        advancedGrid,
-        'Endpoint path',
-        'agy-raw-url',
-        [
-          ['false', 'Normalize for provider'],
-          ['true', 'Use exactly as entered'],
-        ],
-        String(existing?.rawUrl === true),
+      modelSec.append(propsRow);
+      body.append(modelSec);
+
+      modelId.addEventListener('blur', async () => {
+        if (!followRecommended) return;
+        const id = modelId.value.trim();
+        if (!id || (context.value.trim() && maxOutput.value.trim())) return;
+        try {
+          const detectedMap = await storageAPI.detectModelCapabilities([id]);
+          const detected = detectedMap[id];
+          if (!detected) return;
+          if (!context.value.trim() && detected.contextWindow != null) context.value = String(detected.contextWindow);
+          if (!maxOutput.value.trim() && detected.maxOutputTokens != null) maxOutput.value = String(detected.maxOutputTokens);
+          if (!vision.value && detected.supportsVision != null) vision.value = String(detected.supportsVision);
+          if (!effort.value && typeof detected.reasoningEffort === 'string') effort.value = detected.reasoningEffort;
+          setStatus(status, 'Model defaults loaded.');
+        } catch {}
+      });
+
+      // ── Section 3: Clean Grouped Advanced Settings ─────────────────────────
+      const advanced = element('details');
+      advanced.append(element('summary', '', 'Advanced settings'));
+
+      advanced.append(element('div', 'zc-adv-sub', 'Identity & State'));
+      const identityGrid = element('div', 'agy-grid');
+      const name = field(
+        identityGrid,
+        'Configuration name (unique)',
+        'agy-model-name',
+        mode === 'duplicate' ? uniqueName(`${existing?.name}-copy`) : mode === 'discover' ? '' : existing?.name || '',
       );
-      const tls = selectField(
-        advancedGrid,
-        'TLS certificates',
-        'agy-tls',
-        [
-          ['false', 'Verify certificates'],
-          ['true', 'Allow self-signed certificates'],
-        ],
-        String(existing?.allowUnauthorized === true),
-      );
+      name.placeholder = 'Auto-generated if blank';
       const enabled = selectField(
-        advancedGrid,
+        identityGrid,
         'Model state',
         'agy-enabled',
         [
@@ -2689,22 +2676,81 @@ window.addEventListener('DOMContentLoaded', () => {
         ],
         String(existing?.enabled !== false),
       );
-      advanced.append(advancedGrid);
-      const fallbacks = field(
-        advanced,
-        'Fallback model configuration names (comma separated)',
-        'agy-fallback-models',
-        Array.isArray(existing?.fallbackModels) ? existing.fallbackModels.join(', ') : '',
+      advanced.append(identityGrid);
+      const description = field(advanced, 'Description', 'agy-description', String(existing?.description || ''));
+      description.placeholder = 'Optional notes';
+
+      advanced.append(element('div', 'zc-adv-sub', 'Thinking & Compaction'));
+      const compactGrid = element('div', 'agy-grid');
+      const thinking = field(
+        compactGrid,
+        'Thinking budget (tokens)',
+        'agy-thinking-budget',
+        existing?.thinkingBudget != null ? String(existing.thinkingBudget) : '',
+        'number',
       );
-      const headers = jsonField(advanced, 'Custom headers (JSON)', 'agy-custom-headers', existing?.customHeaders);
-      const extraBody = jsonField(advanced, 'Additional request fields (JSON)', 'agy-extra-body', existing?.extraBody);
-      const systemPrompt = textAreaField(
-        advanced,
-        'System prompt (added after Antigravity’s own instructions)',
-        'agy-system-prompt',
-        existing?.systemPrompt,
-        'For example: Always answer in Turkish.',
+      const compactionEffort = selectField(
+        compactGrid,
+        'Compaction effort',
+        'agy-compaction-effort',
+        ['', 'none', 'minimal', 'low', 'medium', 'high', 'xhigh'].map((value) => [
+          value,
+          value || 'Same as normal',
+        ]),
+        String(existing?.compactionReasoningEffort || ''),
       );
+      const compactionThreshold = field(
+        compactGrid,
+        'IDE compaction threshold (%)',
+        'agy-compaction-threshold',
+        existing?.compactionThresholdPercent != null ? String(existing.compactionThresholdPercent) : '',
+        'number',
+      );
+      compactionThreshold.min = '10';
+      compactionThreshold.max = '90';
+      compactionThreshold.placeholder = '80';
+      compactionThreshold.title = '10–90% of actual context window. Leave blank for 80% default.';
+      advanced.append(compactGrid);
+
+      advanced.append(element('div', 'zc-adv-sub', 'Network & Reliability'));
+      const netGrid = element('div', 'agy-grid');
+      const timeout = field(
+        netGrid,
+        'Request timeout (ms)',
+        'agy-timeout',
+        existing?.timeout != null ? String(existing.timeout) : '',
+        'number',
+      );
+      const retries = field(
+        netGrid,
+        'Max retries (0–5)',
+        'agy-max-retries',
+        existing?.maxRetries != null ? String(existing.maxRetries) : '',
+        'number',
+      );
+      retries.max = '5';
+      const rawUrl = selectField(
+        netGrid,
+        'Endpoint path',
+        'agy-raw-url',
+        [
+          ['false', 'Normalize for provider'],
+          ['true', 'Use exact URL'],
+        ],
+        String(existing?.rawUrl === true),
+      );
+      const tls = selectField(
+        netGrid,
+        'TLS certificates',
+        'agy-tls',
+        [
+          ['false', 'Verify certificates'],
+          ['true', 'Allow self-signed'],
+        ],
+        String(existing?.allowUnauthorized === true),
+      );
+      advanced.append(netGrid);
+
       const breaker = existing?.circuitBreaker as
         | { enabled?: boolean; failureThreshold?: number; cooldownMs?: number }
         | undefined;
@@ -2729,12 +2775,29 @@ window.addEventListener('DOMContentLoaded', () => {
       );
       const breakerCooldown = field(
         breakerGrid,
-        'Cooldown (milliseconds)',
+        'Cooldown (ms)',
         'agy-breaker-cooldown',
         breaker?.cooldownMs != null ? String(breaker.cooldownMs) : '',
         'number',
       );
       advanced.append(breakerGrid);
+
+      advanced.append(element('div', 'zc-adv-sub', 'Overrides & Prompt'));
+      const fallbacks = field(
+        advanced,
+        'Fallback models (comma separated)',
+        'agy-fallback-models',
+        Array.isArray(existing?.fallbackModels) ? existing.fallbackModels.join(', ') : '',
+      );
+      const headers = jsonField(advanced, 'Custom headers (JSON)', 'agy-custom-headers', existing?.customHeaders);
+      const extraBody = jsonField(advanced, 'Additional request fields (JSON)', 'agy-extra-body', existing?.extraBody);
+      const systemPrompt = textAreaField(
+        advanced,
+        'System prompt (appended after default)',
+        'agy-system-prompt',
+        existing?.systemPrompt,
+        'e.g. Always answer concisely.',
+      );
       body.append(advanced);
       const discovery = element('div', 'agy-discovery');
       const discoveryFilter = element('div');
@@ -2876,9 +2939,11 @@ window.addEventListener('DOMContentLoaded', () => {
               : {}),
         };
       }
+      let addSelectedBtnRef: HTMLButtonElement | null = null;
       function showChoices(): void {
         discovery.replaceChildren();
         discoveryFilter.hidden = !choices.length;
+        if (addSelectedBtnRef) addSelectedBtnRef.hidden = !choices.length;
         if (!choices.length) return;
         const query = discoverySearch.value.trim().toLowerCase();
         const visible = choices.filter((model) =>
@@ -2968,46 +3033,32 @@ window.addEventListener('DOMContentLoaded', () => {
       const actions = element('div', 'zc-modal-footer');
       const actionsLeft = element('div', 'zc-modal-footer-left');
       const actionsRight = element('div', 'zc-modal-footer-right');
-      actionsLeft.append(
-        button(
-          'Test connection',
-          async () => {
-            setStatus(status, 'Testing…');
-            const result = requireSuccess(await storageAPI.testModelConnection(connection()));
-            setStatus(status, result.message || 'Connection successful.');
-          },
-          status,
-        ),
-        button(
-          'Test generation (may incur charges)',
-          async () => {
-            setStatus(status, 'Sending a short generation test…');
-            const result = requireSuccess(await storageAPI.testModelGeneration(connection()));
-            setStatus(status, result.message || 'Generation succeeded.');
-          },
-          status,
-        ),
-        button(
-          'Fetch provider models',
-          async () => {
-            setStatus(status, 'Fetching models…');
-            const result = await storageAPI.discoverModels(connection());
-            requireSuccess(result);
-            choices = result.models || [];
-            discoverySearch.value = '';
-            selected.clear();
-            showChoices();
-            setStatus(
-              status,
-              choices.length
-                ? 'Select models below, then choose Add selected (properties auto-detect on add).'
-                : 'This provider returned no models. You can enter a model ID manually.',
-            );
-          },
-          status,
-        ),
+      const testConnBtn = button(
+        'Test connection',
+        async () => {
+          setStatus(status, 'Testing…');
+          const result = requireSuccess(await storageAPI.testModelConnection(connection()));
+          setStatus(status, result.message || 'Connection successful.');
+        },
+        status,
       );
+      testConnBtn.classList.add('zc-btn-ghost');
+      const testGenBtn = button(
+        'Test generation (may incur charges)',
+        async () => {
+          setStatus(status, 'Sending a short generation test…');
+          const result = requireSuccess(await storageAPI.testModelGeneration(connection()));
+          setStatus(status, result.message || 'Generation succeeded.');
+        },
+        status,
+      );
+      testGenBtn.classList.add('zc-btn-ghost');
+      actionsLeft.append(testConnBtn, testGenBtn);
+
+      const cancelBtn = button('Cancel', close);
+      cancelBtn.classList.add('zc-btn-ghost');
       actionsRight.append(
+        cancelBtn,
         button(
           'Save model',
           async () => {
@@ -3035,45 +3086,47 @@ window.addEventListener('DOMContentLoaded', () => {
         ),
       );
       actions.append(actionsLeft, actionsRight);
-      body.append(actions, discoveryFilter, discovery);
-      body.append(
-        button(
-          'Add selected',
-          async () => {
-            if (!selected.size) throw new Error('Select at least one model from the fetched list.');
-            const chosen = choices.filter((model) => selected.has(model.id));
-            setStatus(status, `Detecting properties and saving ${chosen.length} models…`);
-            const detectedMap = await storageAPI.detectModelCapabilities(chosen.map((c) => c.id));
-            let saved = 0;
-            for (const choice of chosen) {
-              const prior = modelList.find(
-                (model) =>
-                  model.provider === provider.value &&
-                  model.apiUrl === apiUrl.value.trim() &&
-                  model.externalModelName === choice.id,
-              );
-              const config = modelConfig(
-                choice.id,
-                choice.displayName || choice.id,
-                prior?.name || uniqueName(`models/${provider.value}/${choice.id}`),
-              );
-              // Precedence: explicit form overrides > provider /v1/models metadata > catalog auto-detection
-              for (const key of ['contextWindow', 'maxOutputTokens', 'supportsVision', 'supportsThinking'] as const) {
-                if (config[key] === undefined && choice[key] !== undefined) config[key] = choice[key];
-              }
-              applyDetectedCaps(config, detectedMap[choice.id]);
-              delete config.originalName;
-              if (prior) config.originalName = prior.name;
-              else if (existing?.name) config.copyFrom = existing.name;
-              requireSuccess(await storageAPI.saveCustomModel(config));
-              saved++;
+
+      const addSelectedBtn = button(
+        'Add selected',
+        async () => {
+          if (!selected.size) throw new Error('Select at least one model from the fetched list.');
+          const chosen = choices.filter((model) => selected.has(model.id));
+          setStatus(status, `Detecting properties and saving ${chosen.length} models…`);
+          const detectedMap = await storageAPI.detectModelCapabilities(chosen.map((c) => c.id));
+          let saved = 0;
+          for (const choice of chosen) {
+            const prior = modelList.find(
+              (model) =>
+                model.provider === provider.value &&
+                model.apiUrl === apiUrl.value.trim() &&
+                model.externalModelName === choice.id,
+            );
+            const config = modelConfig(
+              choice.id,
+              choice.displayName || choice.id,
+              prior?.name || uniqueName(`models/${provider.value}/${choice.id}`),
+            );
+            // Precedence: explicit form overrides > provider /v1/models metadata > catalog auto-detection
+            for (const key of ['contextWindow', 'maxOutputTokens', 'supportsVision', 'supportsThinking'] as const) {
+              if (config[key] === undefined && choice[key] !== undefined) config[key] = choice[key];
             }
-            await modelsChanged();
-            setStatus(status, `Saved ${saved} models.`);
-          },
-          status,
-        ),
+            applyDetectedCaps(config, detectedMap[choice.id]);
+            delete config.originalName;
+            if (prior) config.originalName = prior.name;
+            else if (existing?.name) config.copyFrom = existing.name;
+            requireSuccess(await storageAPI.saveCustomModel(config));
+            saved++;
+          }
+          await modelsChanged();
+          setStatus(status, `Saved ${saved} models.`);
+        },
+        status,
+        true,
       );
+      addSelectedBtn.hidden = true;
+      addSelectedBtnRef = addSelectedBtn;
+      body.append(discoveryFilter, discovery, addSelectedBtn, actions);
       provider.addEventListener('change', () => {
         apiUrl.value = preset().defaultUrl;
         apiFormat.value = preset().apiFormat;
