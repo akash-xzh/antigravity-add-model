@@ -667,17 +667,17 @@ describe('custom model settings in the preserved vendor preload', () => {
     expect(f.getModels().map((value) => value.name)).toEqual(['models/primary', 'models/primary-copy']);
   });
 
-  it('keeps one inline toggle per row and hides the remaining actions in an overflow menu', async () => {
+  it('shows ZCode inline row actions (Test, Edit, Delete, toggle) and secondary actions in an overflow menu', async () => {
     const f = await fixture();
     const row = f.document.querySelector<HTMLElement>('.agy-row')!;
     const actions = row.querySelector('.agy-row-actions')!;
     const inline = [...actions.children].filter((node) => node.tagName === 'BUTTON');
-    expect(inline.map((node) => node.textContent)).toEqual(['Disable']);
+    expect(inline.map((node) => node.textContent)).toEqual(['Test', 'Edit', 'Delete', 'Disable']);
     const menu = actions.querySelector<HTMLDetailsElement>('details.agy-menu')!;
     expect(menu.open).toBe(false);
     expect(menu.querySelector('summary')!.getAttribute('aria-label')).toBe('More actions for Primary');
     expect([...menu.querySelectorAll('button')].map((node) => node.textContent)).toEqual(
-      ['Check', 'Test', 'Test generation', 'Edit', 'Duplicate', 'Effort variants', 'Delete'],
+      ['Check', 'Test generation', 'Duplicate', 'Effort variants'],
     );
     expect(row.querySelector('.agy-row-title strong')!.textContent).toContain('Primary');
     expect(row.querySelector('.agy-row-meta')!.textContent).toContain('model-a');
