@@ -3565,6 +3565,7 @@ window.addEventListener('DOMContentLoaded', () => {
   function findSettingsSidebarAndPane(): {
     root: HTMLElement;
     modelsBtn: HTMLElement;
+    modelsItem: HTMLElement;
     sidebarCol: HTMLElement;
     contentPane: HTMLElement;
   } | null {
@@ -3579,36 +3580,53 @@ window.addEventListener('DOMContentLoaded', () => {
     const settingsRoot =
       Array.from(
         document.querySelectorAll<HTMLElement>(
-          '[role="dialog"][aria-label="Settings"],.settings-modal-container,[data-testid="settings-view"],[data-testid="settings-panel"],[role="dialog"]',
+          '.settings-modal-container,[role="dialog"][aria-label="Settings"],[data-testid="settings-view"],[data-testid="settings-panel"],[role="dialog"]',
         ),
       ).find((el) => isVisibleEl(el) && /\bModels\b/.test(el.textContent || '') && /\b(General|Appearance|Browser)\b/.test(el.textContent || '')) ||
       null;
     if (!settingsRoot) return null;
-    const buttons = Array.from(settingsRoot.querySelectorAll<HTMLElement>('button,[role="tab"]'));
-    const modelsBtn = buttons.find(
-      (btn) =>
-        btn.id !== 'agy-providers-nav-tab' &&
-        (btn.textContent || '').trim() === 'Models' &&
-        isVisibleEl(btn),
-    );
+    // Antigravity renders each nav item as <div class="relative group/nav-item mx-2"><button data-testid="settings-nav-item-Models">...</button></div>
+    const byTestId = settingsRoot.querySelector<HTMLElement>('[data-testid="settings-nav-item-Models"]');
+    const modelsBtn =
+      (byTestId && isVisibleEl(byTestId) ? byTestId : null) ||
+      Array.from(settingsRoot.querySelectorAll<HTMLElement>('button,[role="tab"]')).find(
+        (btn) =>
+          btn.id !== 'agy-providers-nav-tab' &&
+          (btn.textContent || '').trim() === 'Models' &&
+          isVisibleEl(btn),
+      ) ||
+      null;
     if (!modelsBtn || !modelsBtn.parentElement) return null;
-    // Verify this is the Settings left sidebar (contains sibling nav items like General / Browser / Appearance).
-    const siblingTexts = Array.from(modelsBtn.parentElement.querySelectorAll<HTMLElement>('button,[role="tab"]')).map(
+    // If modelsBtn is the sole button inside a wrapper div (e.g. TX's .group/nav-item), treat that wrapper as the list item.
+    const parentHasOtherTabs = Array.from(modelsBtn.parentElement.querySelectorAll<HTMLElement>('button,[role="tab"]')).some(
+      (b) => b !== modelsBtn && b.id !== 'agy-providers-nav-tab',
+    );
+    const modelsItem = parentHasOtherTabs ? modelsBtn : modelsBtn.parentElement;
+    const navList = modelsItem.parentElement;
+    if (!navList) return null;
+    // Verify navList contains sibling Settings tabs (General / Appearance / Browser / Shortcuts / Notifications).
+    const siblingTexts = Array.from(navList.querySelectorAll<HTMLElement>('button,[role="tab"]')).map(
       (el) => (el.textContent || '').trim(),
     );
     if (!siblingTexts.some((t) => /^(General|Appearance|Browser|Shortcuts|Notifications)$/i.test(t))) return null;
-    // Walk up from modelsBtn to find the 2-column split [sidebarCol, contentPane] inside settingsRoot.
-    let node: HTMLElement | null = modelsBtn.parentElement;
+    // Walk up from navList to find the 2-column split [sidebarCol, contentPane] inside settingsRoot.
+    let node: HTMLElement | null = navList;
     while (node && node.parentElement && node !== settingsRoot) {
       const parent: HTMLElement = node.parentElement;
       const visibleSiblings = Array.from(parent.children).filter(
         (child): child is HTMLElement =>
-          child instanceof HTMLElement && child !== node && child.tagName !== 'STYLE' && child.tagName !== 'SCRIPT',
+          child instanceof HTMLElement &&
+          child !== node &&
+          child.tagName !== 'STYLE' &&
+          child.tagName !== 'SCRIPT' &&
+          !(child.tagName === 'BUTTON' && child.children.length <= 1),
       );
       if (visibleSiblings.length >= 1) {
-        const candidatePane = visibleSiblings.find((el) => el.querySelector('h1,h2,h3,button,input,section,[role="tabpanel"]')) || visibleSiblings[0];
+        const candidatePane =
+          visibleSiblings.find((el) => el.querySelector('h1,h2,h3,section,[role="tabpanel"],.overflow-y-auto')) ||
+          visibleSiblings[0];
         if (candidatePane && settingsRoot.contains(candidatePane)) {
-          return { root: settingsRoot, modelsBtn, sidebarCol: node, contentPane: candidatePane };
+          return { root: settingsRoot, modelsBtn, modelsItem, sidebarCol: node, contentPane: candidatePane };
         }
       }
       node = parent;
@@ -3760,9 +3778,10 @@ window.addEventListener('DOMContentLoaded', () => {
 
     // 1. Real Antigravity Settings dialog with left sidebar: inject dedicated full-width "Providers" tab!
     if (sidebarInfo) {
-      const { modelsBtn, sidebarCol, contentPane } = sidebarInfo;
+      const { modelsBtn, modelsItem, sidebarCol, contentPane } = sidebarInfo;
       let navTab = document.getElementById('agy-providers-nav-tab') as HTMLButtonElement | null;
       if (!navTab || !sidebarCol.contains(navTab)) {
+        document.getElementById('agy-providers-nav-wrap')?.remove();
         navTab?.remove();
         navTab = document.createElement('button');
         navTab.id = 'agy-providers-nav-tab';
@@ -3770,11 +3789,22 @@ window.addEventListener('DOMContentLoaded', () => {
         // Copy native nav button layout classes while stripping active background classes.
         const baseClasses = (modelsBtn.className || '')
           .split(/\s+/)
-          .filter((c) => c && !/^(bg-|text-foreground|font-medium|font-semibold)/.test(c))
+          .filter((c) => c && !/^(bg-sidebar-secondary|bg-white|bg-accent|bg-secondary|text-foreground|font-medium|font-semibold)/.test(c))
           .join(' ');
         navTab.className = `${baseClasses} agy-providers-nav-tab`.trim();
-        navTab.textContent = 'Providers';
-        modelsBtn.insertAdjacentElement('afterend', navTab);
+        const labelSpan = document.createElement('span');
+        labelSpan.className = 'transition-colors select-none truncate flex-1';
+        labelSpan.textContent = 'Providers';
+        navTab.append(labelSpan);
+        if (modelsItem !== modelsBtn) {
+          const wrap = document.createElement('div');
+          wrap.id = 'agy-providers-nav-wrap';
+          wrap.className = modelsItem.className || 'relative group/nav-item mx-2';
+          wrap.append(navTab);
+          modelsItem.insertAdjacentElement('afterend', wrap);
+        } else {
+          modelsItem.insertAdjacentElement('afterend', navTab);
+        }
 
         navTab.addEventListener('click', (e) => {
           e.preventDefault();

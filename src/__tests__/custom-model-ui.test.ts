@@ -1831,12 +1831,12 @@ describe('Google fleet and native picker search', () => {
 
   it('injects a dedicated full-width Providers tab in the Settings sidebar and restores native tabs cleanly', async () => {
     const html = `
-      <div role="dialog" aria-label="Settings">
+      <div class="settings-modal-container" aria-label="Settings">
         <div id="settings-shell">
           <div id="settings-sidebar">
-            <button type="button" class="nav-btn">General</button>
-            <button type="button" class="nav-btn bg-white/10">Models</button>
-            <button type="button" class="nav-btn">Browser</button>
+            <div class="relative group/nav-item mx-2"><button type="button" data-testid="settings-nav-item-General" class="nav-btn"><span>General</span></button></div>
+            <div class="relative group/nav-item mx-2"><button type="button" data-testid="settings-nav-item-Models" class="nav-btn bg-sidebar-secondary"><span>Models</span></button></div>
+            <div class="relative group/nav-item mx-2"><button type="button" data-testid="settings-nav-item-Browser" class="nav-btn"><span>Browser</span></button></div>
           </div>
           <div id="settings-pane">
             <section id="native-models"><h2>Models &amp; Usage</h2><div>Weekly Limit Remaining</div></section>
@@ -1848,7 +1848,7 @@ describe('Google fleet and native picker search', () => {
     const navTab = f.document.getElementById('agy-providers-nav-tab') as HTMLButtonElement | null;
     expect(navTab).toBeTruthy();
     expect(navTab!.textContent).toBe('Providers');
-    expect(navTab!.previousElementSibling?.textContent).toBe('Models');
+    expect(f.document.getElementById('agy-providers-nav-wrap')?.previousElementSibling?.textContent).toBe('Models');
     expect(f.document.getElementById('agy-providers-banner')).toBeTruthy();
     expect(f.document.getElementById('agy-custom-models-section')).toBeNull();
 
