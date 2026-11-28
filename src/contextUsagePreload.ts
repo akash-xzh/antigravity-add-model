@@ -34,7 +34,7 @@ window.addEventListener('DOMContentLoaded', () => {
     tokensUntilCompaction?: number;
     compactionSource?: 'custom' | 'default' | 'ide';
   };
-  type Target = { trigger: HTMLElement; conversationId?: string; modelName: string; key: string };
+  type Target = { trigger: HTMLElement; scope: HTMLElement; conversationId?: string; modelName: string; key: string };
   type State = {
     composer: HTMLElement;
     target: Target;
@@ -146,7 +146,8 @@ window.addEventListener('DOMContentLoaded', () => {
       const route = `${window.location.pathname} ${window.location.hash}`;
       conversationId = idFrom(route.match(/(?:\/c\/|\/conversation\/)([a-f0-9-]{36})(?:[/?#\s]|$)/i)?.[1]);
     }
-    return { trigger, modelName, conversationId, key: `${conversationId || ''}\n${modelName}` };
+    const inputBox = trigger.closest<HTMLElement>('[data-testid="agent-input-box"]') || scope;
+    return { trigger, scope: inputBox, modelName, conversationId, key: `${conversationId || ''}\n${modelName}` };
   }
 
   let activePopover: HTMLElement | undefined;
@@ -231,6 +232,11 @@ window.addEventListener('DOMContentLoaded', () => {
       `Summarizing earlier messages${modelLabel} to free context space.`,
       matchingState?.ring,
     );
+    for (const delay of [1500, 4500, 9000]) {
+      setTimeout(() => {
+        if (!stopped) refresh(true);
+      }, delay);
+    }
   };
   if (typeof ipcRenderer.on === 'function') {
     ipcRenderer.on('agy:compaction-event', onRealtimeCompaction);
@@ -338,7 +344,8 @@ window.addEventListener('DOMContentLoaded', () => {
     activePopoverState = state;
     const r = ring.getBoundingClientRect();
     const pr = pop.getBoundingClientRect();
-    const left = Math.max(8, Math.min(window.innerWidth - pr.width - 8, r.left));
+    const preferredLeft = r.left > window.innerWidth / 2 ? r.right - pr.width : r.left;
+    const left = Math.max(8, Math.min(window.innerWidth - pr.width - 8, preferredLeft));
     const top = Math.max(8, r.top - pr.height - 8);
     pop.style.left = `${left}px`;
     pop.style.top = `${top}px`;
@@ -397,12 +404,39 @@ window.addEventListener('DOMContentLoaded', () => {
       `<circle cx="8" cy="8" r="6" fill="none" stroke="${strokeColor}" stroke-width="2" stroke-linecap="round" transform="rotate(-90 8 8)" stroke-dasharray="${circ}" stroke-dashoffset="${(circ * (1 - fraction)).toFixed(2)}"/>` +
       `</svg><span>${pillLabel}</span>`;
     if (ring.innerHTML !== html) ring.innerHTML = html;
-    const parent = target.trigger.parentElement;
-    if (parent) {
-      if (!parent.hasAttribute('data-agy-context-toolbar')) parent.setAttribute('data-agy-context-toolbar', '');
-      toolbarParents.add(parent);
+    const findPermissionButton = (): HTMLElement | null => {
+      const searchRoot = target.scope || state.composer;
+      const candidates = Array.from(searchRoot.querySelectorAll<HTMLElement>('button,[role="button"]'));
+      for (const btn of candidates) {
+        if (btn === target.trigger || btn === ring || !visible(btn) || btn.closest('[data-agy-context-ring],.agy-ctx-popover')) continue;
+        const testId = (btn.getAttribute('data-testid') || '').toLowerCase();
+        const aria = (btn.getAttribute('aria-label') || '').toLowerCase();
+        const label = text(btn);
+        if (
+          /permission|security-preset|approval|execution|policy/.test(testId) ||
+          /permission|security|approval|execution|turbo|auto-run|review policy/.test(aria) ||
+          /^(Turbo|Auto|Default|Review|Ask|Off|Manual|Safe|Agent-driven|Always Proceed|Request Review)$/i.test(label)
+        ) {
+          return btn;
+        }
+      }
+      return null;
+    };
+    const permBtn = findPermissionButton();
+    if (permBtn && permBtn.parentElement) {
+      if (!permBtn.parentElement.hasAttribute('data-agy-context-toolbar')) {
+        permBtn.parentElement.setAttribute('data-agy-context-toolbar', '');
+      }
+      toolbarParents.add(permBtn.parentElement);
+      if (permBtn.previousElementSibling !== ring) permBtn.insertAdjacentElement('beforebegin', ring);
+    } else {
+      const parent = target.trigger.parentElement;
+      if (parent) {
+        if (!parent.hasAttribute('data-agy-context-toolbar')) parent.setAttribute('data-agy-context-toolbar', '');
+        toolbarParents.add(parent);
+      }
+      if (target.trigger.nextElementSibling !== ring) target.trigger.insertAdjacentElement('afterend', ring);
     }
-    if (target.trigger.nextElementSibling !== ring) target.trigger.insertAdjacentElement('afterend', ring);
   }
 
   async function request(state: State, force = false): Promise<void> {

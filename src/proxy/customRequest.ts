@@ -35,7 +35,7 @@ import { subagentRouting, SubagentRoutingError } from './subagentRouting';
 import { resolveConfiguredSubagentModel } from './subagentModels';
 import { isGoogleQuotaFailure } from './googlePoolFailover';
 import { reasoningReplayCache } from './reasoningReplay';
-import { recordConversationUsage } from './conversationUsage';
+import { clearConversationUsage, recordConversationUsage } from './conversationUsage';
 
 const circuits = new CircuitBreaker();
 export interface CompactionEvent {
@@ -354,11 +354,15 @@ export async function runCustomModelRequest(
   /** Real provider usage: Antigravity records it per step only when the response carries it. */
   const writeUsage = () => {
     const measured = diagnostic.usage();
-    recordConversationUsage(prepared.context.conversationId, {
-      ...measured,
-      ttftMs: firstChunkAt ? firstChunkAt - streamStartedAt : undefined,
-      decodeMs: firstChunkAt && lastChunkAt > firstChunkAt ? lastChunkAt - firstChunkAt : undefined,
-    });
+    if (isCompaction) {
+      clearConversationUsage(prepared.context.conversationId);
+    } else {
+      recordConversationUsage(prepared.context.conversationId, {
+        ...measured,
+        ttftMs: firstChunkAt ? firstChunkAt - streamStartedAt : undefined,
+        decodeMs: firstChunkAt && lastChunkAt > firstChunkAt ? lastChunkAt - firstChunkAt : undefined,
+      });
+    }
     if (measured.inputTokens === undefined && measured.outputTokens === undefined) return;
     if (signal.aborted || res.destroyed) return;
     const usageMetadata = {
@@ -859,7 +863,11 @@ export async function runCustomModelRequest(
               for (const candidate of mapped.candidates) writeCandidate(candidate);
               writeUsage();
             } else {
-              recordConversationUsage(prepared.context.conversationId, diagnostic.usage());
+              if (isCompaction) {
+                clearConversationUsage(prepared.context.conversationId);
+              } else {
+                recordConversationUsage(prepared.context.conversationId, diagnostic.usage());
+              }
               prepared.context.modelName = effectiveModel.name;
               const routed = subagentRouting.rewriteResponse(mapped, prepared.context, resolveSubagent);
               res.writeHead(200, { 'Content-Type': 'application/json' });

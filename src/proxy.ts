@@ -1676,7 +1676,7 @@ function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): voi
               const uiMitm = getUiMitm();
               const providerMap = uiMitm ? uiMitm.buildCustomProviderMap(loadCustomModels()) : {};
               const { code, patched, missed } = uiMitm
-                ? uiMitm.patchMainJsModelSelector(raw, proxyPort, providerMap)
+                ? uiMitm.patchMainJsModelSelector(raw, proxyPort, providerMap, getUiMitmToken())
                 : { code: raw, patched: false, missed: [] };
               log.info(`[Proxy] Served MITM /main.js (patched=${patched}, providers=${Object.keys(providerMap).length})`);
               if (missed.length)

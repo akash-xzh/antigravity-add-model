@@ -46,11 +46,16 @@ export function guardLoopbackRequest(req: IncomingMessage, res: ServerResponse, 
   // `Origin` and strips `Referer`. Authenticate that exact redirect with the per-process token
   // while keeping all unauthenticated cross-site requests blocked.
   const isAuthorizedMitmScript = (() => {
-    if (req.method !== 'GET' || !req.url?.startsWith('/_ui/main.js')) return false;
+    if (req.method !== 'GET' || (!req.url?.startsWith('/_ui/main.js') && !req.url?.startsWith('/_ui/custom-providers.json')))
+      return false;
     try {
       const parsed = new URL(req.url, 'http://localhost');
       const token = parsed.searchParams.get('t') || '';
-      if (parsed.pathname !== '/_ui/main.js' || token.length !== UI_MITM_TOKEN.length) return false;
+      if (
+        (parsed.pathname !== '/_ui/main.js' && parsed.pathname !== '/_ui/custom-providers.json') ||
+        token.length !== UI_MITM_TOKEN.length
+      )
+        return false;
       return timingSafeEqual(Buffer.from(token, 'utf8'), Buffer.from(UI_MITM_TOKEN, 'utf8'));
     } catch {
       return false;

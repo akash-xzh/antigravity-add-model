@@ -993,6 +993,9 @@ window.addEventListener('DOMContentLoaded', () => {
     );
   }
   async function modelsChanged(): Promise<void> {
+    if (typeof document !== 'undefined' && document.documentElement) {
+      document.documentElement.dataset.agyModelsVersion = String(Date.now());
+    }
     const restore = captureScrollPosition(document.getElementById('agy-custom-models-section') || document.body);
     fleetEpoch++;
     quotaCache.clear();
